@@ -49,7 +49,7 @@ dotnet_diagnostic.SA1633.severity = none
 [src/Jellyfin.Plugin.Database.Npgsql/Migrations/*.cs]
 generated_code = true
 
-[src/Jellyfin.Plugin.Database.Npgsql/NpgsqlDatabaseProvider.cs]
+[src/Jellyfin.Plugin.Database.Npgsql/{NpgsqlDatabaseOperations,NpgsqlDatabaseProvider}.cs]
 # Raw SQL literals are intentionally kept readable, and the helpers quote every
 # interpolated identifier/value. Async-disposable CA2007 cannot be satisfied by
 # adding ConfigureAwait directly to an await-using declaration without changing

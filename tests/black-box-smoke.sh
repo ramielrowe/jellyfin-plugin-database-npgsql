@@ -152,6 +152,26 @@ wait_for_host_exit() {
     return 1
 }
 
+assert_missing_dependency() {
+    local dependency=$1
+    local test_name=$2
+    local held_dependency="$RUN_ROOT/$dependency.$test_name.missing-test"
+    local log_file="$RUN_ROOT/$test_name.log"
+
+    mv "$PLUGIN_FOLDER/$dependency" "$held_dependency"
+    start_host "$log_file"
+    wait_for_host_exit || fail "host did not stop after $dependency was removed"
+    grep -F "Required Npgsql dependency '$dependency' is missing or incompatible" "$log_file" >/dev/null \
+        || fail "$dependency failure did not provide the package-reinstall diagnostic"
+    grep -F "Restore the complete Jellyfin.Plugin.Database.Npgsql" "$log_file" >/dev/null \
+        || fail "$dependency failure did not explain how to reinstall the package"
+    grep -F "or reinstall the previous compatible package before restarting" "$log_file" >/dev/null \
+        || fail "$dependency failure did not explain how to recover the prior package"
+    grep -F "No database connection was attempted" "$log_file" >/dev/null \
+        || fail "$dependency failure did not state its pre-connection boundary"
+    mv "$held_dependency" "$PLUGIN_FOLDER/$dependency"
+}
+
 authenticate() {
     local port=$1
     local device_id=$2
@@ -272,18 +292,12 @@ sed \
     "$PLUGIN_ROOT/tests/fixtures/network.xml" \
     >"$RUN_ROOT/runtime/config/network.xml"
 
-# These two failures occur before PostgreSQL is started. They prove that an
-# incomplete ZIP and Jellyfin's prefix-selected ambiguous directory are both
-# rejected before any database connection can be attempted, and that restoring
-# the canonical package is sufficient recovery.
-mv "$PLUGIN_FOLDER/Npgsql.dll" "$RUN_ROOT/Npgsql.dll.missing-test"
-start_host "$RUN_ROOT/missing-dependency.log"
-wait_for_host_exit || fail "host did not stop after the missing dependency was detected"
-grep -F "Required Npgsql dependency 'Npgsql.dll' is missing or incompatible" "$RUN_ROOT/missing-dependency.log" >/dev/null \
-    || fail "missing dependency failure did not provide the recovery diagnostic"
-grep -F "No database connection was attempted" "$RUN_ROOT/missing-dependency.log" >/dev/null \
-    || fail "missing dependency failure did not state its pre-connection boundary"
-mv "$RUN_ROOT/Npgsql.dll.missing-test" "$PLUGIN_FOLDER/Npgsql.dll"
+# These failures occur before PostgreSQL is started. They prove that either
+# independently missing ZIP dependency and Jellyfin's prefix-selected ambiguous
+# directory are rejected before database access, and that restoring the
+# canonical package is sufficient recovery.
+assert_missing_dependency "Npgsql.dll" "missing-npgsql-driver"
+assert_missing_dependency "Npgsql.EntityFrameworkCore.PostgreSQL.dll" "missing-npgsql-ef-provider"
 
 mv "$PLUGIN_FOLDER" "$RUN_ROOT/canonical-package-hold"
 start_host "$RUN_ROOT/ambiguous-folder.log"
@@ -493,7 +507,7 @@ stop_host "$HTTP_PORT" "$RECOVERY_TOKEN" || fail "recovery host did not stop cle
     echo "false_sequence_state=$FALSE_SEQUENCE_STATE"
     echo "package_dlls=${package_dlls[*]}"
     echo "canonical_plugin_folder=$PLUGIN_FOLDER_NAME"
-    echo "early_failure_guards=missing-dependency,ambiguous-prefix,unsupported-abi"
+    echo "early_failure_guards=missing-npgsql-driver,missing-npgsql-ef-provider,ambiguous-prefix,unsupported-abi"
     echo "normal_plugin_scans=disabled,active,malformed-metadata"
 } | tee "$RUN_ROOT/evidence.txt"
 
