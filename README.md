@@ -86,13 +86,14 @@ passfile. Client certificates must be a PEM certificate/key pair or a
 PFX/PKCS#12 file; root certificates must be PEM or an unencrypted PFX/PKCS#12
 file.
 
-Passfile processing streams only through the first applicable entry and clears
-its temporary byte and character buffers. The selected password must be
-returned through Npgsql's managed `string` callback contract; .NET strings are
-immutable and cannot be deterministically wiped after authentication. The
-passfile path remains private callback state so it can be reopened, but neither
-the path nor any credential is placed in the normalized connection string or
-provider diagnostics.
+Passfile processing uses positional reads on the opened file handle rather than
+a buffered stream, stops at the first applicable entry, and clears every owned
+byte and character buffer. The selected password must be returned through
+Npgsql's managed `string` callback contract; .NET strings are immutable and
+cannot be deterministically wiped after authentication. The passfile path
+remains private callback state so it can be reopened, but neither the path nor
+any credential is placed in the normalized connection string or provider
+diagnostics.
 
 On Unix, a configured passfile, PEM client private key, or client PFX/PKCS#12
 file must have no group or other permission bits; mode `0600` is recommended

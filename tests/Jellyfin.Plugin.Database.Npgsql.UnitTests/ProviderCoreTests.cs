@@ -394,6 +394,60 @@ public sealed class ProviderCoreTests
     }
 
     [Fact]
+    public void PassfileResolutionReturnsFirstMatchBeforeUnrelatedCredentialsInTheSameRead()
+    {
+        using var files = SecretFiles.Create();
+        File.WriteAllText(
+            files.Passfile,
+            "database.internal:5544:jellyfin:jellyfin_runtime:first-password\n"
+            + "unrelated.internal:5544:other:other-user:unrelated-secret-that-must-not-survive-read-ahead\n"
+            + "malformed-line-after-the-first-match\n");
+
+        Assert.Equal(
+            "first-password",
+            NpgsqlConfigurationSecurity.ResolvePassfilePassword(
+                files.Passfile,
+                PassfileSettings("database.internal", 5544)));
+    }
+
+    [Theory]
+    [InlineData("\r")]
+    [InlineData("\n")]
+    [InlineData("\r\n")]
+    public void PassfileResolutionMatchesStreamReaderLineEndingSemantics(string lineEnding)
+    {
+        using var files = SecretFiles.Create();
+        File.WriteAllText(
+            files.Passfile,
+            lineEnding
+            + $"other.internal:5544:jellyfin:jellyfin_runtime:other-secret{lineEnding}"
+            + $"database.internal:5544:jellyfin:jellyfin_runtime:matching-password{lineEnding}"
+            + $"{lineEnding}malformed-line-after-the-first-match");
+
+        Assert.Equal(
+            "matching-password",
+            NpgsqlConfigurationSecurity.ResolvePassfilePassword(
+                files.Passfile,
+                PassfileSettings("database.internal", 5544)));
+    }
+
+    [Fact]
+    public void PassfileResolutionConsumesCrLfOnceAcrossReadBoundaries()
+    {
+        using var files = SecretFiles.Create();
+        File.WriteAllText(
+            files.Passfile,
+            "#" + new string('x', 258) + "\r\n"
+            + "database.internal:5544:jellyfin:jellyfin_runtime:boundary-password\r\n");
+
+        Assert.Equal(
+            "boundary-password",
+            NpgsqlConfigurationSecurity.ResolvePassfilePassword(
+                files.Passfile,
+                PassfileSettings("database.internal", 5544)));
+    }
+
+    [Fact]
     public void PassfileResolutionMatchesNpgsqlWildcardPasswordAndNoMatchSemantics()
     {
         using var files = SecretFiles.Create();

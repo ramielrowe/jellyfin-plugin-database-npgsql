@@ -4,6 +4,7 @@ using System.Security;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 using Npgsql;
 
 namespace Jellyfin.Plugin.Database.Npgsql;
@@ -174,8 +175,8 @@ internal static class NpgsqlConfigurationSecurity
     {
         try
         {
-            using var stream = OpenConfiguredFile(path, MaximumPassfileBytes, requireOwnerOnlyOnUnix: true);
-            return ReadFirstMatchingPassfilePassword(stream, settings);
+            using var handle = OpenConfiguredFile(path, MaximumPassfileBytes, requireOwnerOnlyOnUnix: true);
+            return ReadFirstMatchingPassfilePassword(handle, settings);
         }
         catch (Exception exception) when (IsSecretFileFailure(exception))
         {
@@ -187,20 +188,20 @@ internal static class NpgsqlConfigurationSecurity
     }
 
     private static string? ReadFirstMatchingPassfilePassword(
-        FileStream stream,
+        SafeFileHandle handle,
         NpgsqlConnectionStringBuilder settings)
     {
         Span<byte> prefix = stackalloc byte[4];
         var prefixLength = 0;
         while (prefixLength < prefix.Length)
         {
-            var value = stream.ReadByte();
-            if (value < 0)
+            var count = RandomAccess.Read(handle, prefix[prefixLength..], prefixLength);
+            if (count == 0)
             {
                 break;
             }
 
-            prefix[prefixLength++] = (byte)value;
+            prefixLength += count;
         }
 
         var (encoding, bomLength) = DetectPassfileEncoding(prefix[..prefixLength]);
@@ -209,6 +210,7 @@ internal static class NpgsqlConfigurationSecurity
         Span<char> charBuffer = stackalloc char[256];
         var lineBuffer = ArrayPool<char>.Shared.Rent(256);
         var lineLength = 0;
+        var previousTerminatorWasCarriageReturn = false;
         long bytesRead = prefixLength;
 
         try
@@ -220,6 +222,7 @@ internal static class NpgsqlConfigurationSecurity
                     charBuffer,
                     ref lineBuffer,
                     ref lineLength,
+                    ref previousTerminatorWasCarriageReturn,
                     settings,
                     out var password))
             {
@@ -228,7 +231,7 @@ internal static class NpgsqlConfigurationSecurity
 
             while (true)
             {
-                var count = stream.Read(byteBuffer);
+                var count = RandomAccess.Read(handle, byteBuffer, bytesRead);
                 if (count == 0)
                 {
                     break;
@@ -247,6 +250,7 @@ internal static class NpgsqlConfigurationSecurity
                     charBuffer,
                     ref lineBuffer,
                     ref lineLength,
+                    ref previousTerminatorWasCarriageReturn,
                     settings,
                     out password);
                 CryptographicOperations.ZeroMemory(byteBuffer[..count]);
@@ -263,6 +267,7 @@ internal static class NpgsqlConfigurationSecurity
                     charBuffer,
                     ref lineBuffer,
                     ref lineLength,
+                    ref previousTerminatorWasCarriageReturn,
                     settings,
                     out password))
             {
@@ -296,6 +301,7 @@ internal static class NpgsqlConfigurationSecurity
         Span<char> charBuffer,
         ref char[] lineBuffer,
         ref int lineLength,
+        ref bool previousTerminatorWasCarriageReturn,
         NpgsqlConnectionStringBuilder settings,
         out string? password)
     {
@@ -306,7 +312,17 @@ internal static class NpgsqlConfigurationSecurity
 
             for (var index = 0; index < charsUsed; index++)
             {
-                if (charBuffer[index] == '\n')
+                var character = charBuffer[index];
+                if (previousTerminatorWasCarriageReturn)
+                {
+                    previousTerminatorWasCarriageReturn = false;
+                    if (character == '\n')
+                    {
+                        continue;
+                    }
+                }
+
+                if (character is '\r' or '\n')
                 {
                     if (TryResolvePassfileLine(lineBuffer.AsSpan(0, lineLength), settings, out password))
                     {
@@ -315,6 +331,7 @@ internal static class NpgsqlConfigurationSecurity
 
                     CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(lineBuffer.AsSpan(0, lineLength)));
                     lineLength = 0;
+                    previousTerminatorWasCarriageReturn = character == '\r';
                     continue;
                 }
 
@@ -323,7 +340,7 @@ internal static class NpgsqlConfigurationSecurity
                     GrowAndClearPassfileLineBuffer(ref lineBuffer, lineLength);
                 }
 
-                lineBuffer[lineLength++] = charBuffer[index];
+                lineBuffer[lineLength++] = character;
             }
 
             CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(charBuffer[..charsUsed]));
@@ -624,7 +641,7 @@ internal static class NpgsqlConfigurationSecurity
     {
         try
         {
-            using var stream = OpenConfiguredFile(path, maximumBytes, requireOwnerOnlyOnUnix);
+            using var handle = OpenConfiguredFile(path, maximumBytes, requireOwnerOnlyOnUnix);
         }
         catch (Exception exception) when (IsSecretFileFailure(exception))
         {
@@ -633,19 +650,21 @@ internal static class NpgsqlConfigurationSecurity
         }
     }
 
-    private static FileStream OpenConfiguredFile(string path, long maximumBytes, bool requireOwnerOnlyOnUnix)
+    private static SafeFileHandle OpenConfiguredFile(string path, long maximumBytes, bool requireOwnerOnlyOnUnix)
     {
-        var stream = new FileStream(
+        // Keep credential bytes out of FileStream's private read-ahead buffer.
+        // Callers use RandomAccess so every managed buffer is visible and can
+        // be cleared deterministically.
+        var handle = File.OpenHandle(
             path,
             FileMode.Open,
             FileAccess.Read,
             FileShare.Read,
-            bufferSize: 4096,
-            FileOptions.SequentialScan);
+            FileOptions.RandomAccess);
 
         try
         {
-            if (!stream.CanSeek || stream.Length > maximumBytes)
+            if (RandomAccess.GetLength(handle) > maximumBytes)
             {
                 throw new IOException();
             }
@@ -655,34 +674,59 @@ internal static class NpgsqlConfigurationSecurity
             // the permissions of the same object whose bytes are consumed.
             if (requireOwnerOnlyOnUnix && !OperatingSystem.IsWindows())
             {
-                var mode = File.GetUnixFileMode(stream.SafeFileHandle);
+                var mode = File.GetUnixFileMode(handle);
                 if ((mode & GroupOrOtherPermissions) != 0)
                 {
                     throw new UnauthorizedAccessException();
                 }
             }
 
-            return stream;
+            return handle;
         }
         catch
         {
-            stream.Dispose();
+            handle.Dispose();
             throw;
         }
     }
 
     private static byte[] ReadConfiguredFile(string path, long maximumBytes, bool requireOwnerOnlyOnUnix)
     {
-        using var stream = OpenConfiguredFile(path, maximumBytes, requireOwnerOnlyOnUnix);
+        using var handle = OpenConfiguredFile(path, maximumBytes, requireOwnerOnlyOnUnix);
 
-        var bytes = new byte[stream.Length];
+        var length = RandomAccess.GetLength(handle);
+        if (length > maximumBytes)
+        {
+            throw new IOException();
+        }
+
+        var bytes = new byte[checked((int)length)];
         var complete = false;
         try
         {
-            stream.ReadExactly(bytes);
-            if (stream.ReadByte() != -1)
+            var offset = 0;
+            while (offset < bytes.Length)
             {
-                throw new IOException();
+                var count = RandomAccess.Read(handle, bytes.AsSpan(offset), offset);
+                if (count == 0)
+                {
+                    throw new EndOfStreamException();
+                }
+
+                offset += count;
+            }
+
+            Span<byte> extraByte = stackalloc byte[1];
+            try
+            {
+                if (RandomAccess.Read(handle, extraByte, offset) != 0)
+                {
+                    throw new IOException();
+                }
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(extraByte);
             }
 
             complete = true;
