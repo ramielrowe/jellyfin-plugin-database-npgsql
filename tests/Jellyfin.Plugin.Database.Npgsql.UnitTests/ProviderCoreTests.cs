@@ -356,6 +356,122 @@ public sealed class ProviderCoreTests
         Assert.DoesNotContain(files.Directory, dataSource.ConnectionString, StringComparison.Ordinal);
     }
 
+    public static TheoryData<UnixFileMode> InsecureCredentialFileModes
+        => new()
+        {
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.OtherRead | UnixFileMode.OtherWrite,
+        };
+
+    [Fact]
+    public void Parse_AcceptsOwnerOnlyUnixCredentialFiles()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var files = SecretFiles.Create();
+
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(files.Passfile));
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(files.ClientKey));
+        Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(files.ClientPkcs12));
+
+        var passfileAndPem = NpgsqlOptionsBootstrap.Parse(
+            $"Host=database.internal;Port=5544;Database=jellyfin;Username=jellyfin_runtime;Passfile={files.Passfile};"
+            + $"SSL Mode=VerifyFull;SSL Certificate={files.ClientCertificate};SSL Key={files.ClientKey};Root Certificate={files.RootCertificate}",
+            null);
+        var pkcs12 = NpgsqlOptionsBootstrap.Parse(
+            $"{ValidConnectionString};SSL Mode=Require;SSL Certificate={files.ClientPkcs12};SSL Password={Password}",
+            null);
+
+        Assert.NotNull(passfileAndPem.ConfigureDataSource);
+        Assert.NotNull(pkcs12.ConfigureDataSource);
+    }
+
+    [Theory]
+    [MemberData(nameof(InsecureCredentialFileModes))]
+    public void Parse_RejectsInsecureUnixPassfilePermissions(UnixFileMode mode)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var files = SecretFiles.Create();
+        File.SetUnixFileMode(files.Passfile, mode);
+
+        AssertSanitizedCredentialFileFailure(
+            () => NpgsqlOptionsBootstrap.Parse(
+                $"Host=database.internal;Port=5544;Database=jellyfin;Username=jellyfin_runtime;Passfile={files.Passfile}",
+                null),
+            files);
+    }
+
+    [Theory]
+    [MemberData(nameof(InsecureCredentialFileModes))]
+    public void Parse_RejectsInsecureUnixPemPrivateKeyPermissions(UnixFileMode mode)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var files = SecretFiles.Create();
+        File.SetUnixFileMode(files.ClientKey, mode);
+
+        AssertSanitizedCredentialFileFailure(
+            () => NpgsqlOptionsBootstrap.Parse(
+                $"{ValidConnectionString};SSL Mode=Require;SSL Certificate={files.ClientCertificate};SSL Key={files.ClientKey}",
+                null),
+            files);
+    }
+
+    [Theory]
+    [MemberData(nameof(InsecureCredentialFileModes))]
+    public void Parse_RejectsInsecureUnixPkcs12Permissions(UnixFileMode mode)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var files = SecretFiles.Create();
+        File.SetUnixFileMode(files.ClientPkcs12, mode);
+
+        AssertSanitizedCredentialFileFailure(
+            () => NpgsqlOptionsBootstrap.Parse(
+                $"{ValidConnectionString};SSL Mode=Require;SSL Certificate={files.ClientPkcs12};SSL Password={Password}",
+                null),
+            files);
+    }
+
+    [Fact]
+    public void Parse_ChecksUnixPermissionsOnTheOpenedSymlinkTarget()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var files = SecretFiles.Create();
+        var passfileLink = Path.Combine(files.Directory, "pgpass-link");
+        File.CreateSymbolicLink(passfileLink, files.Passfile);
+
+        var configured = NpgsqlOptionsBootstrap.Parse(
+            $"Host=database.internal;Port=5544;Database=jellyfin;Username=jellyfin_runtime;Passfile={passfileLink}",
+            null);
+        Assert.NotNull(configured.ConfigureDataSource);
+
+        File.SetUnixFileMode(files.Passfile, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead);
+        AssertSanitizedCredentialFileFailure(
+            () => NpgsqlOptionsBootstrap.Parse(
+                $"Host=database.internal;Port=5544;Database=jellyfin;Username=jellyfin_runtime;Passfile={passfileLink}",
+                null),
+            files);
+    }
+
     [Fact]
     public void DatabaseConfigurationRequiresPluginProviderAndNoLock()
     {
@@ -486,6 +602,20 @@ public sealed class ProviderCoreTests
     private static Collection<CustomDatabaseOption> Options(params (string Key, string Value)[] values)
         => new(values.Select(value => new CustomDatabaseOption { Key = value.Key, Value = value.Value }).ToList());
 
+    private static void AssertSanitizedCredentialFileFailure(
+        Action action,
+        SecretFiles files)
+    {
+        var exception = Assert.Throws<InvalidOperationException>(action);
+
+        Assert.Contains("owner-only permissions", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("No database connection was attempted", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(files.Directory, exception.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("test-password", exception.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(Password, exception.ToString(), StringComparison.Ordinal);
+        Assert.Null(exception.InnerException);
+    }
+
     private sealed class QuotedEntity
     {
         public int Id { get; set; }
@@ -533,13 +663,15 @@ public sealed class ProviderCoreTests
             string passfile,
             string rootCertificate,
             string clientCertificate,
-            string clientKey)
+            string clientKey,
+            string clientPkcs12)
         {
             this.Directory = directory;
             this.Passfile = passfile;
             this.RootCertificate = rootCertificate;
             this.ClientCertificate = clientCertificate;
             this.ClientKey = clientKey;
+            this.ClientPkcs12 = clientPkcs12;
         }
 
         public string Directory { get; }
@@ -551,6 +683,8 @@ public sealed class ProviderCoreTests
         public string ClientCertificate { get; }
 
         public string ClientKey { get; }
+
+        public string ClientPkcs12 { get; }
 
         public static SecretFiles Create()
         {
@@ -569,7 +703,26 @@ public sealed class ProviderCoreTests
             File.WriteAllText(clientCertificate, certificate.ExportCertificatePem());
             var clientKey = Path.Combine(directory, "client-key.pem");
             File.WriteAllText(clientKey, rsa.ExportPkcs8PrivateKeyPem());
-            return new SecretFiles(directory, passfile, rootCertificate, clientCertificate, clientKey);
+            var clientPkcs12 = Path.Combine(directory, "client.p12");
+            var pkcs12Bytes = certificate.Export(X509ContentType.Pkcs12, Password);
+            try
+            {
+                File.WriteAllBytes(clientPkcs12, pkcs12Bytes);
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(pkcs12Bytes);
+            }
+
+            if (!OperatingSystem.IsWindows())
+            {
+                var ownerOnly = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                File.SetUnixFileMode(passfile, ownerOnly);
+                File.SetUnixFileMode(clientKey, ownerOnly);
+                File.SetUnixFileMode(clientPkcs12, ownerOnly);
+            }
+
+            return new SecretFiles(directory, passfile, rootCertificate, clientCertificate, clientKey, clientPkcs12);
         }
 
         public void Dispose()

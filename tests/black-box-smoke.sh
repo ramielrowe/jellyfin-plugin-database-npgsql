@@ -436,6 +436,23 @@ assert_secret_file_rejected \
     "$SECRET_FILE_MARKER"
 chmod 600 "$UNREADABLE_PASSFILE"
 
+# These controls run against a pristine published Jellyfin host before
+# PostgreSQL starts. Each common over-broad Unix mode must be rejected based on
+# the opened file, without leaking its path or contents into the host log.
+for insecure_mode in 0640 0644 0666; do
+    INSECURE_PASSFILE="$RUN_ROOT/sensitive-insecure-$insecure_mode-$SMOKE_ID.pgpass"
+    printf '127.0.0.1:%s:jellyfin:jellyfin:%s\n' "$POSTGRES_PORT" "$SECRET_FILE_MARKER" >"$INSECURE_PASSFILE"
+    chmod "$insecure_mode" "$INSECURE_PASSFILE"
+    restore_database_configuration
+    set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Passfile=$INSECURE_PASSFILE"
+    assert_secret_file_rejected \
+        "insecure-passfile-$insecure_mode" \
+        "Passfile must name a readable, well-formed PostgreSQL password file and, on Unix, use owner-only permissions" \
+        "$INSECURE_PASSFILE" \
+        "$SECRET_FILE_MARKER"
+    chmod 600 "$INSECURE_PASSFILE"
+done
+
 MISSING_ROOT_CERTIFICATE="$RUN_ROOT/sensitive-missing-root-$SMOKE_ID.pem"
 restore_database_configuration
 set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Password=$APPLICATION_PASSWORD;SSL Mode=VerifyFull;Root Certificate=$MISSING_ROOT_CERTIFICATE"
@@ -503,7 +520,13 @@ fi
 # the data source; this preserves passfile support while making later exception
 # chains incapable of exposing the configured path.
 RUNTIME_PASSFILE="$RUN_ROOT/runtime/sensitive-runtime-$SMOKE_ID.pgpass"
-printf '127.0.0.1:%s:jellyfin:jellyfin:%s\n' "$POSTGRES_PORT" "$APPLICATION_PASSWORD" >"$RUNTIME_PASSFILE"
+PASSFILE_UNRELATED_SECRET="unrelated-$SECRET_FILE_MARKER"
+PASSFILE_LOWER_PRECEDENCE_SECRET="lower-precedence-$SECRET_FILE_MARKER"
+{
+    printf 'unrelated.invalid:%s:jellyfin:jellyfin:%s\n' "$POSTGRES_PORT" "$PASSFILE_UNRELATED_SECRET"
+    printf '127.0.0.1:%s:jellyfin:jellyfin:%s\n' "$POSTGRES_PORT" "$APPLICATION_PASSWORD"
+    printf '127.0.0.1:%s:jellyfin:jellyfin:%s\n' "$POSTGRES_PORT" "$PASSFILE_LOWER_PRECEDENCE_SECRET"
+} >"$RUNTIME_PASSFILE"
 chmod 600 "$RUNTIME_PASSFILE"
 restore_database_configuration
 set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Passfile=$RUNTIME_PASSFILE"
@@ -535,7 +558,13 @@ if [ "${PROVIDER_CORE_ONLY:-false}" = "true" ]; then
         || fail "migration-backup guard did not state its pre-mutation boundary"
     grep -F "PostgreSQL configured at 127.0.0.1:$POSTGRES_PORT for database jellyfin;" "$RUN_ROOT/first-start.log" >/dev/null \
         || fail "provider did not emit its endpoint-only configuration diagnostic"
-    if grep -F -e "$APPLICATION_PASSWORD" -e "$BOOTSTRAP_PASSWORD" -e "$ADMIN_PASSWORD" "$RUN_ROOT/first-start.log" >/dev/null; then
+    if grep -F \
+        -e "$APPLICATION_PASSWORD" \
+        -e "$BOOTSTRAP_PASSWORD" \
+        -e "$ADMIN_PASSWORD" \
+        -e "$PASSFILE_UNRELATED_SECRET" \
+        -e "$PASSFILE_LOWER_PRECEDENCE_SECRET" \
+        "$RUN_ROOT/first-start.log" >/dev/null; then
         fail "vanilla host log exposed a smoke-test credential"
     fi
     if grep -F "$RUNTIME_PASSFILE" "$RUN_ROOT/first-start.log" >/dev/null; then

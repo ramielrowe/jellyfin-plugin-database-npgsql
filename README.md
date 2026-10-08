@@ -74,10 +74,23 @@ TLS certificate and passfile settings are validated and loaded before Npgsql
 startup, then their paths are removed from the normalized connection string.
 Configuration failures identify only the setting—not its path or contents. A
 passfile used for authentication must be readable, no larger than 1 MiB, and
-contain well-formed PostgreSQL password entries. As in Npgsql, an explicitly
-configured password takes precedence over an otherwise unused passfile. Client
-certificates must be a PEM certificate/key pair or a PFX file; root certificates
-must be PEM or an unencrypted PFX.
+contain well-formed PostgreSQL password entries. The first entry matching the
+configured host, port, database, and user is retained; other passfile
+credentials are discarded. As in Npgsql, an explicitly configured password
+takes precedence over an otherwise unused passfile. Client certificates must be
+a PEM certificate/key pair or a PFX/PKCS#12 file; root certificates must be PEM
+or an unencrypted PFX/PKCS#12 file.
+
+On Unix, a configured passfile, PEM client private key, or client PFX/PKCS#12
+file must have no group or other permission bits; mode `0600` is recommended
+(`0400` is also accepted). The check uses the opened file handle, so a symlink
+is judged by the permissions of the target actually read and a pathname swap
+cannot substitute an unchecked file. Certificate-only PEM files may remain
+world-readable. On Windows, Unix mode checks do not apply: the plugin preloads
+the configured files and removes their paths, but it does not attempt to
+interpret Windows ACL inheritance. Administrators must restrict each passfile,
+client private key, and client PFX/PKCS#12 ACL to the Jellyfin service identity
+and trusted administrators.
 
 Npgsql 10.0.3 recognizes several PostgreSQL environment fallbacks. To keep
 `database.xml` authoritative, startup rejects `PGUSER`, `PGPASSWORD`,
