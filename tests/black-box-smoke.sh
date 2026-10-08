@@ -2,14 +2,25 @@
 set -euo pipefail
 
 PLUGIN_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-if [ -n "${JELLYFIN_HOST_REPOSITORY:-}" ]; then
+HOST_INPUT_MODE=""
+HOST_REPOSITORY=""
+HOST_PUBLISH=""
+UNSUPPORTED_HOST_PUBLISH=""
+if [ -n "${JELLYFIN_HOST_PUBLISH:-}" ]; then
+    [ -d "$JELLYFIN_HOST_PUBLISH" ] \
+        || { echo "FAIL: JELLYFIN_HOST_PUBLISH is not a directory: $JELLYFIN_HOST_PUBLISH" >&2; exit 1; }
+    HOST_PUBLISH=$(cd "$JELLYFIN_HOST_PUBLISH" && pwd)
+    HOST_INPUT_MODE="publish"
+elif [ -n "${JELLYFIN_HOST_REPOSITORY:-}" ]; then
     [ -d "$JELLYFIN_HOST_REPOSITORY" ] \
         || { echo "FAIL: JELLYFIN_HOST_REPOSITORY is not a directory: $JELLYFIN_HOST_REPOSITORY" >&2; exit 1; }
     HOST_REPOSITORY=$(cd "$JELLYFIN_HOST_REPOSITORY" && pwd)
+    HOST_INPUT_MODE="legacy-repository"
 else
-    HOST_REPOSITORY=$(cd "$PLUGIN_ROOT/.." && pwd)
+    echo "FAIL: set JELLYFIN_HOST_PUBLISH to an exact vanilla Jellyfin publish; a parent source checkout is not required or inferred" >&2
+    exit 1
 fi
-SMOKE_ID="${SMOKE_ID:-$(date -u +%Y%m%d%H%M%S)-$$}"
+SMOKE_ID="$(date -u +%Y%m%d%H%M%S)-$$-$(tr -d '-' </proc/sys/kernel/random/uuid)"
 RUN_ROOT="$PLUGIN_ROOT/.artifacts/smoke-$SMOKE_ID"
 POSTGRES_CONTAINER="jellyfin-npgsql-smoke-$SMOKE_ID"
 read -r AUTOMATIC_POSTGRES_PORT AUTOMATIC_HTTP_PORT AUTOMATIC_HTTPS_PORT < <(
@@ -24,6 +35,10 @@ HTTPS_PORT="${HTTPS_PORT:-$AUTOMATIC_HTTPS_PORT}"
 JELLYFIN_HOST_COMMIT="${JELLYFIN_HOST_COMMIT:-ca0f16eb7c195f720a1493ed469a27c4657db0c6}"
 UNSUPPORTED_HOST_COMMIT="${UNSUPPORTED_HOST_COMMIT:-284997ebe28678ebca971f9f64fcfe02976ed937}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336}"
+if [[ ! "$POSTGRES_IMAGE" =~ ^[^[:space:]]+@sha256:[0-9a-fA-F]{64}$ ]]; then
+    echo "FAIL: POSTGRES_IMAGE must be pinned by a complete SHA-256 digest" >&2
+    exit 1
+fi
 NUGET_PACKAGES="$PLUGIN_ROOT/.packages"
 NUGET_HTTP_CACHE_PATH="$PLUGIN_ROOT/.nuget-http"
 PLUGIN_PROJECT="$PLUGIN_ROOT/src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj"
@@ -70,7 +85,9 @@ cleanup() {
         wait "$HOST_PID" 2>/dev/null || true
     fi
 
-    docker rm --force "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+    if [[ "$POSTGRES_CONTAINER" =~ ^jellyfin-npgsql-smoke-[0-9]{14}-[0-9]+-[0-9a-f]{32}$ ]]; then
+        docker rm --force "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+    fi
 }
 trap cleanup EXIT
 
@@ -79,19 +96,61 @@ fail() {
     exit 1
 }
 
-if [ ! -f "$HOST_REPOSITORY/Jellyfin.Server/Jellyfin.Server.csproj" ] \
-    || ! git -C "$HOST_REPOSITORY" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    fail "Jellyfin host checkout not found at $HOST_REPOSITORY; set JELLYFIN_HOST_REPOSITORY to a Jellyfin Git checkout"
-fi
+hash_host_publish() {
+    dotnet run \
+        --project "$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/Jellyfin.Plugin.Database.Npgsql.TestHarness.csproj" \
+        --configuration Release \
+        --no-restore \
+        -- hash-publish "$1"
+}
 
-JELLYFIN_HOST_COMMIT=$(
-    git -C "$HOST_REPOSITORY" rev-parse --verify --end-of-options "$JELLYFIN_HOST_COMMIT^{commit}"
-) || fail "could not resolve Jellyfin host revision to a commit"
-readonly JELLYFIN_HOST_COMMIT
-UNSUPPORTED_HOST_COMMIT=$(
-    git -C "$HOST_REPOSITORY" rev-parse --verify --end-of-options "$UNSUPPORTED_HOST_COMMIT^{commit}"
-) || fail "could not resolve the unsupported-host Jellyfin revision to a commit"
-readonly UNSUPPORTED_HOST_COMMIT
+assert_pristine_host_unchanged() {
+    local current_hash
+    current_hash=$(hash_host_publish "$RUN_ROOT/host-publish")
+    [ "$current_hash" = "$COPIED_HOST_SHA256" ] \
+        || fail "the isolated pristine Jellyfin publish changed during the smoke test"
+}
+
+if [ "$HOST_INPUT_MODE" = "legacy-repository" ]; then
+    if [ ! -f "$HOST_REPOSITORY/Jellyfin.Server/Jellyfin.Server.csproj" ] \
+        || ! git -C "$HOST_REPOSITORY" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        fail "Jellyfin host checkout not found at $HOST_REPOSITORY"
+    fi
+
+    JELLYFIN_HOST_COMMIT=$(
+        git -C "$HOST_REPOSITORY" rev-parse --verify --end-of-options "$JELLYFIN_HOST_COMMIT^{commit}"
+    ) || fail "could not resolve Jellyfin host revision to a commit"
+    readonly JELLYFIN_HOST_COMMIT
+    UNSUPPORTED_HOST_COMMIT=$(
+        git -C "$HOST_REPOSITORY" rev-parse --verify --end-of-options "$UNSUPPORTED_HOST_COMMIT^{commit}"
+    ) || fail "could not resolve the unsupported-host Jellyfin revision to a commit"
+    readonly UNSUPPORTED_HOST_COMMIT
+else
+    [ -f "$HOST_PUBLISH/jellyfin.dll" ] \
+        || fail "JELLYFIN_HOST_PUBLISH does not contain jellyfin.dll"
+    [ -n "${JELLYFIN_HOST_SHA256:-}" ] \
+        || fail "JELLYFIN_HOST_SHA256 is required with JELLYFIN_HOST_PUBLISH; calculate it with the documented test-harness command"
+    ACTUAL_HOST_SHA256=$(hash_host_publish "$HOST_PUBLISH")
+    [ "$ACTUAL_HOST_SHA256" = "$JELLYFIN_HOST_SHA256" ] \
+        || fail "JELLYFIN_HOST_PUBLISH did not match JELLYFIN_HOST_SHA256"
+    JELLYFIN_HOST_COMMIT="publish-sha256:$ACTUAL_HOST_SHA256"
+
+    if [ -n "${UNSUPPORTED_JELLYFIN_HOST_PUBLISH:-}" ]; then
+        [ -d "$UNSUPPORTED_JELLYFIN_HOST_PUBLISH" ] \
+            || fail "UNSUPPORTED_JELLYFIN_HOST_PUBLISH is not a directory"
+        UNSUPPORTED_HOST_PUBLISH=$(cd "$UNSUPPORTED_JELLYFIN_HOST_PUBLISH" && pwd)
+        [ -f "$UNSUPPORTED_HOST_PUBLISH/jellyfin.dll" ] \
+            || fail "UNSUPPORTED_JELLYFIN_HOST_PUBLISH does not contain jellyfin.dll"
+        [ -n "${UNSUPPORTED_JELLYFIN_HOST_SHA256:-}" ] \
+            || fail "UNSUPPORTED_JELLYFIN_HOST_SHA256 is required with UNSUPPORTED_JELLYFIN_HOST_PUBLISH"
+        ACTUAL_UNSUPPORTED_HOST_SHA256=$(hash_host_publish "$UNSUPPORTED_HOST_PUBLISH")
+        [ "$ACTUAL_UNSUPPORTED_HOST_SHA256" = "$UNSUPPORTED_JELLYFIN_HOST_SHA256" ] \
+            || fail "UNSUPPORTED_JELLYFIN_HOST_PUBLISH did not match UNSUPPORTED_JELLYFIN_HOST_SHA256"
+        UNSUPPORTED_HOST_COMMIT="publish-sha256:$ACTUAL_UNSUPPORTED_HOST_SHA256"
+    else
+        UNSUPPORTED_HOST_COMMIT="not-supplied"
+    fi
+fi
 
 wait_for_health() {
     local port=$1
@@ -357,28 +416,37 @@ identity_sequence_state() {
 }
 
 mkdir -p \
-    "$RUN_ROOT/host-source" \
     "$RUN_ROOT/host-publish" \
-    "$RUN_ROOT/unsupported-host-source" \
     "$RUN_ROOT/unsupported-host-publish" \
     "$RUN_ROOT/failure-plugin" \
     "$PLUGIN_FOLDER" \
     "$RUN_ROOT/runtime/config" \
     "$RUN_ROOT/runtime/cache" \
-    "$RUN_ROOT/runtime/log"
+    "$RUN_ROOT/runtime/log" \
+    "$RUN_ROOT/runtime/media"
 
-git -C "$HOST_REPOSITORY" archive "$JELLYFIN_HOST_COMMIT" | tar -x -C "$RUN_ROOT/host-source"
-git -C "$HOST_REPOSITORY" archive "$UNSUPPORTED_HOST_COMMIT" | tar -x -C "$RUN_ROOT/unsupported-host-source"
-dotnet publish \
-    "$RUN_ROOT/host-source/Jellyfin.Server/Jellyfin.Server.csproj" \
-    --configuration Release \
-    --output "$RUN_ROOT/host-publish" \
-    --no-self-contained
-dotnet publish \
-    "$RUN_ROOT/unsupported-host-source/Jellyfin.Server/Jellyfin.Server.csproj" \
-    --configuration Release \
-    --output "$RUN_ROOT/unsupported-host-publish" \
-    --no-self-contained
+if [ "$HOST_INPUT_MODE" = "legacy-repository" ]; then
+    mkdir -p "$RUN_ROOT/host-source" "$RUN_ROOT/unsupported-host-source"
+    git -C "$HOST_REPOSITORY" archive "$JELLYFIN_HOST_COMMIT" | tar -x -C "$RUN_ROOT/host-source"
+    git -C "$HOST_REPOSITORY" archive "$UNSUPPORTED_HOST_COMMIT" | tar -x -C "$RUN_ROOT/unsupported-host-source"
+    dotnet publish \
+        "$RUN_ROOT/host-source/Jellyfin.Server/Jellyfin.Server.csproj" \
+        --configuration Release \
+        --output "$RUN_ROOT/host-publish" \
+        --no-self-contained
+    dotnet publish \
+        "$RUN_ROOT/unsupported-host-source/Jellyfin.Server/Jellyfin.Server.csproj" \
+        --configuration Release \
+        --output "$RUN_ROOT/unsupported-host-publish" \
+        --no-self-contained
+else
+    cp -a "$HOST_PUBLISH/." "$RUN_ROOT/host-publish/"
+    if [ -n "$UNSUPPORTED_HOST_PUBLISH" ]; then
+        cp -a "$UNSUPPORTED_HOST_PUBLISH/." "$RUN_ROOT/unsupported-host-publish/"
+    fi
+fi
+COPIED_HOST_SHA256=$(hash_host_publish "$RUN_ROOT/host-publish")
+readonly COPIED_HOST_SHA256
 
 dotnet msbuild "$PLUGIN_ROOT/build/Package.proj" -target:Package -property:Configuration=Release
 [ -f "$PACKAGE_ZIP" ] || fail "release package was not created at $PACKAGE_ZIP"
@@ -438,12 +506,14 @@ grep -F "No database connection was attempted" "$RUN_ROOT/ambiguous-folder.log" 
     || fail "ambiguous prefix selection did not state its pre-connection boundary"
 mv "$RUN_ROOT/canonical-package-hold" "$PLUGIN_FOLDER"
 
-start_unsupported_host "$RUN_ROOT/unsupported-abi.log"
-wait_for_host_exit || fail "unsupported vanilla Jellyfin host did not stop after the ABI guard"
-grep -F "supports Jellyfin database ABI 12.2.x; the host loaded 13.0.0.0" "$RUN_ROOT/unsupported-abi.log" >/dev/null \
-    || fail "unsupported host ABI failure did not identify the supported and loaded versions"
-grep -F "No database connection was attempted" "$RUN_ROOT/unsupported-abi.log" >/dev/null \
-    || fail "unsupported host ABI failure did not state its pre-connection boundary"
+if [ "$HOST_INPUT_MODE" = "legacy-repository" ] || [ -n "$UNSUPPORTED_HOST_PUBLISH" ]; then
+    start_unsupported_host "$RUN_ROOT/unsupported-abi.log"
+    wait_for_host_exit || fail "unsupported vanilla Jellyfin host did not stop after the ABI guard"
+    grep -F "supports Jellyfin database ABI 12.2.x; the host loaded 13.0.0.0" "$RUN_ROOT/unsupported-abi.log" >/dev/null \
+        || fail "unsupported host ABI failure did not identify the supported and loaded versions"
+    grep -F "No database connection was attempted" "$RUN_ROOT/unsupported-abi.log" >/dev/null \
+        || fail "unsupported host ABI failure did not state its pre-connection boundary"
+fi
 
 # Npgsql 10.0.3 reads these ambient variables after parsing the connection
 # string. Each untouched-host control must fail before PostgreSQL is started,
@@ -590,7 +660,8 @@ docker run \
     --env POSTGRES_PASSWORD="$BOOTSTRAP_PASSWORD" \
     --env POSTGRES_DB=postgres \
     --publish "127.0.0.1:$POSTGRES_PORT:5432" \
-    "$POSTGRES_IMAGE" >/dev/null
+    "$POSTGRES_IMAGE" \
+    postgres -c max_connections=20 >/dev/null
 
 for _ in $(seq 1 60); do
     if docker exec "$POSTGRES_CONTAINER" pg_isready --username postgres --dbname postgres >/dev/null 2>&1; then
@@ -699,6 +770,7 @@ if [ "${PROVIDER_CORE_ONLY:-false}" = "true" ]; then
     kill -KILL "$HOST_PID" 2>/dev/null || true
     wait "$HOST_PID" 2>/dev/null || true
     HOST_PID=""
+    assert_pristine_host_unchanged
 
     {
         echo "result=PASS"
@@ -847,6 +919,7 @@ wait_for_health "$HTTP_PORT" || fail "normal package did not recover after the f
 RECOVERY_TOKEN=$(authenticate "$HTTP_PORT" "npgsql-recovery")
 [ -n "$RECOVERY_TOKEN" ] || fail "restored user could not authenticate during recovery"
 stop_host "$HTTP_PORT" "$RECOVERY_TOKEN" || fail "recovery host did not stop cleanly"
+assert_pristine_host_unchanged
 
 {
     echo "result=PASS"

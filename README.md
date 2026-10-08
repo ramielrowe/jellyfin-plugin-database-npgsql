@@ -149,15 +149,12 @@ the guard rejects it. Builds are isolated from an enclosing Git repository so
 moving the workspace does not change the release binary. `build.yaml` lists the
 same seven package artifacts for the official Jellyfin plugin packager.
 
-The opt-in black-box feasibility proof remains available as
-`./tests/black-box-smoke.sh`. It requires Docker and a local Jellyfin Git checkout;
-it is historical compatibility evidence, not part of the standalone default test
-suite. When this repository is not directly nested inside that Jellyfin checkout,
-pass its location explicitly:
-
-```sh
-JELLYFIN_HOST_REPOSITORY=/path/to/jellyfin ./tests/black-box-smoke.sh
-```
+Reusable opt-in PostgreSQL and pristine-host infrastructure is documented in
+[`docs/test-infrastructure.md`](docs/test-infrastructure.md). Default test runs
+do not contact Docker, PostgreSQL, or the network. The real fixture supports an
+explicit test-administrator connection or an immutable pinned container; the
+host fixture accepts an integrity-checked vanilla Jellyfin publish or ZIP and
+has no sibling/parent checkout dependency.
 
 Until the backup bead lands, run its provider-core stage instead. It exercises
 the packaged ZIP, early dependency/ABI guards, a restricted real PostgreSQL role,
@@ -165,8 +162,11 @@ and the untouched vanilla startup path, then proves the deliberate backup guard
 stops before application tables are created and does not leak credentials:
 
 ```sh
-PROVIDER_CORE_ONLY=true JELLYFIN_HOST_REPOSITORY=/path/to/jellyfin ./tests/black-box-smoke.sh
+JELLYFIN_HOST_PUBLISH=/path/to/vanilla-jellyfin-publish \
+JELLYFIN_HOST_SHA256=<documented-publish-hash> \
+PROVIDER_CORE_ONLY=true ./tests/black-box-smoke.sh
 ```
 
-Without that setting, the script safely uses the plugin directory's parent only
-when it is a Jellyfin Git checkout; otherwise it stops with an actionable error.
+The script never infers a parent checkout. `JELLYFIN_HOST_REPOSITORY` remains an
+explicit legacy compatibility input while the plugin is developed inside the
+old monorepo, but it is not needed after relocation.
