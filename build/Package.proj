@@ -27,6 +27,7 @@
       <PackageArtifact Include="$(PublishDirectory)Jellyfin.Plugin.Database.Npgsql.deps.json" />
       <PackageArtifact Include="$(PublishDirectory)Npgsql.EntityFrameworkCore.PostgreSQL.dll" />
       <PackageArtifact Include="$(PublishDirectory)Npgsql.dll" />
+      <PackageArtifact Include="$(PublishDirectory)meta.json" />
       <PackageArtifact Include="$(PublishDirectory)LICENSE" />
       <PackageArtifact Include="$(PublishDirectory)THIRD-PARTY-NOTICES.md" />
 
@@ -42,10 +43,14 @@
       <ForbiddenHostAssembly Include="$(PackageDirectory)MediaBrowser.*.dll" />
       <ForbiddenHostAssembly Include="$(PackageDirectory)Microsoft.EntityFrameworkCore*.dll" />
       <ForbiddenHostAssembly Include="$(PackageDirectory)Microsoft.Extensions.*.dll" />
+      <UnexpectedArtifact Include="@(StagedArtifact)" Exclude="@(PackageArtifact->'$(PackageDirectory)%(Filename)%(Extension)')" />
     </ItemGroup>
     <Error
       Condition="'@(ForbiddenHostAssembly)' != ''"
       Text="Host-owned runtime assemblies must not be packaged: @(ForbiddenHostAssembly, ', ')" />
+    <Error
+      Condition="'@(UnexpectedArtifact)' != ''"
+      Text="The staged package contains an artifact outside the release allowlist: @(UnexpectedArtifact, ', ')" />
     <Touch Files="@(StagedArtifact)" Time="2000-01-01T00:00:00Z" />
     <ZipDirectory
       SourceDirectory="$(PackageDirectory)"

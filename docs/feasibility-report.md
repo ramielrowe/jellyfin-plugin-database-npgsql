@@ -7,6 +7,12 @@ Bead: `jellyfin-38k.1`
 Result: **PASS for an independently packaged provider, with the version and
 installation constraints below.**
 
+> Historical note: this report records the original feasibility bead. The
+> release-shaped package now supports only the automated Jellyfin 12.2 ABI;
+> its black-box gate also publishes unmodified Jellyfin 13.0 and proves the
+> provider rejects that unsupported ABI before database access. Current
+> installation and recovery instructions live in the repository README.
+
 This is a contract proof, not a production release. It establishes that the
 vanilla loader, model pipeline, migration callbacks, basic Jellyfin CRUD, and
 restart lifecycle are sufficient to build the real provider. Full query-surface,

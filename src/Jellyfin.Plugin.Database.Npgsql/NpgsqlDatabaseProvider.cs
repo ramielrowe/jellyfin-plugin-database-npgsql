@@ -16,26 +16,20 @@ using Npgsql;
 namespace Jellyfin.Plugin.Database.Npgsql;
 
 /// <summary>
-/// Minimal provider used to test Jellyfin's custom database provider loading contract.
+/// Npgsql database provider loaded by Jellyfin's early custom-provider loader.
 /// </summary>
-public sealed class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
+/// <remarks>
+/// Initializes a new instance of the <see cref="NpgsqlDatabaseProvider"/> class.
+/// </remarks>
+/// <param name="logger">The host logger.</param>
+public sealed partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvider> logger) : IJellyfinDatabaseProvider
 {
     private const string BackupSchemaPrefix = "jellyfin_migration_backup_";
     private const string ForeignKeyMetadataTable = "__JellyfinMigrationBackupForeignKeys";
-    private static readonly Regex BackupKeyPattern = new(
-        "^" + BackupSchemaPrefix + "[0-9a-f]{32}$",
-        RegexOptions.CultureInvariant);
-    private readonly ILogger<NpgsqlDatabaseProvider> _logger;
-    private string? _connectionString;
+    private static readonly Regex BackupKeyPattern = MyRegex();
 
-    /// <summary>
-    /// Initializes a new instance of the <see cref="NpgsqlDatabaseProvider"/> class.
-    /// </summary>
-    /// <param name="logger">The host logger.</param>
-    public NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvider> logger)
-    {
-        _logger = logger;
-    }
+    private readonly ILogger<NpgsqlDatabaseProvider> logger = logger;
+    private string? connectionString;
 
     /// <inheritdoc />
     public IDbContextFactory<JellyfinDbContext>? DbContextFactory { get; set; }
@@ -43,39 +37,51 @@ public sealed class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc />
     public void Initialise(DbContextOptionsBuilder options, DatabaseConfigurationOptions databaseConfiguration)
     {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(databaseConfiguration);
+
         var hostDatabaseAssembly = typeof(JellyfinDbContext).Assembly;
         var hostDatabaseVersion = hostDatabaseAssembly.GetName().Version
             ?? throw new InvalidOperationException("Jellyfin.Database.Implementations did not expose an assembly version.");
-        if (!IsSupportedHostDatabaseAbi(hostDatabaseVersion))
+        if (!SupportsHostDatabaseAbi(hostDatabaseVersion))
         {
             throw new NotSupportedException(
-                $"Jellyfin.Plugin.Database.Npgsql 0.0.1 supports Jellyfin database ABI 12.2.x and 13.0.x; the host loaded {hostDatabaseVersion}. "
-                + "The provider stopped before opening or changing the database.");
+                $"Jellyfin.Plugin.Database.Npgsql {PluginMetadata.Version} supports Jellyfin database ABI {PluginMetadata.SupportedDatabaseAbi}; "
+                + $"the host loaded {hostDatabaseVersion}. Install a plugin release that supports this Jellyfin version, or restore the previous "
+                + "Jellyfin version and provider package. No database connection was attempted.");
         }
 
-        var connectionString = databaseConfiguration.CustomProviderOptions?.ConnectionString;
+        var customOptions = databaseConfiguration.CustomProviderOptions
+            ?? throw new InvalidOperationException(
+                "The Npgsql provider requires CustomProviderOptions in database.xml. No database connection was attempted.");
+        this.ValidateSelectedDirectory(customOptions.PluginName);
+        var dependencyAssemblies = LoadAdjacentDependencies();
+
+        var connectionString = customOptions.ConnectionString;
         if (string.IsNullOrWhiteSpace(connectionString))
         {
-            throw new InvalidOperationException("The Npgsql feasibility provider requires CustomProviderOptions.ConnectionString.");
+            throw new InvalidOperationException(
+                "The Npgsql provider requires CustomProviderOptions.ConnectionString in database.xml. No database connection was attempted.");
         }
 
-        _connectionString = connectionString;
+        this.connectionString = connectionString;
 
-        _logger.LogInformation(
-            "Npgsql feasibility provider loaded from {AssemblyLocation} in {LoadContext}",
-            GetType().Assembly.Location,
-            System.Runtime.Loader.AssemblyLoadContext.GetLoadContext(GetType().Assembly)?.Name ?? "Default");
+        LogProviderLoaded(
+            this.logger,
+            PluginMetadata.Version,
+            this.GetType().Assembly.Location,
+            AssemblyLoadContext.GetLoadContext(this.GetType().Assembly)?.Name ?? "Default");
 
         options.UseNpgsql(
             connectionString,
             npgsql => npgsql.MigrationsAssembly(Assembly.GetExecutingAssembly().GetName().Name));
         options.ReplaceService<IModelCustomizer, NpgsqlModelCustomizer>();
 
-        LogAssembly("provider", GetType().Assembly);
-        LogAssembly("host database", hostDatabaseAssembly);
-        LogAssembly("EF Core", typeof(DbContext).Assembly);
-        LogAssembly("Npgsql EF", typeof(NpgsqlDbContextOptionsBuilderExtensions).Assembly);
-        LogAssembly("Npgsql", typeof(NpgsqlConnection).Assembly);
+        this.LogAssembly("provider", this.GetType().Assembly);
+        this.LogAssembly("host database", hostDatabaseAssembly);
+        this.LogAssembly("EF Core", typeof(DbContext).Assembly);
+        this.LogAssembly("Npgsql", dependencyAssemblies[0]);
+        this.LogAssembly("Npgsql EF", dependencyAssemblies[1]);
     }
 
     /// <inheritdoc />
@@ -97,7 +103,7 @@ public sealed class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc />
     public async Task<string> MigrationBackupFast(CancellationToken cancellationToken)
     {
-        var connection = CreateConnection();
+        var connection = this.CreateConnection();
         await using (connection.ConfigureAwait(false))
         {
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
@@ -220,7 +226,7 @@ public sealed class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
             }
 
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            _logger.LogInformation("Created PostgreSQL migration snapshot in schema {BackupSchema} with {TableCount} tables", backupSchema, tableNames.Count);
+            LogBackupCreated(this.logger, backupSchema, tableNames.Count);
             return backupSchema;
         }
     }
@@ -228,8 +234,9 @@ public sealed class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc />
     public async Task RestoreBackupFast(string key, CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(key);
         ValidateBackupKey(key);
-        var connection = CreateConnection();
+        var connection = this.CreateConnection();
         await using (connection.ConfigureAwait(false))
         {
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
@@ -253,20 +260,21 @@ public sealed class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
 
             await ExecuteAsync(connection, transaction, $"DROP TABLE public.{Quote(ForeignKeyMetadataTable)}", cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            _logger.LogInformation("Restored PostgreSQL migration snapshot {BackupSchema}", key);
+            LogBackupRestored(this.logger, key);
         }
     }
 
     /// <inheritdoc />
     public async Task DeleteBackup(string key)
     {
+        ArgumentNullException.ThrowIfNull(key);
         ValidateBackupKey(key);
-        var connection = CreateConnection();
+        var connection = this.CreateConnection();
         await using (connection.ConfigureAwait(false))
         {
             await connection.OpenAsync().ConfigureAwait(false);
             await ExecuteAsync(connection, null, $"DROP SCHEMA {Quote(key)} CASCADE", CancellationToken.None).ConfigureAwait(false);
-            _logger.LogInformation("Deleted PostgreSQL migration snapshot {BackupSchema}", key);
+            LogBackupDeleted(this.logger, key);
         }
     }
 
@@ -277,19 +285,102 @@ public sealed class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
 
     private static string Literal(string value) => '\'' + value.Replace("'", "''", StringComparison.Ordinal) + '\'';
 
-    private static bool IsSupportedHostDatabaseAbi(Version version)
-        => (version.Major == 12 && version.Minor == 2)
-            || (version.Major == 13 && version.Minor == 0);
+    /// <summary>
+    /// Determines whether a host database assembly belongs to this release's supported ABI family.
+    /// </summary>
+    /// <param name="version">The host database assembly version.</param>
+    /// <returns><see langword="true" /> when the ABI is supported.</returns>
+    internal static bool SupportsHostDatabaseAbi(Version version)
+        => version.Major == 12 && version.Minor == 2;
+
+    private void ValidateSelectedDirectory(string pluginName)
+    {
+        var providerAssembly = this.GetType().Assembly;
+        var loadContext = AssemblyLoadContext.GetLoadContext(providerAssembly);
+        if (loadContext != AssemblyLoadContext.Default)
+        {
+            throw new InvalidOperationException(
+                "The Npgsql database provider was instantiated from Jellyfin's later collectible plugin context instead of the early default "
+                + "load context. Keep DatabaseType set to PLUGIN_PROVIDER and do not rely on plugin service registration. No database connection was attempted.");
+        }
+
+        var selectedDirectory = Path.GetFileName(Path.GetDirectoryName(providerAssembly.Location));
+        if (string.IsNullOrWhiteSpace(pluginName)
+            || !string.Equals(pluginName, PluginMetadata.InstallationDirectory, StringComparison.Ordinal)
+            || !string.Equals(selectedDirectory, pluginName, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Jellyfin selected the Npgsql provider from folder '{selectedDirectory}', but this release requires the exact folder and PluginName "
+                + $"'{PluginMetadata.InstallationDirectory}'. Remove ambiguous prefix-matching folders, restore the complete release ZIP there, update "
+                + "database.xml atomically, and restart. No database connection was attempted.");
+        }
+    }
+
+    private static Assembly[] LoadAdjacentDependencies()
+    {
+        var pluginDirectory = Path.GetDirectoryName(typeof(NpgsqlDatabaseProvider).Assembly.Location)
+            ?? throw new InvalidOperationException("The Npgsql provider assembly has no installation directory.");
+        var dependencies = new[]
+        {
+            "Npgsql.dll",
+            "Npgsql.EntityFrameworkCore.PostgreSQL.dll",
+        };
+        var loaded = new Assembly[dependencies.Length];
+
+        for (var index = 0; index < dependencies.Length; index++)
+        {
+            var dependencyPath = Path.Combine(pluginDirectory, dependencies[index]);
+            if (!File.Exists(dependencyPath))
+            {
+                throw MissingDependency(dependencies[index], pluginDirectory, null);
+            }
+
+            try
+            {
+                loaded[index] = Assembly.LoadFrom(dependencyPath);
+            }
+            catch (Exception exception) when (exception is FileLoadException or FileNotFoundException or BadImageFormatException)
+            {
+                throw MissingDependency(dependencies[index], pluginDirectory, exception);
+            }
+
+            var actualDirectory = Path.GetDirectoryName(loaded[index].Location);
+            if (!string.Equals(actualDirectory, pluginDirectory, StringComparison.Ordinal)
+                || AssemblyLoadContext.GetLoadContext(loaded[index]) != AssemblyLoadContext.Default)
+            {
+                throw new InvalidOperationException(
+                    $"Required dependency '{dependencies[index]}' resolved from '{loaded[index].Location}' instead of the Npgsql plugin folder "
+                    + $"'{pluginDirectory}' in the default load context. Remove stray copies, restore the complete release ZIP, and restart. "
+                    + "No database connection was attempted.");
+            }
+        }
+
+        return loaded;
+    }
+
+    private static InvalidOperationException MissingDependency(string dependency, string pluginDirectory, Exception? innerException)
+        => new(
+            $"Required Npgsql dependency '{dependency}' is missing or incompatible in '{pluginDirectory}'. Restore the complete "
+            + $"Jellyfin.Plugin.Database.Npgsql {PluginMetadata.Version} ZIP in '{PluginMetadata.InstallationDirectory}', or reinstall the previous "
+            + "compatible package before restarting. No database connection was attempted.",
+            innerException);
 
     private void LogAssembly(string role, Assembly assembly)
     {
+        if (!this.logger.IsEnabled(LogLevel.Information))
+        {
+            return;
+        }
+
         var loadContext = AssemblyLoadContext.GetLoadContext(assembly);
-        _logger.LogInformation(
-            "Npgsql feasibility {AssemblyRole}: {AssemblyName} from {AssemblyLocation} in load context {LoadContext}",
+#pragma warning disable CA1873 // IsEnabled above prevents evaluation when information logging is disabled.
+        LogAssemblyOrigin(
+            this.logger,
             role,
-            assembly.GetName(),
+            assembly.GetName().ToString(),
             assembly.Location,
             loadContext?.Name ?? "Default");
+#pragma warning restore CA1873
     }
 
     private static void ValidateBackupKey(string key)
@@ -301,7 +392,7 @@ public sealed class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     }
 
     private NpgsqlConnection CreateConnection()
-        => new(_connectionString ?? throw new InvalidOperationException("The Npgsql provider has not been initialized."));
+        => new(this.connectionString ?? throw new InvalidOperationException("The Npgsql provider has not been initialized."));
 
     private static async Task ExecuteAsync(
         NpgsqlConnection connection,
@@ -309,8 +400,11 @@ public sealed class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
         string commandText,
         CancellationToken cancellationToken)
     {
-        await using var command = new NpgsqlCommand(commandText, connection, transaction);
-        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        var command = new NpgsqlCommand(commandText, connection, transaction);
+        await using (command.ConfigureAwait(false))
+        {
+            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private static async Task<List<string>> ReadStringsAsync(
@@ -318,9 +412,7 @@ public sealed class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
         NpgsqlTransaction transaction,
         string commandText,
         CancellationToken cancellationToken)
-        => (await ReadRowsAsync(connection, transaction, commandText, cancellationToken).ConfigureAwait(false))
-            .Select(row => row[0])
-            .ToList();
+        => [.. (await ReadRowsAsync(connection, transaction, commandText, cancellationToken).ConfigureAwait(false)).Select(row => row[0])];
 
     private static async Task<List<string[]>> ReadRowsAsync(
         NpgsqlConnection connection,
@@ -329,19 +421,63 @@ public sealed class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
         CancellationToken cancellationToken)
     {
         var rows = new List<string[]>();
-        await using var command = new NpgsqlCommand(commandText, connection, transaction);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        var command = new NpgsqlCommand(commandText, connection, transaction);
+        await using (command.ConfigureAwait(false))
         {
-            var row = new string[reader.FieldCount];
-            for (var index = 0; index < reader.FieldCount; index++)
+            var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            await using (reader.ConfigureAwait(false))
             {
-                row[index] = reader.GetString(index);
-            }
+                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    var row = new string[reader.FieldCount];
+                    for (var index = 0; index < reader.FieldCount; index++)
+                    {
+                        row[index] = reader.GetString(index);
+                    }
 
-            rows.Add(row);
+                    rows.Add(row);
+                }
+            }
         }
 
         return rows;
     }
+
+    [GeneratedRegex("^jellyfin_migration_backup_[0-9a-f]{32}$", RegexOptions.CultureInvariant)]
+    private static partial Regex MyRegex();
+
+    [LoggerMessage(
+        EventId = 1,
+        Level = LogLevel.Information,
+        Message = "Npgsql database provider {PluginVersion} loaded from {AssemblyLocation} in {LoadContext}")]
+    private static partial void LogProviderLoaded(ILogger logger, string pluginVersion, string assemblyLocation, string loadContext);
+
+    [LoggerMessage(
+        EventId = 2,
+        Level = LogLevel.Information,
+        Message = "Created PostgreSQL migration snapshot in schema {BackupSchema} with {TableCount} tables")]
+    private static partial void LogBackupCreated(ILogger logger, string backupSchema, int tableCount);
+
+    [LoggerMessage(
+        EventId = 3,
+        Level = LogLevel.Information,
+        Message = "Restored PostgreSQL migration snapshot {BackupSchema}")]
+    private static partial void LogBackupRestored(ILogger logger, string backupSchema);
+
+    [LoggerMessage(
+        EventId = 4,
+        Level = LogLevel.Information,
+        Message = "Deleted PostgreSQL migration snapshot {BackupSchema}")]
+    private static partial void LogBackupDeleted(ILogger logger, string backupSchema);
+
+    [LoggerMessage(
+        EventId = 5,
+        Level = LogLevel.Information,
+        Message = "Npgsql provider {AssemblyRole}: {AssemblyName} from {AssemblyLocation} in load context {LoadContext}")]
+    private static partial void LogAssemblyOrigin(
+        ILogger logger,
+        string assemblyRole,
+        string assemblyName,
+        string assemblyLocation,
+        string loadContext);
 }

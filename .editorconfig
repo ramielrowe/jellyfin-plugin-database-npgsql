@@ -45,3 +45,17 @@ dotnet_diagnostic.SA1210.severity = error
 dotnet_diagnostic.SA1518.severity = error
 dotnet_diagnostic.SA1629.severity = error
 dotnet_diagnostic.SA1633.severity = none
+
+[src/Jellyfin.Plugin.Database.Npgsql/Migrations/*.cs]
+generated_code = true
+
+[src/Jellyfin.Plugin.Database.Npgsql/NpgsqlDatabaseProvider.cs]
+# Raw SQL literals are intentionally kept readable, and the helpers quote every
+# interpolated identifier/value. Async-disposable CA2007 cannot be satisfied by
+# adding ConfigureAwait directly to an await-using declaration without changing
+# the variable's type to ConfiguredAsyncDisposable.
+dotnet_diagnostic.CA2007.severity = none
+dotnet_diagnostic.CA2100.severity = none
+dotnet_diagnostic.SA1118.severity = none
+dotnet_diagnostic.SA1202.severity = none
+dotnet_diagnostic.SA1204.severity = none

@@ -2,7 +2,7 @@
 <DatabaseConfigurationOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <DatabaseType>PLUGIN_PROVIDER</DatabaseType>
   <CustomProviderOptions>
-    <PluginName>Npgsql Database</PluginName>
+    <PluginName>Npgsql Database_0.1.0.0</PluginName>
     <PluginAssembly>Jellyfin.Plugin.Database.Npgsql.dll</PluginAssembly>
     <ConnectionString>Host=127.0.0.1;Port=__POSTGRES_PORT__;Database=jellyfin;Username=jellyfin;Password=__APPLICATION_PASSWORD__</ConnectionString>
     <Options />

@@ -5,22 +5,19 @@ using Microsoft.EntityFrameworkCore.Infrastructure;
 namespace Jellyfin.Plugin.Database.Npgsql;
 
 /// <summary>
-/// Applies provider model changes after Jellyfin has applied its shared configurations.
+/// Applies Npgsql model changes after Jellyfin has applied its shared configurations.
 /// </summary>
-public sealed class NpgsqlModelCustomizer : ModelCustomizer
+/// <remarks>
+/// Initializes a new instance of the <see cref="NpgsqlModelCustomizer"/> class.
+/// </remarks>
+/// <param name="dependencies">The EF model customizer dependencies.</param>
+public sealed class NpgsqlModelCustomizer(ModelCustomizerDependencies dependencies) : ModelCustomizer(dependencies)
 {
-    /// <summary>
-    /// Initializes a new instance of the <see cref="NpgsqlModelCustomizer"/> class.
-    /// </summary>
-    /// <param name="dependencies">The EF model customizer dependencies.</param>
-    public NpgsqlModelCustomizer(ModelCustomizerDependencies dependencies)
-        : base(dependencies)
-    {
-    }
-
     /// <inheritdoc />
     public override void Customize(ModelBuilder modelBuilder, DbContext context)
     {
+        ArgumentNullException.ThrowIfNull(modelBuilder);
+        ArgumentNullException.ThrowIfNull(context);
         base.Customize(modelBuilder, context);
 
         var baseItem = modelBuilder.Model.FindEntityType("Jellyfin.Database.Implementations.Entities.BaseItemEntity")
