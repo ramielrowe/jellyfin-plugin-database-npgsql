@@ -10,3 +10,9 @@
 **/TestResults/
 *.user
 *.suo
+
+# This directory contains source for the release packaging target, not build
+# output. Keep both rules so this repository remains correct when developed
+# inside a checkout whose broader ignore rules exclude directories named build.
+!/build/
+!/build/Package.proj

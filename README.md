@@ -43,4 +43,12 @@ package artifacts for the official Jellyfin plugin packager.
 The opt-in black-box feasibility proof remains available as
 `./tests/black-box-smoke.sh`. It requires Docker and a local Jellyfin Git checkout;
 it is historical compatibility evidence, not part of the standalone default test
-suite.
+suite. When this repository is not directly nested inside that Jellyfin checkout,
+pass its location explicitly:
+
+```sh
+JELLYFIN_HOST_REPOSITORY=/path/to/jellyfin ./tests/black-box-smoke.sh
+```
+
+Without that setting, the script safely uses the plugin directory's parent only
+when it is a Jellyfin Git checkout; otherwise it stops with an actionable error.

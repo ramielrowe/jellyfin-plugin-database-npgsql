@@ -12,6 +12,13 @@ fail() {
     exit 1
 }
 
+[ -f "$PLUGIN_ROOT/build/Package.proj" ] \
+    || fail "tracked packaging source build/Package.proj is missing"
+if git -C "$PLUGIN_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git -C "$PLUGIN_ROOT" ls-files --error-unmatch -- build/Package.proj >/dev/null 2>&1 \
+        || fail "build/Package.proj is not tracked; enclosing ignore rules may have hidden it"
+fi
+
 [ -f "$PACKAGE_ZIP" ] || fail "package ZIP is missing; run the package command first"
 [ -d "$PACKAGE_DIR" ] || fail "staged package directory is missing"
 

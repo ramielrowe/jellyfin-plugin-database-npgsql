@@ -1,0 +1,56 @@
+<Project DefaultTargets="Package">
+  <PropertyGroup>
+    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
+    <PluginRoot>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..'))</PluginRoot>
+    <ProviderProject>$(PluginRoot)src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj</ProviderProject>
+    <ArtifactsDirectory>$(PluginRoot)artifacts/</ArtifactsDirectory>
+    <PublishDirectory>$(ArtifactsDirectory)publish/</PublishDirectory>
+    <PackageDirectory>$(ArtifactsDirectory)package/</PackageDirectory>
+    <PackagePath>$(ArtifactsDirectory)jellyfin-plugin-database-npgsql_0.1.0.0.zip</PackagePath>
+  </PropertyGroup>
+
+  <Target Name="CleanPackage">
+    <RemoveDir Directories="$(ArtifactsDirectory)" />
+    <MakeDir Directories="$(PublishDirectory);$(PackageDirectory)" />
+  </Target>
+
+  <Target Name="PublishPlugin" DependsOnTargets="CleanPackage">
+    <MSBuild
+      Projects="$(ProviderProject)"
+      Targets="Publish"
+      Properties="Configuration=$(Configuration);PublishDir=$(PublishDirectory);RestoreLockedMode=true" />
+  </Target>
+
+  <Target Name="Package" DependsOnTargets="PublishPlugin">
+    <ItemGroup>
+      <PackageArtifact Include="$(PublishDirectory)Jellyfin.Plugin.Database.Npgsql.dll" />
+      <PackageArtifact Include="$(PublishDirectory)Jellyfin.Plugin.Database.Npgsql.deps.json" />
+      <PackageArtifact Include="$(PublishDirectory)Npgsql.EntityFrameworkCore.PostgreSQL.dll" />
+      <PackageArtifact Include="$(PublishDirectory)Npgsql.dll" />
+      <PackageArtifact Include="$(PublishDirectory)LICENSE" />
+      <PackageArtifact Include="$(PublishDirectory)THIRD-PARTY-NOTICES.md" />
+
+    </ItemGroup>
+
+    <Error
+      Condition="!Exists('%(PackageArtifact.Identity)')"
+      Text="Required plugin artifact is missing: %(PackageArtifact.Identity)" />
+    <Copy SourceFiles="@(PackageArtifact)" DestinationFolder="$(PackageDirectory)" />
+    <ItemGroup>
+      <StagedArtifact Include="$(PackageDirectory)*" />
+      <ForbiddenHostAssembly Include="$(PackageDirectory)Jellyfin.Database.Implementations.dll" Condition="Exists('$(PackageDirectory)Jellyfin.Database.Implementations.dll')" />
+      <ForbiddenHostAssembly Include="$(PackageDirectory)MediaBrowser.*.dll" />
+      <ForbiddenHostAssembly Include="$(PackageDirectory)Microsoft.EntityFrameworkCore*.dll" />
+      <ForbiddenHostAssembly Include="$(PackageDirectory)Microsoft.Extensions.*.dll" />
+    </ItemGroup>
+    <Error
+      Condition="'@(ForbiddenHostAssembly)' != ''"
+      Text="Host-owned runtime assemblies must not be packaged: @(ForbiddenHostAssembly, ', ')" />
+    <Touch Files="@(StagedArtifact)" Time="2000-01-01T00:00:00Z" />
+    <ZipDirectory
+      SourceDirectory="$(PackageDirectory)"
+      DestinationFile="$(PackagePath)"
+      Overwrite="true" />
+    <Message Importance="high" Text="Created $(PackagePath)" />
+  </Target>
+</Project>

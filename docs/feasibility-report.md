@@ -160,7 +160,7 @@ negative `CREATE DATABASE`/`CREATE ROLE` attempts prove it is `NOSUPERUSER`,
 From this directory:
 
 ```sh
-./tests/black-box-smoke.sh
+JELLYFIN_HOST_REPOSITORY=/path/to/jellyfin ./tests/black-box-smoke.sh
 ```
 
 The script archives the exact default Jellyfin commit beneath ignored `.artifacts`,
@@ -170,9 +170,13 @@ verifies rollback, and records an `evidence.txt`. It uses collision-resistant
 OS-assigned ports, random per-run credentials, and a paired fake `ffmpeg`/`ffprobe`.
 It never edits the archived host and cleans up its Docker container.
 
-`JELLYFIN_HOST_COMMIT` and `POSTGRES_IMAGE` parameterize the two pinned inputs for
-an explicit compatibility run; `POSTGRES_PORT`, `HTTP_PORT`, and `HTTPS_PORT` may
-also be supplied when fixed ports are required. The passing default run used
+`JELLYFIN_HOST_REPOSITORY` identifies the Jellyfin Git checkout. It defaults to
+the plugin directory's parent only when that directory is a valid Jellyfin
+checkout, so the proof remains convenient in this temporary layout and safely
+fails with instructions after the plugin is relocated. `JELLYFIN_HOST_COMMIT` and
+`POSTGRES_IMAGE` parameterize the two pinned inputs for an explicit compatibility
+run; `POSTGRES_PORT`, `HTTP_PORT`, and `HTTPS_PORT` may also be supplied when fixed
+ports are required. The passing default run used
 Jellyfin 12.2.0 and PostgreSQL 18.6 and reported 28 restored foreign keys, the
 single 511-character model override, exact identity sequence state, no host
 `pg_dump` or `psql`, and only the three expected package DLLs.

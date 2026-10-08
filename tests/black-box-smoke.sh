@@ -2,7 +2,13 @@
 set -euo pipefail
 
 PLUGIN_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-HOST_REPOSITORY=$(cd "$PLUGIN_ROOT/.." && pwd)
+if [ -n "${JELLYFIN_HOST_REPOSITORY:-}" ]; then
+    [ -d "$JELLYFIN_HOST_REPOSITORY" ] \
+        || { echo "FAIL: JELLYFIN_HOST_REPOSITORY is not a directory: $JELLYFIN_HOST_REPOSITORY" >&2; exit 1; }
+    HOST_REPOSITORY=$(cd "$JELLYFIN_HOST_REPOSITORY" && pwd)
+else
+    HOST_REPOSITORY=$(cd "$PLUGIN_ROOT/.." && pwd)
+fi
 SMOKE_ID="${SMOKE_ID:-$(date -u +%Y%m%d%H%M%S)-$$}"
 RUN_ROOT="$PLUGIN_ROOT/.artifacts/smoke-$SMOKE_ID"
 POSTGRES_CONTAINER="jellyfin-npgsql-smoke-$SMOKE_ID"
@@ -50,6 +56,11 @@ fail() {
     echo "FAIL: $*" >&2
     exit 1
 }
+
+if [ ! -f "$HOST_REPOSITORY/Jellyfin.Server/Jellyfin.Server.csproj" ] \
+    || ! git -C "$HOST_REPOSITORY" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    fail "Jellyfin host checkout not found at $HOST_REPOSITORY; set JELLYFIN_HOST_REPOSITORY to a Jellyfin Git checkout"
+fi
 
 JELLYFIN_HOST_COMMIT=$(
     git -C "$HOST_REPOSITORY" rev-parse --verify --end-of-options "$JELLYFIN_HOST_COMMIT^{commit}"
