@@ -1,0 +1,9 @@
+<Project>
+  <Target Name="UseOnlyRepositoryBuildConfiguration" BeforeTargets="GenerateMSBuildEditorConfigFileShouldRun">
+    <ItemGroup>
+      <EditorConfigFiles Remove="@(EditorConfigFiles)" />
+      <EditorConfigFiles Include="$(MSBuildThisFileDirectory).editorconfig" />
+      <CompilerVisibleProperty Remove="ProjectDir" />
+    </ItemGroup>
+  </Target>
+</Project>

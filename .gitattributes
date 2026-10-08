@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.cs text diff=csharp
+*.slnx text
+*.sh text eol=lf
+*.zip binary

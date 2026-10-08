@@ -1,0 +1,21 @@
+---
+name: "Npgsql Database"
+guid: "8a6e4c5e-2185-45df-a30f-cc828529330b"
+version: "0.1.0.0"
+targetAbi: "12.2.0.0"
+framework: "net10.0"
+overview: "PostgreSQL database provider for Jellyfin"
+description: >
+  An independently packaged Npgsql Entity Framework database provider for
+  unmodified Jellyfin servers.
+category: "General"
+owner: "ramielrowe"
+artifacts:
+  - "Jellyfin.Plugin.Database.Npgsql.dll"
+  - "Jellyfin.Plugin.Database.Npgsql.deps.json"
+  - "Npgsql.EntityFrameworkCore.PostgreSQL.dll"
+  - "Npgsql.dll"
+  - "LICENSE"
+  - "THIRD-PARTY-NOTICES.md"
+changelog: >
+  Initial development scaffold.

@@ -1,6 +1,12 @@
+/artifacts/
 /.artifacts/
 /.packages/
 /.nuget-http/
 /.dotnet/
-**/bin/
-**/obj/
+/.vs/
+/.idea/
+**/[Bb]in/
+**/[Oo]bj/
+**/TestResults/
+*.user
+*.suo

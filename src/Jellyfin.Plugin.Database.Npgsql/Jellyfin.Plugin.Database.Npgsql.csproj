@@ -1,25 +1,33 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>Jellyfin.Plugin.Database.Npgsql</AssemblyName>
     <RootNamespace>Jellyfin.Plugin.Database.Npgsql</RootNamespace>
-    <Version>0.0.1</Version>
-    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <GenerateDependencyFile>true</GenerateDependencyFile>
+    <AnalysisMode>AllEnabledByDefault</AnalysisMode>
   </PropertyGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Jellyfin.Database.Implementations" Version="12.2.0" />
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.11">
-      <PrivateAssets>all</PrivateAssets>
-      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-    </PackageReference>
-    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.11" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
-    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
+  <ItemGroup Label="Host-provided compile contracts">
+    <PackageReference Include="Jellyfin.Database.Implementations" ExcludeAssets="runtime" Private="false" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore" ExcludeAssets="runtime" Private="false" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" ExcludeAssets="runtime" Private="false" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" ExcludeAssets="runtime" Private="false" />
   </ItemGroup>
 
-  <ItemGroup Condition="'$(FeasibilityFailureMigration)' == 'true'">
-    <Compile Include="../../tests/fixtures/ForcedFailureMigration.cs" Link="Migrations/ForcedFailureMigration.cs" />
+  <ItemGroup Label="Plugin-shipped runtime dependencies">
+    <PackageReference Include="Npgsql" />
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+  </ItemGroup>
+
+  <ItemGroup Label="Build analyzers">
+    <PackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" PrivateAssets="all" />
+    <PackageReference Include="SerilogAnalyzer" PrivateAssets="all" />
+    <PackageReference Include="SmartAnalyzers.MultithreadingAnalyzer" PrivateAssets="all" />
+    <PackageReference Include="StyleCop.Analyzers" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../LICENSE" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Link="LICENSE" />
+    <None Include="../../THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Link="THIRD-PARTY-NOTICES.md" />
   </ItemGroup>
 </Project>
