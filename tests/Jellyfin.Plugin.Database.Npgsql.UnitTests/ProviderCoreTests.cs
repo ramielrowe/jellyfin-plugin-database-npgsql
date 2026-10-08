@@ -1,4 +1,6 @@
 using System.Collections.ObjectModel;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Xml.Serialization;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Plugin.Database.Npgsql.ValueConverters;
@@ -12,11 +14,10 @@ using Xunit;
 
 namespace Jellyfin.Plugin.Database.Npgsql.UnitTests;
 
+[Collection(PostgresEnvironmentCollection.Name)]
 public sealed class ProviderCoreTests
 {
     private const string Password = "correct horse battery staple";
-    private const string Passfile = "/run/secrets/jellyfin-pgpass";
-    private const string RootCertificate = "/run/secrets/postgresql-root.crt";
     private const string ValidConnectionString =
         "Host=database.internal;Port=5544;Database=jellyfin;Username=jellyfin_runtime;Password=" + Password;
 
@@ -164,16 +165,20 @@ public sealed class ProviderCoreTests
     }
 
     [Fact]
-    public void Parse_PreservesTlsPassfileAndPoolConfigurationWithoutReadingFiles()
+    public void Parse_PreflightsAndPreservesTlsPassfileAndPoolConfiguration()
     {
+        using var files = SecretFiles.Create();
         var configured = NpgsqlOptionsBootstrap.Parse(
-            $"Host=database.internal;Port=5544;Database=jellyfin;Username=jellyfin_runtime;Passfile={Passfile};"
-            + $"SSL Mode=VerifyFull;Root Certificate={RootCertificate};Pooling=true;Minimum Pool Size=2;Maximum Pool Size=32",
+            $"Host=database.internal;Port=5544;Database=jellyfin;Username=jellyfin_runtime;Passfile={files.Passfile};"
+            + $"SSL Mode=VerifyFull;Root Certificate={files.RootCertificate};Pooling=true;Minimum Pool Size=2;Maximum Pool Size=32",
             null);
         var normalized = new NpgsqlConnectionStringBuilder(configured.ConnectionString);
 
-        Assert.Equal(Passfile, normalized.Passfile);
-        Assert.Equal(RootCertificate, normalized.RootCertificate);
+        Assert.Null(normalized.Passfile);
+        Assert.Null(normalized.RootCertificate);
+        Assert.DoesNotContain(files.Passfile, configured.ConnectionString, StringComparison.Ordinal);
+        Assert.DoesNotContain(files.RootCertificate, configured.ConnectionString, StringComparison.Ordinal);
+        Assert.NotNull(configured.ConfigureDataSource);
         Assert.Equal(SslMode.VerifyFull, normalized.SslMode);
         Assert.Equal(2, normalized.MinPoolSize);
         Assert.Equal(32, normalized.MaxPoolSize);
@@ -186,9 +191,10 @@ public sealed class ProviderCoreTests
     [Fact]
     public void EndpointLogContainsNoCredentialsOrSecretFilePaths()
     {
+        using var files = SecretFiles.Create();
         var configured = NpgsqlOptionsBootstrap.Parse(
-            $"Host=database.internal;Database=jellyfin;Username=sensitive-user;Password={Password};Passfile={Passfile};"
-            + $"SSL Mode=VerifyFull;Root Certificate={RootCertificate}",
+            $"Host=database.internal;Database=jellyfin;Username=sensitive-user;Password={Password};Passfile={files.Passfile};"
+            + $"SSL Mode=VerifyFull;Root Certificate={files.RootCertificate}",
             null);
         var logger = new CollectingLogger();
 
@@ -207,9 +213,147 @@ public sealed class ProviderCoreTests
         Assert.Contains("jellyfin", message, StringComparison.Ordinal);
         Assert.DoesNotContain(Password, message, StringComparison.Ordinal);
         Assert.DoesNotContain("sensitive-user", message, StringComparison.Ordinal);
-        Assert.DoesNotContain(Passfile, message, StringComparison.Ordinal);
-        Assert.DoesNotContain(RootCertificate, message, StringComparison.Ordinal);
+        Assert.DoesNotContain(files.Passfile, message, StringComparison.Ordinal);
+        Assert.DoesNotContain(files.RootCertificate, message, StringComparison.Ordinal);
         Assert.DoesNotContain(configured.ConnectionString, message, StringComparison.Ordinal);
+    }
+
+    public static TheoryData<string> RecognizedPostgresEnvironmentVariables
+        => new(NpgsqlConfigurationSecurity.RecognizedPostgresEnvironmentVariables);
+
+    [Fact]
+    public void EnvironmentFallbackAuditMatchesTheCompleteNpgsql10Surface()
+    {
+        string[] expected =
+        [
+            "PGUSER",
+            "PGPASSWORD",
+            "PGPASSFILE",
+            "PGSSLCERT",
+            "PGSSLKEY",
+            "PGSSLROOTCERT",
+            "PGCLIENTENCODING",
+            "PGTZ",
+            "PGOPTIONS",
+            "PGTARGETSESSIONATTRS",
+            "PGSSLNEGOTIATION",
+            "PGGSSENCMODE",
+            "PGREQUIREAUTH",
+            "PGAPPNAME",
+        ];
+
+        Assert.Equal(expected, NpgsqlConfigurationSecurity.RecognizedPostgresEnvironmentVariables);
+    }
+
+    [Theory]
+    [MemberData(nameof(RecognizedPostgresEnvironmentVariables))]
+    public void Parse_RejectsEveryNpgsql10PostgresEnvironmentFallback(string variable)
+    {
+        using var environment = new EnvironmentVariableScope(variable, "ambient-secret-or-setting");
+
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => NpgsqlOptionsBootstrap.Parse(ValidConnectionString, null));
+
+        Assert.Contains(variable, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("ambient-secret-or-setting", exception.ToString(), StringComparison.Ordinal);
+        Assert.Contains("No database connection was attempted", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("-c search_path=private")]
+    [InlineData("-c default_transaction_read_only=on")]
+    public void Parse_RejectsPgOptionsBeforeItCanChangeSessionState(string value)
+    {
+        using var environment = new EnvironmentVariableScope("PGOPTIONS", value);
+
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => NpgsqlOptionsBootstrap.Parse(ValidConnectionString, null));
+
+        Assert.Contains("PGOPTIONS", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(value, exception.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Parse_IgnoresLibpqEndpointVariablesThatNpgsql10DoesNotConsume()
+    {
+        using var host = new EnvironmentVariableScope("PGHOST", "attacker.invalid");
+        using var port = new EnvironmentVariableScope("PGPORT", "1");
+        using var database = new EnvironmentVariableScope("PGDATABASE", "attacker_database");
+        using var sslMode = new EnvironmentVariableScope("PGSSLMODE", "disable");
+
+        var configured = NpgsqlOptionsBootstrap.Parse(ValidConnectionString, null);
+
+        Assert.Equal("database.internal", configured.Host);
+        Assert.Equal(5544, configured.Port);
+        Assert.Equal("jellyfin", configured.Database);
+        Assert.Equal(nameof(SslMode.Prefer), configured.SslMode);
+    }
+
+    [Theory]
+    [InlineData("Passfile", "missing.pgpass")]
+    [InlineData("Root Certificate", "missing-root.pem")]
+    [InlineData("SSL Certificate", "missing-client.pem")]
+    public void Parse_SecretFileErrorsDoNotExposeConfiguredPaths(string setting, string fileName)
+    {
+        var secretDirectory = Path.Combine(Path.GetTempPath(), "jellyfin-sensitive-path", Guid.NewGuid().ToString("N"));
+        var secretPath = Path.Combine(secretDirectory, fileName);
+        var connectionString = setting switch
+        {
+            "Passfile" => $"Host=db;Database=jellyfin;Username=user;Passfile={secretPath}",
+            "Root Certificate" => $"{ValidConnectionString};SSL Mode=VerifyFull;Root Certificate={secretPath}",
+            _ => $"{ValidConnectionString};SSL Mode=Require;SSL Certificate={secretPath};SSL Key={secretPath}.key",
+        };
+
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => NpgsqlOptionsBootstrap.Parse(connectionString, null));
+
+        Assert.DoesNotContain(secretDirectory, exception.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(fileName, exception.ToString(), StringComparison.Ordinal);
+        Assert.Contains("No database connection was attempted", exception.Message, StringComparison.Ordinal);
+        Assert.Null(exception.InnerException);
+    }
+
+    [Fact]
+    public void Parse_MalformedSecretPathDoesNotEscapeSanitization()
+    {
+        const string SecretPathFragment = "credential-secret";
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => NpgsqlOptionsBootstrap.Parse(
+                $"Host=db;Database=jellyfin;Username=user;Passfile={SecretPathFragment}\0.pgpass",
+                null));
+
+        Assert.DoesNotContain(SecretPathFragment, exception.ToString(), StringComparison.Ordinal);
+        Assert.Null(exception.InnerException);
+    }
+
+    [Fact]
+    public void Parse_ExplicitPasswordKeepsPrecedenceWithoutReadingUnusedPassfile()
+    {
+        var configured = NpgsqlOptionsBootstrap.Parse(
+            $"{ValidConnectionString};Passfile=/missing/unused/credential.pgpass",
+            null);
+        var normalized = new NpgsqlConnectionStringBuilder(configured.ConnectionString);
+
+        Assert.Equal(Password, normalized.Password);
+        Assert.Null(normalized.Passfile);
+        Assert.Null(configured.ConfigureDataSource);
+        Assert.True(configured.PassfileConfigured);
+    }
+
+    [Fact]
+    public void PreloadedPassfileAndTlsMaterialBuildADataSourceWithoutFilePaths()
+    {
+        using var files = SecretFiles.Create();
+        var configured = NpgsqlOptionsBootstrap.Parse(
+            $"Host=database.internal;Port=5544;Database=jellyfin;Username=jellyfin_runtime;Passfile={files.Passfile};"
+            + $"SSL Mode=VerifyFull;SSL Certificate={files.ClientCertificate};SSL Key={files.ClientKey};Root Certificate={files.RootCertificate}",
+            null);
+        var dataSourceBuilder = new NpgsqlDataSourceBuilder(configured.ConnectionString);
+
+        configured.ConfigureDataSource!(dataSourceBuilder);
+        using var dataSource = dataSourceBuilder.Build();
+
+        Assert.DoesNotContain(files.Directory, dataSource.ConnectionString, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -365,4 +509,76 @@ public sealed class ProviderCoreTests
             Func<TState, Exception?, string> formatter)
             => this.Messages.Add(formatter(state, exception));
     }
+
+    private sealed class EnvironmentVariableScope : IDisposable
+    {
+        private readonly string name;
+        private readonly string? originalValue;
+
+        public EnvironmentVariableScope(string name, string? value)
+        {
+            this.name = name;
+            this.originalValue = Environment.GetEnvironmentVariable(name);
+            Environment.SetEnvironmentVariable(name, value);
+        }
+
+        public void Dispose()
+            => Environment.SetEnvironmentVariable(this.name, this.originalValue);
+    }
+
+    private sealed class SecretFiles : IDisposable
+    {
+        private SecretFiles(
+            string directory,
+            string passfile,
+            string rootCertificate,
+            string clientCertificate,
+            string clientKey)
+        {
+            this.Directory = directory;
+            this.Passfile = passfile;
+            this.RootCertificate = rootCertificate;
+            this.ClientCertificate = clientCertificate;
+            this.ClientKey = clientKey;
+        }
+
+        public string Directory { get; }
+
+        public string Passfile { get; }
+
+        public string RootCertificate { get; }
+
+        public string ClientCertificate { get; }
+
+        public string ClientKey { get; }
+
+        public static SecretFiles Create()
+        {
+            var directory = Path.Combine(Path.GetTempPath(), "jellyfin-npgsql-unit-" + Guid.NewGuid().ToString("N"));
+            System.IO.Directory.CreateDirectory(directory);
+            var passfile = Path.Combine(directory, "pgpass");
+            File.WriteAllText(passfile, "database.internal:5544:jellyfin:jellyfin_runtime:test-password\n");
+
+            using var rsa = RSA.Create(2048);
+            var request = new CertificateRequest("CN=jellyfin-unit-root", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            request.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
+            using var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+            var rootCertificate = Path.Combine(directory, "root.pem");
+            File.WriteAllText(rootCertificate, certificate.ExportCertificatePem());
+            var clientCertificate = Path.Combine(directory, "client.pem");
+            File.WriteAllText(clientCertificate, certificate.ExportCertificatePem());
+            var clientKey = Path.Combine(directory, "client-key.pem");
+            File.WriteAllText(clientKey, rsa.ExportPkcs8PrivateKeyPem());
+            return new SecretFiles(directory, passfile, rootCertificate, clientCertificate, clientKey);
+        }
+
+        public void Dispose()
+            => System.IO.Directory.Delete(this.Directory, true);
+    }
+}
+
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class PostgresEnvironmentCollection
+{
+    public const string Name = "PostgreSQL environment";
 }

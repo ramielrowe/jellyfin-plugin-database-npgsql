@@ -57,6 +57,10 @@ internal static class NpgsqlOptionsBootstrap
             {
                 npgsql.MigrationsAssembly(Assembly.GetExecutingAssembly().GetName().Name);
                 npgsql.CommandTimeout(configured.CommandTimeout);
+                if (configured.ConfigureDataSource is not null)
+                {
+                    npgsql.ConfigureDataSource(configured.ConfigureDataSource);
+                }
             });
         options.ReplaceService<IModelCustomizer, NpgsqlModelCustomizer>();
         return configured;
@@ -72,6 +76,10 @@ internal static class NpgsqlOptionsBootstrap
         string connectionString,
         Collection<CustomDatabaseOption>? customOptions)
     {
+        // Reject ambient configuration before invoking any Npgsql parsing or
+        // defaults. database.xml is the sole configuration authority.
+        NpgsqlConfigurationSecurity.RejectRecognizedEnvironmentFallbacks();
+
         if (string.IsNullOrWhiteSpace(connectionString))
         {
             throw ConfigurationError("CustomProviderOptions.ConnectionString is required");
@@ -142,6 +150,9 @@ internal static class NpgsqlOptionsBootstrap
             throw ConfigurationError("No Reset On Close must remain disabled so pooled session state cannot leak between operations");
         }
 
+        var passfileConfigured = !string.IsNullOrWhiteSpace(builder.Passfile);
+        var configureDataSource = NpgsqlConfigurationSecurity.PrepareSecretFiles(builder);
+
         builder.SearchPath = "public";
         builder.Timezone = "UTC";
         builder.CommandTimeout = commandTimeout;
@@ -161,8 +172,9 @@ internal static class NpgsqlOptionsBootstrap
             builder.Database!,
             builder.SslMode.ToString(),
             builder.Pooling,
-            !string.IsNullOrWhiteSpace(builder.Passfile),
-            commandTimeout);
+            passfileConfigured,
+            commandTimeout,
+            configureDataSource);
     }
 
     private static int ReadCommandTimeout(

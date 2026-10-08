@@ -70,8 +70,24 @@ Connection, cancellation, and pool sizes are also bounded. The provider requires
 an explicit host, database, and username, forces UTC and the `public` search path,
 and rejects connection settings that log parameters, include potentially secret
 server details, retain security information, or preserve pooled session state.
-TLS certificate and passfile settings are passed to Npgsql but their paths and
-contents are never logged.
+TLS certificate and passfile settings are validated and loaded before Npgsql
+startup, then their paths are removed from the normalized connection string.
+Configuration failures identify only the setting—not its path or contents. A
+passfile used for authentication must be readable, no larger than 1 MiB, and
+contain well-formed PostgreSQL password entries. As in Npgsql, an explicitly
+configured password takes precedence over an otherwise unused passfile. Client
+certificates must be a PEM certificate/key pair or a PFX file; root certificates
+must be PEM or an unencrypted PFX.
+
+Npgsql 10.0.3 recognizes several PostgreSQL environment fallbacks. To keep
+`database.xml` authoritative, startup rejects `PGUSER`, `PGPASSWORD`,
+`PGPASSFILE`, `PGSSLCERT`, `PGSSLKEY`, `PGSSLROOTCERT`, `PGCLIENTENCODING`,
+`PGTZ`, `PGOPTIONS`, `PGTARGETSESSIONATTRS`, `PGSSLNEGOTIATION`,
+`PGGSSENCMODE`, `PGREQUIREAUTH`, and `PGAPPNAME` when they are present (even
+when empty). This Npgsql release does not consume `PGHOST`, `PGPORT`,
+`PGDATABASE`, or `PGSSLMODE`; explicit connection-string endpoint and TLS
+settings remain authoritative. Startup also rejects conventional password or
+TLS files in the home directory whenever Npgsql could otherwise load them.
 
 Create the UTF8 database before starting Jellyfin. The configured login should
 own the Jellyfin objects and needs `CONNECT` on that database plus `USAGE` and

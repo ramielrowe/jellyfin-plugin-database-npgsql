@@ -36,6 +36,23 @@ BOOTSTRAP_PASSWORD=$(tr -d '-' </proc/sys/kernel/random/uuid)
 APPLICATION_PASSWORD=$(tr -d '-' </proc/sys/kernel/random/uuid)
 ADMIN_PASSWORD=$(tr -d '-' </proc/sys/kernel/random/uuid)
 HOST_PID=""
+HOST_ENVIRONMENT=(
+    env
+    -u PGUSER
+    -u PGPASSWORD
+    -u PGPASSFILE
+    -u PGSSLCERT
+    -u PGSSLKEY
+    -u PGSSLROOTCERT
+    -u PGCLIENTENCODING
+    -u PGTZ
+    -u PGOPTIONS
+    -u PGTARGETSESSIONATTRS
+    -u PGSSLNEGOTIATION
+    -u PGGSSENCMODE
+    -u PGREQUIREAUTH
+    -u PGAPPNAME
+)
 
 export NUGET_PACKAGES NUGET_HTTP_CACHE_PATH
 
@@ -95,7 +112,8 @@ wait_for_health() {
 
 start_host() {
     local log_file=$1
-    dotnet "$RUN_ROOT/host-publish/jellyfin.dll" \
+    shift
+    "${HOST_ENVIRONMENT[@]}" "$@" dotnet "$RUN_ROOT/host-publish/jellyfin.dll" \
         --datadir "$RUN_ROOT/runtime/data" \
         --configdir "$RUN_ROOT/runtime/config" \
         --cachedir "$RUN_ROOT/runtime/cache" \
@@ -107,9 +125,77 @@ start_host() {
     HOST_PID=$!
 }
 
+restore_database_configuration() {
+    cp "$RUN_ROOT/database.xml.baseline" "$RUN_ROOT/runtime/config/database.xml"
+}
+
+set_database_connection_string() {
+    local connection_string=$1
+    python3 -c 'import sys, xml.etree.ElementTree as ET
+path, connection_string = sys.argv[1:]
+tree = ET.parse(path)
+node = tree.find("./CustomProviderOptions/ConnectionString")
+if node is None:
+    raise SystemExit("database.xml has no ConnectionString element")
+node.text = connection_string
+tree.write(path, encoding="utf-8", xml_declaration=True)' \
+        "$RUN_ROOT/runtime/config/database.xml" \
+        "$connection_string"
+}
+
+assert_log_redacted() {
+    local log_file=$1
+    shift
+    local sensitive
+    for sensitive in "$@"; do
+        [ -n "$sensitive" ] || continue
+        if grep -F -- "$sensitive" "$log_file" >/dev/null; then
+            fail "startup log exposed sensitive configuration from $log_file"
+        fi
+    done
+}
+
+assert_environment_rejected() {
+    local variable=$1
+    local value=$2
+    local test_name=$3
+    local log_file="$RUN_ROOT/$test_name.log"
+
+    restore_database_configuration
+    start_host "$log_file" "$variable=$value"
+    wait_for_host_exit || fail "host did not stop after $variable supplied ambient PostgreSQL configuration"
+    grep -F "environment variable '$variable' must be unset because database.xml is the only supported configuration source" "$log_file" >/dev/null \
+        || fail "$variable was not rejected by the untouched host before it changed database behavior"
+    grep -F "No database connection was attempted" "$log_file" >/dev/null \
+        || fail "$variable rejection did not state its pre-connection boundary"
+    assert_log_redacted "$log_file" "$value" "$APPLICATION_PASSWORD" "$BOOTSTRAP_PASSWORD" "$ADMIN_PASSWORD"
+}
+
+assert_secret_file_rejected() {
+    local test_name=$1
+    local expected_message=$2
+    local sensitive_path=$3
+    local sensitive_content=$4
+    local log_file="$RUN_ROOT/$test_name.log"
+
+    start_host "$log_file"
+    wait_for_host_exit || fail "host did not stop after $test_name secret-file validation failed"
+    grep -F "$expected_message" "$log_file" >/dev/null \
+        || fail "$test_name did not produce the sanitized secret-file diagnostic"
+    grep -F "No database connection was attempted" "$log_file" >/dev/null \
+        || fail "$test_name did not state its pre-connection boundary"
+    assert_log_redacted \
+        "$log_file" \
+        "$sensitive_path" \
+        "$sensitive_content" \
+        "$APPLICATION_PASSWORD" \
+        "$BOOTSTRAP_PASSWORD" \
+        "$ADMIN_PASSWORD"
+}
+
 start_unsupported_host() {
     local log_file=$1
-    dotnet "$RUN_ROOT/unsupported-host-publish/jellyfin.dll" \
+    "${HOST_ENVIRONMENT[@]}" dotnet "$RUN_ROOT/unsupported-host-publish/jellyfin.dll" \
         --datadir "$RUN_ROOT/runtime/data" \
         --configdir "$RUN_ROOT/runtime/config" \
         --cachedir "$RUN_ROOT/runtime/cache" \
@@ -286,6 +372,7 @@ sed \
     -e "s/__APPLICATION_PASSWORD__/$APPLICATION_PASSWORD/g" \
     "$PLUGIN_ROOT/tests/fixtures/database.xml" \
     >"$RUN_ROOT/runtime/config/database.xml"
+cp "$RUN_ROOT/runtime/config/database.xml" "$RUN_ROOT/database.xml.baseline"
 sed \
     -e "s/18096/$HTTP_PORT/g" \
     -e "s/18920/$HTTPS_PORT/g" \
@@ -314,6 +401,65 @@ grep -F "supports Jellyfin database ABI 12.2.x; the host loaded 13.0.0.0" "$RUN_
     || fail "unsupported host ABI failure did not identify the supported and loaded versions"
 grep -F "No database connection was attempted" "$RUN_ROOT/unsupported-abi.log" >/dev/null \
     || fail "unsupported host ABI failure did not state its pre-connection boundary"
+
+# Npgsql 10.0.3 reads these ambient variables after parsing the connection
+# string. Each untouched-host control must fail before PostgreSQL is started,
+# without logging the variable value. The two PGOPTIONS cases cover both schema
+# selection and read-only transaction state rather than treating PGOPTIONS as a
+# single syntactic edge case.
+assert_environment_rejected "PGOPTIONS" "-c search_path=private" "ambient-pgoptions-search-path"
+assert_environment_rejected "PGOPTIONS" "-c default_transaction_read_only=on" "ambient-pgoptions-read-only"
+assert_environment_rejected "PGPASSWORD" "ambient-password-secret" "ambient-password"
+assert_environment_rejected "PGTARGETSESSIONATTRS" "read-only" "ambient-target-session"
+assert_environment_rejected "PGSSLCERT" "/sensitive/ambient-client-certificate.pem" "ambient-client-certificate"
+assert_environment_rejected "PGAPPNAME" "" "ambient-empty-application-name"
+
+SECRET_FILE_MARKER="secret-file-content-$SMOKE_ID"
+MISSING_PASSFILE="$RUN_ROOT/sensitive-missing-passfile-$SMOKE_ID.pgpass"
+restore_database_configuration
+set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Passfile=$MISSING_PASSFILE"
+assert_secret_file_rejected \
+    "missing-passfile" \
+    "Passfile must name a readable, well-formed PostgreSQL password file" \
+    "$MISSING_PASSFILE" \
+    "$SECRET_FILE_MARKER"
+
+UNREADABLE_PASSFILE="$RUN_ROOT/sensitive-unreadable-passfile-$SMOKE_ID.pgpass"
+printf '127.0.0.1:%s:jellyfin:jellyfin:%s\n' "$POSTGRES_PORT" "$SECRET_FILE_MARKER" >"$UNREADABLE_PASSFILE"
+chmod 000 "$UNREADABLE_PASSFILE"
+restore_database_configuration
+set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Passfile=$UNREADABLE_PASSFILE"
+assert_secret_file_rejected \
+    "unreadable-passfile" \
+    "Passfile must name a readable, well-formed PostgreSQL password file" \
+    "$UNREADABLE_PASSFILE" \
+    "$SECRET_FILE_MARKER"
+chmod 600 "$UNREADABLE_PASSFILE"
+
+MISSING_ROOT_CERTIFICATE="$RUN_ROOT/sensitive-missing-root-$SMOKE_ID.pem"
+restore_database_configuration
+set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Password=$APPLICATION_PASSWORD;SSL Mode=VerifyFull;Root Certificate=$MISSING_ROOT_CERTIFICATE"
+assert_secret_file_rejected \
+    "missing-root-certificate" \
+    "Root Certificate must name a readable, valid PEM or unencrypted PFX certificate file" \
+    "$MISSING_ROOT_CERTIFICATE" \
+    "$SECRET_FILE_MARKER"
+
+UNREADABLE_CLIENT_CERTIFICATE="$RUN_ROOT/sensitive-unreadable-client-$SMOKE_ID.pem"
+UNREADABLE_CLIENT_KEY="$RUN_ROOT/sensitive-unreadable-client-key-$SMOKE_ID.pem"
+printf '%s\n' "$SECRET_FILE_MARKER" >"$UNREADABLE_CLIENT_CERTIFICATE"
+printf '%s\n' "$SECRET_FILE_MARKER" >"$UNREADABLE_CLIENT_KEY"
+chmod 000 "$UNREADABLE_CLIENT_CERTIFICATE" "$UNREADABLE_CLIENT_KEY"
+restore_database_configuration
+set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Password=$APPLICATION_PASSWORD;SSL Mode=Require;SSL Certificate=$UNREADABLE_CLIENT_CERTIFICATE;SSL Key=$UNREADABLE_CLIENT_KEY"
+assert_secret_file_rejected \
+    "unreadable-client-certificate" \
+    "SSL Certificate and SSL Key must name a readable, valid PEM pair" \
+    "$UNREADABLE_CLIENT_CERTIFICATE" \
+    "$SECRET_FILE_MARKER"
+assert_log_redacted "$RUN_ROOT/unreadable-client-certificate.log" "$UNREADABLE_CLIENT_KEY"
+chmod 600 "$UNREADABLE_CLIENT_CERTIFICATE" "$UNREADABLE_CLIENT_KEY"
+restore_database_configuration
 
 docker run \
     --detach \
@@ -352,7 +498,25 @@ if docker exec --env PGPASSWORD="$APPLICATION_PASSWORD" "$POSTGRES_CONTAINER" \
     fail "Jellyfin runtime role unexpectedly created a role"
 fi
 
-start_host "$RUN_ROOT/first-start.log"
+# Use a real passfile for every successful/guarded host start. The provider
+# must preload the matching credential and remove the path before Npgsql owns
+# the data source; this preserves passfile support while making later exception
+# chains incapable of exposing the configured path.
+RUNTIME_PASSFILE="$RUN_ROOT/runtime/sensitive-runtime-$SMOKE_ID.pgpass"
+printf '127.0.0.1:%s:jellyfin:jellyfin:%s\n' "$POSTGRES_PORT" "$APPLICATION_PASSWORD" >"$RUNTIME_PASSFILE"
+chmod 600 "$RUNTIME_PASSFILE"
+restore_database_configuration
+set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Passfile=$RUNTIME_PASSFILE"
+
+# These variables are standard libpq settings but are deliberately not consumed
+# by Npgsql 10.0.3. Supplying hostile values on the real host proves that the
+# explicit database.xml endpoint and SSL mode remain authoritative.
+start_host \
+    "$RUN_ROOT/first-start.log" \
+    "PGHOST=attacker.invalid" \
+    "PGPORT=1" \
+    "PGDATABASE=attacker_database" \
+    "PGSSLMODE=disable"
 if [ "${PROVIDER_CORE_ONLY:-false}" = "true" ]; then
     for _ in $(seq 1 60); do
         if grep -F 'does not yet implement the rollback-capable PostgreSQL migration backup protocol required by vanilla Jellyfin' "$RUN_ROOT/first-start.log" >/dev/null; then
@@ -373,6 +537,9 @@ if [ "${PROVIDER_CORE_ONLY:-false}" = "true" ]; then
         || fail "provider did not emit its endpoint-only configuration diagnostic"
     if grep -F -e "$APPLICATION_PASSWORD" -e "$BOOTSTRAP_PASSWORD" -e "$ADMIN_PASSWORD" "$RUN_ROOT/first-start.log" >/dev/null; then
         fail "vanilla host log exposed a smoke-test credential"
+    fi
+    if grep -F "$RUNTIME_PASSFILE" "$RUN_ROOT/first-start.log" >/dev/null; then
+        fail "vanilla host log exposed the configured passfile path"
     fi
     [ "$(psql_value "SELECT COUNT(*) FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename <> '__EFMigrationsHistory'")" = "0" ] \
         || fail "the guarded startup created application tables"
@@ -402,6 +569,7 @@ if [ "${PROVIDER_CORE_ONLY:-false}" = "true" ]; then
         echo "runtime_role_flags=LOGIN,NOSUPERUSER,NOCREATEDB,NOCREATEROLE,NOREPLICATION,NOBYPASSRLS"
         echo "guarded_mutation=true"
         echo "endpoint_log_redacted=true"
+        echo "passfile_path_redacted=true"
     } | tee "$RUN_ROOT/evidence.txt"
 
     echo "Provider-core smoke test passed. Evidence: $RUN_ROOT/evidence.txt"
