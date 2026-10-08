@@ -60,7 +60,8 @@ public sealed class PristineJellyfinPublish
     public static async Task<PristineJellyfinPublish> CreateAsync(
         PristineJellyfinPublishOptions options,
         string destination,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action? inputVerifiedForTest = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         ValidateExpectedHash(options.Sha256);
@@ -78,15 +79,39 @@ public sealed class PristineJellyfinPublish
             throw new InvalidOperationException("The pristine Jellyfin publish destination must not already exist.");
         }
 
-        Directory.CreateDirectory(destination);
+        var destinationFullPath = Path.GetFullPath(destination);
+        destination = destinationFullPath;
+        if (hasDirectory)
+        {
+            var sourceFullPath = Path.GetFullPath(options.PublishDirectory!);
+            if (IsSameOrDescendant(destinationFullPath, sourceFullPath)
+                || IsSameOrDescendant(sourceFullPath, destinationFullPath))
+            {
+                throw new InvalidOperationException("The source and isolated Jellyfin publish destination must not overlap.");
+            }
+        }
+
+        Directory.CreateDirectory(destinationFullPath);
         try
         {
             if (hasArchive)
             {
                 var archivePath = Path.GetFullPath(options.ArchivePath!);
-                var archiveHash = await HashFileAsync(archivePath, cancellationToken).ConfigureAwait(false);
+                await using var archiveStream = new FileStream(
+                    archivePath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read,
+                    64 * 1024,
+                    FileOptions.Asynchronous | FileOptions.SequentialScan);
+                var archiveHash = await HashStreamAsync(archiveStream, cancellationToken).ConfigureAwait(false);
                 EnsureHash(options.Sha256, archiveHash, "Jellyfin host archive");
-                ExtractZipSafely(archivePath, destination);
+                inputVerifiedForTest?.Invoke();
+                archiveStream.Position = 0;
+                ExtractZipSafely(archiveStream, destination);
+                archiveStream.Position = 0;
+                var postExtractionHash = await HashStreamAsync(archiveStream, cancellationToken).ConfigureAwait(false);
+                EnsureHash(options.Sha256, postExtractionHash, "Jellyfin host archive after extraction");
             }
             else
             {
@@ -98,7 +123,10 @@ public sealed class PristineJellyfinPublish
 
                 var sourceHash = await HashDirectoryAsync(source, cancellationToken).ConfigureAwait(false);
                 EnsureHash(options.Sha256, sourceHash, "Jellyfin host publish");
+                inputVerifiedForTest?.Invoke();
                 CopyDirectory(source, destination);
+                var copiedHash = await HashDirectoryAsync(destination, cancellationToken).ConfigureAwait(false);
+                EnsureHash(options.Sha256, copiedHash, "Copied Jellyfin host publish");
             }
 
             if (!File.Exists(Path.Combine(destination, "jellyfin.dll")))
@@ -181,14 +209,25 @@ public sealed class PristineJellyfinPublish
     public static async Task<string> HashFileAsync(string path, CancellationToken cancellationToken)
     {
         await using var stream = File.OpenRead(path);
+        return await HashStreamAsync(stream, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<string> HashStreamAsync(Stream stream, CancellationToken cancellationToken)
+    {
         var hash = await SHA256.HashDataAsync(stream, cancellationToken).ConfigureAwait(false);
         return Convert.ToHexString(hash).ToLowerInvariant();
     }
 
     public static void ExtractZipSafely(string archivePath, string destination)
     {
+        using var stream = new FileStream(archivePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        ExtractZipSafely(stream, destination);
+    }
+
+    private static void ExtractZipSafely(Stream stream, string destination)
+    {
         var root = Path.GetFullPath(destination) + Path.DirectorySeparatorChar;
-        using var archive = ZipFile.OpenRead(archivePath);
+        using var archive = new ZipArchive(stream, ZipArchiveMode.Read, leaveOpen: true);
         foreach (var entry in archive.Entries)
         {
             var outputPath = Path.GetFullPath(Path.Combine(destination, entry.FullName));
@@ -238,5 +277,12 @@ public sealed class PristineJellyfinPublish
         {
             throw new InvalidOperationException($"{description} SHA-256 did not match the explicitly configured value.");
         }
+    }
+
+    private static bool IsSameOrDescendant(string candidate, string root)
+    {
+        var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        return string.Equals(candidate, root, comparison)
+            || candidate.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, comparison);
     }
 }

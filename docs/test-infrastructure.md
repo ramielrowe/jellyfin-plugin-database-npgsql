@@ -29,6 +29,8 @@ dotnet test --project tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jel
 The administrator database name must contain `jellyfin_npgsql_test_admin`, and
 the administrator must have `CREATEDB` and `CREATEROLE`. This explicit safety
 marker is intentional; do not point the fixture at a production cluster.
+The real fixture asserts PostgreSQL major 16. The controlled container asserts
+the exact 16.6 server version as well as the numeric major.
 
 Alternatively, start the immutable PostgreSQL 16.6 test image automatically:
 
@@ -43,6 +45,7 @@ The default image is pinned by SHA-256. An override through
 `JELLYFIN_NPGSQL_TEST_POSTGRES_IMAGE` is accepted only when it is also a
 digest-pinned reference. Set `JELLYFIN_NPGSQL_TEST_WORKER` when separate test
 processes need a readable worker tag; randomness already prevents collisions.
+An override which does not actually run PostgreSQL 16.6 fails after connection.
 The real test verifies concurrent worker isolation, restricted privileges,
 cleanup after success, a setup callback failure, and cancellation.
 
@@ -81,9 +84,10 @@ dotnet test --project tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jel
 
 For a ZIP, calculate the ordinary file SHA-256 with `hash-archive`, then set
 `JELLYFIN_NPGSQL_TEST_HOST_ARCHIVE` instead. ZIP traversal paths are rejected.
-Successful runs delete their isolated case directory. A failed host run keeps
-only its isolated case under the explicitly selected artifact root, with
-collected diagnostics redacted.
+Successful runs delete their isolated case directory. A failed host run copies
+only redacted collected logs into a mode-0700 failure directory (mode-0600
+files), then deletes configuration, data, cache, media, raw logs, keys,
+passfiles, certificates, and the host copy.
 
 No helper searches for or references a sibling/parent Jellyfin checkout. The
 standalone plugin root is found by its own solution marker, so the same commands
@@ -104,7 +108,8 @@ export JELLYFIN_HOST_SHA256=<publish hash>
 PROVIDER_CORE_ONLY=true ./tests/black-box-smoke.sh
 ```
 
-This path uses the same digest-pinned PostgreSQL image. The reusable C# fixture
+This path uses the same digest-pinned PostgreSQL 16.6 image and verifies both
+`server_version` and `server_version_num` after startup. The reusable C# fixture
 above is the preferred path for new database tests and supports an external
-administrator connection; the package smoke retains its container because it
-also controls exact PostgreSQL process/version evidence.
+administrator connection. The package smoke removes its labeled container and
+retains only redacted logs and evidence with owner-only modes.

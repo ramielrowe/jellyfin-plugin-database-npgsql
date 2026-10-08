@@ -51,12 +51,13 @@ public sealed class PristineHostOptInTests
                 Path.Combine(caseRoot, "pristine-host"),
                 TestContext.Current.CancellationToken);
             var ffmpeg = Path.Combine(repositoryRoot, "tests", "fixtures", "fake-ffmpeg.sh");
+            var portCoordinationRoot = Path.Combine(artifactRoot, ".port-leases");
             for (var launch = 0; launch < 2; launch++)
             {
-                var httpPort = LoopbackPortReservation.GetAvailablePort();
-                var httpsPort = LoopbackPortReservation.GetAvailablePort();
+                using var httpPort = LoopbackPortReservation.Acquire(portCoordinationRoot);
+                using var httpsPort = LoopbackPortReservation.Acquire(portCoordinationRoot);
                 var layout = JellyfinHostLayout.Create(Path.Combine(caseRoot, "runs"), publish, "launch-" + launch);
-                layout.WriteNetworkConfiguration(httpPort, httpsPort);
+                layout.WriteNetworkConfiguration(httpPort.Port, httpsPort.Port);
                 var password = "test-only-" + Guid.NewGuid().ToString("N");
                 var redactor = new SensitiveDataRedactor(password);
                 await using var host = JellyfinHostProcess.Start(
@@ -90,13 +91,38 @@ public sealed class PristineHostOptInTests
         }
         finally
         {
-            if (succeeded)
+            if (!succeeded && Directory.Exists(caseRoot))
+            {
+                var retained = Path.Combine(artifactRoot, "failed-" + Path.GetFileName(caseRoot));
+                Directory.CreateDirectory(retained);
+                foreach (var log in Directory.EnumerateFiles(caseRoot, "*", SearchOption.AllDirectories)
+                             .Where(path => path.Contains(
+                                 Path.DirectorySeparatorChar + "collected-logs" + Path.DirectorySeparatorChar,
+                                 StringComparison.Ordinal)))
+                {
+                    File.Copy(log, Path.Combine(retained, Path.GetFileName(log)), overwrite: true);
+                }
+
+                if (!OperatingSystem.IsWindows())
+                {
+                    File.SetUnixFileMode(retained, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                    foreach (var log in Directory.EnumerateFiles(retained))
+                    {
+                        File.SetUnixFileMode(log, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+                    }
+                }
+            }
+
+            if (Directory.Exists(caseRoot))
             {
                 Directory.Delete(caseRoot, recursive: true);
-                if (configuredArtifactRoot is null && !Directory.EnumerateFileSystemEntries(artifactRoot).Any())
-                {
-                    Directory.Delete(artifactRoot);
-                }
+            }
+
+            if (configuredArtifactRoot is null
+                && Directory.Exists(artifactRoot)
+                && !Directory.EnumerateFileSystemEntries(artifactRoot).Any())
+            {
+                Directory.Delete(artifactRoot);
             }
         }
     }

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Npgsql;
 
 namespace Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
@@ -15,11 +16,15 @@ public sealed class SensitiveDataRedactor
 
     public void Add(params IEnumerable<string?> secrets)
     {
-        foreach (var secret in secrets)
+        lock (_secrets)
         {
-            if (!string.IsNullOrEmpty(secret) && !_secrets.Contains(secret, StringComparer.Ordinal))
+            foreach (var secret in secrets)
             {
-                _secrets.Add(secret);
+                if (!string.IsNullOrEmpty(secret) && !_secrets.Contains(secret, StringComparer.Ordinal))
+                {
+                    _secrets.Add(secret);
+                    _secrets.Sort((left, right) => right.Length.CompareTo(left.Length));
+                }
             }
         }
     }
@@ -27,12 +32,26 @@ public sealed class SensitiveDataRedactor
     public string Redact(string value)
     {
         var redacted = value;
-        foreach (var secret in _secrets)
+        string[] secrets;
+        lock (_secrets)
+        {
+            secrets = _secrets.ToArray();
+        }
+
+        foreach (var secret in secrets)
         {
             redacted = redacted.Replace(secret, "<redacted>", StringComparison.Ordinal);
         }
 
         return redacted;
+    }
+
+    public bool ContainsKnownSecret(string value)
+    {
+        lock (_secrets)
+        {
+            return _secrets.Any(secret => value.Contains(secret, StringComparison.Ordinal));
+        }
     }
 
     public static string RedactConnectionString(string connectionString)

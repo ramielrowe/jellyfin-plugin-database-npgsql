@@ -21,6 +21,8 @@ public sealed record ExternalCommandResult(int ExitCode, string StandardOutput, 
 
 public static class ExternalCommand
 {
+    private static readonly TimeSpan TerminationGracePeriod = TimeSpan.FromSeconds(5);
+
     public static async Task<ExternalCommandResult> RunAsync(
         string fileName,
         IEnumerable<string> arguments,
@@ -80,7 +82,7 @@ public static class ExternalCommand
         catch (OperationCanceledException)
         {
             TryTerminate(process);
-            await Task.WhenAll(readStdout, readStderr).ConfigureAwait(false);
+            await DrainOutputBoundedAsync(process, readStdout, readStderr).ConfigureAwait(false);
             if (timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
                 throw new TimeoutException($"Test command '{fileName}' exceeded its {timeout.TotalSeconds:F0}-second timeout.");
@@ -89,7 +91,7 @@ public static class ExternalCommand
             throw;
         }
 
-        await Task.WhenAll(readStdout, readStderr).ConfigureAwait(false);
+        await DrainOutputBoundedAsync(process, readStdout, readStderr).ConfigureAwait(false);
         return new ExternalCommandResult(process.ExitCode, stdout.ToString(), stderr.ToString());
     }
 
@@ -113,9 +115,31 @@ public static class ExternalCommand
     {
         var buffer = new char[4096];
         int count;
-        while ((count = await reader.ReadAsync(buffer).ConfigureAwait(false)) != 0)
+        try
         {
-            destination.Append(buffer, 0, count);
+            while ((count = await reader.ReadAsync(buffer).ConfigureAwait(false)) != 0)
+            {
+                destination.Append(buffer, 0, count);
+            }
         }
+        catch (Exception ex) when (ex is ObjectDisposedException or System.IO.IOException)
+        {
+            // A detached descendant can keep an inherited pipe open forever.
+            // Bounded shutdown closes our reader after the command itself dies.
+        }
+    }
+
+    private static async Task DrainOutputBoundedAsync(Process process, Task stdout, Task stderr)
+    {
+        var readers = Task.WhenAll(stdout, stderr);
+        if (await Task.WhenAny(readers, Task.Delay(TerminationGracePeriod)).ConfigureAwait(false) == readers)
+        {
+            await readers.ConfigureAwait(false);
+            return;
+        }
+
+        process.StandardOutput.Dispose();
+        process.StandardError.Dispose();
+        _ = await Task.WhenAny(readers, Task.Delay(TerminationGracePeriod)).ConfigureAwait(false);
     }
 }

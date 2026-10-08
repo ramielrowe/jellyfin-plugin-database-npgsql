@@ -38,8 +38,21 @@ public sealed class JellyfinHostLayout
 
     public static JellyfinHostLayout Create(string artifactRoot, PristineJellyfinPublish publish, string? workerId = null)
     {
-        var runName = "jellyfin-npgsql-test-run-" + (workerId ?? "worker") + "-" + Guid.NewGuid().ToString("N");
-        var root = Path.Combine(Path.GetFullPath(artifactRoot), runName);
+        var safeWorker = new string((workerId ?? "worker").Select(character => char.IsAsciiLetterOrDigit(character) ? character : '_').ToArray());
+        safeWorker = safeWorker.Trim('_');
+        if (safeWorker.Length == 0)
+        {
+            safeWorker = "worker";
+        }
+
+        safeWorker = safeWorker.Length > 32 ? safeWorker[..32] : safeWorker;
+        var runName = "jellyfin-npgsql-test-run-" + safeWorker + "-" + Guid.NewGuid().ToString("N");
+        var artifactRootFullPath = Path.GetFullPath(artifactRoot);
+        var root = Path.GetFullPath(Path.Combine(artifactRootFullPath, runName));
+        if (!root.StartsWith(artifactRootFullPath + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("The generated test run path escaped its artifact root.");
+        }
         var layout = new JellyfinHostLayout(root, publish);
         Directory.CreateDirectory(layout.ConfigurationDirectory);
         Directory.CreateDirectory(layout.CacheDirectory);
@@ -85,9 +98,9 @@ public sealed class JellyfinHostLayout
 
     public void WriteNetworkConfiguration(int httpPort, int httpsPort)
     {
-        if (httpPort is < 1024 or > 65535 || httpsPort is < 1024 or > 65535 || httpPort == httpsPort)
+        if (httpPort is < 1 or > 65535 || httpsPort is < 1 or > 65535 || httpPort == httpsPort)
         {
-            throw new ArgumentOutOfRangeException(nameof(httpPort), "Test HTTP and HTTPS ports must be distinct non-privileged ports.");
+            throw new ArgumentOutOfRangeException(nameof(httpPort), "Test HTTP and HTTPS ports must be distinct decimal values from 1 through 65535.");
         }
 
         var document = new XDocument(
@@ -115,6 +128,59 @@ public sealed class JellyfinHostLayout
             File.WriteAllText(
                 Path.Combine(CollectedLogDirectory, relative),
                 redactor.Redact(File.ReadAllText(source)));
+        }
+    }
+
+    public void RetainOnlySanitizedEvidence(SensitiveDataRedactor redactor)
+    {
+        Exception? collectionError = null;
+        try
+        {
+            CollectSanitizedLogs(redactor);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            collectionError = ex;
+        }
+        finally
+        {
+            foreach (var directory in new[] { ConfigurationDirectory, CacheDirectory, DataDirectory, MediaDirectory, LogDirectory })
+            {
+                if (Directory.Exists(directory))
+                {
+                    Directory.Delete(directory, recursive: true);
+                }
+            }
+
+            foreach (var processLog in Directory.EnumerateFiles(RunRoot, "process*.log", SearchOption.TopDirectoryOnly))
+            {
+                File.Delete(processLog);
+            }
+        }
+
+        if (collectionError is not null)
+        {
+            throw new InvalidOperationException("Raw test artifacts were removed, but sanitized log collection failed.", collectionError);
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(CollectedLogDirectory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+
+        foreach (var evidence in Directory.EnumerateFiles(CollectedLogDirectory, "*", SearchOption.AllDirectories))
+        {
+            var contents = File.ReadAllText(evidence);
+            if (redactor.ContainsKnownSecret(contents))
+            {
+                File.Delete(evidence);
+                throw new InvalidOperationException("Sanitized test evidence still contains a generated secret.");
+            }
+
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(evidence, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
         }
     }
 }

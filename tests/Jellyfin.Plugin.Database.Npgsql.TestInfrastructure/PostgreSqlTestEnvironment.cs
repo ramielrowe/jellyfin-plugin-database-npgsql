@@ -38,10 +38,22 @@ public sealed class PostgreSqlTestEnvironment : IAsyncDisposable
         if (options.UseContainer)
         {
             var container = await PostgreSqlTestContainer.StartAsync(options, cancellationToken).ConfigureAwait(false);
-            return new PostgreSqlTestEnvironment(options, container.AdministratorConnectionString, container);
+            try
+            {
+                await PostgreSqlTestDatabase.ValidateServerMajorAsync(container.AdministratorConnectionString, 16, cancellationToken).ConfigureAwait(false);
+                await PostgreSqlTestDatabase.ReclaimStaleResourcesAsync(container.AdministratorConnectionString, cancellationToken).ConfigureAwait(false);
+                return new PostgreSqlTestEnvironment(options, container.AdministratorConnectionString, container);
+            }
+            catch
+            {
+                await container.DisposeAsync().ConfigureAwait(false);
+                throw;
+            }
         }
 
         _ = PostgreSqlTestDatabase.ValidateAdministratorConnectionString(options.AdministratorConnectionString!);
+        await PostgreSqlTestDatabase.ValidateServerMajorAsync(options.AdministratorConnectionString!, 16, cancellationToken).ConfigureAwait(false);
+        await PostgreSqlTestDatabase.ReclaimStaleResourcesAsync(options.AdministratorConnectionString!, cancellationToken).ConfigureAwait(false);
         return new PostgreSqlTestEnvironment(options, options.AdministratorConnectionString!, null);
     }
 

@@ -29,8 +29,7 @@ dependent implementation beads.
 | .NET | SDK 10.0.401, runtime 10.0 | Supported |
 | Entity Framework Core | 10.0.11 | Must match the host |
 | Npgsql EF provider / Npgsql | 10.0.3 / 10.0.3 | Shipped beside the plugin |
-| PostgreSQL | 18.6, image digest `sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336` | Automated black-box gate |
-| PostgreSQL (manual) | 16.6 | Prior manual observation only; it does not establish automated 16–18 coverage |
+| PostgreSQL | 16.6, image digest `sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36` | Automated black-box gate with runtime version assertion |
 | Host PostgreSQL client programs | `pg_dump` absent; `psql` absent | Not required |
 
 The provider rejects any Jellyfin database assembly outside ABI 12.2.x or 13.0.x
@@ -183,7 +182,7 @@ fails with instructions after the plugin is relocated. `JELLYFIN_HOST_COMMIT` an
 `POSTGRES_IMAGE` parameterize the two pinned inputs for an explicit compatibility
 run; `POSTGRES_PORT`, `HTTP_PORT`, and `HTTPS_PORT` may also be supplied when fixed
 ports are required. The passing default run used
-Jellyfin 12.2.0 and PostgreSQL 18.6 and reported 28 restored foreign keys, the
+Jellyfin 12.2.0 and PostgreSQL 16.6 and reported 28 restored foreign keys, the
 single 511-character model override, exact identity sequence state, no host
 `pg_dump` or `psql`, and only the three expected package DLLs.
 
