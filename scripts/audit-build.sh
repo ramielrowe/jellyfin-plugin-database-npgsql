@@ -5,7 +5,8 @@ PLUGIN_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PACKAGE_DIR="$PLUGIN_ROOT/artifacts/package"
 PACKAGE_ZIP="$PLUGIN_ROOT/artifacts/jellyfin-plugin-database-npgsql_0.1.0.0.zip"
 PROVIDER_PROJECT="$PLUGIN_ROOT/src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj"
-REFERENCE_REPORT="$PLUGIN_ROOT/artifacts/evaluated-references.json"
+NEGATIVE_CONTROL_PROJECT="$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests.csproj"
+REFERENCE_REPORT_DIR="$PLUGIN_ROOT/artifacts/evaluated-references"
 
 fail() {
     echo "FAIL: $*" >&2
@@ -44,17 +45,65 @@ if find "$PACKAGE_DIR" -maxdepth 1 -type f \
     fail "package contains a host-owned runtime assembly"
 fi
 
-dotnet msbuild "$PROVIDER_PROJECT" \
+mkdir -p "$REFERENCE_REPORT_DIR"
+
+mapfile -d '' -t audited_projects < <(
+    find "$PLUGIN_ROOT/src" "$PLUGIN_ROOT/tests" \
+        -path "$PLUGIN_ROOT/tests/feasibility" -prune -o \
+        -type f -name '*.csproj' -print0 \
+        | sort -z
+)
+
+[ "${#audited_projects[@]}" -gt 0 ] || fail "no projects were found to audit"
+
+audit_properties=(-property:Configuration=Release)
+if [ -n "${FORBIDDEN_PARENT_CHECKOUT:-}" ]; then
+    audit_properties+=("-property:StandaloneAuditForbiddenRoot=$FORBIDDEN_PARENT_CHECKOUT")
+fi
+
+for project in "${audited_projects[@]}"; do
+    project_name=$(basename "$project" .csproj)
+    report="$REFERENCE_REPORT_DIR/$project_name.json"
+    dotnet msbuild "$project" \
+        -nologo \
+        "${audit_properties[@]}" \
+        -target:AuditStandaloneReferences \
+        -getItem:ProjectReference,ReferencePath >"$report"
+done
+
+# Regression control: import one known ProjectReference outside PLUGIN_ROOT and
+# prove the same target rejects it. This also guards against an audit target
+# that silently stops running after an SDK/MSBuild change.
+negative_root=$(mktemp -d)
+trap 'rm -rf "$negative_root"' EXIT
+mkdir -p "$negative_root/forbidden"
+cat >"$negative_root/forbidden/Forbidden.csproj" <<'EOF'
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+</Project>
+EOF
+cat >"$negative_root/inject-forbidden-reference.targets" <<EOF
+<Project>
+  <ItemGroup>
+    <ProjectReference Include="$negative_root/forbidden/Forbidden.csproj" />
+  </ItemGroup>
+</Project>
+EOF
+
+negative_log="$negative_root/audit.log"
+if dotnet msbuild "$NEGATIVE_CONTROL_PROJECT" \
+    -nologo \
     -property:Configuration=Release \
-    -getItem:ProjectReference,ReferencePath >"$REFERENCE_REPORT"
-
-if grep -F '"ProjectReference"' "$REFERENCE_REPORT" | grep -q 'Identity'; then
-    fail "release provider project has an unexpected project reference"
+    -property:CustomAfterMicrosoftCommonTargets="$negative_root/inject-forbidden-reference.targets" \
+    -target:AuditStandaloneReferences >"$negative_log" 2>&1; then
+    fail "negative control unexpectedly accepted an external ProjectReference"
 fi
 
-if [ -n "${FORBIDDEN_PARENT_CHECKOUT:-}" ] \
-    && grep -F "$FORBIDDEN_PARENT_CHECKOUT" "$REFERENCE_REPORT" >/dev/null; then
-    fail "evaluated references contain the forbidden parent checkout: $FORBIDDEN_PARENT_CHECKOUT"
+if ! grep -F "ProjectReference escapes the standalone repository:" "$negative_log" >/dev/null; then
+    cat "$negative_log" >&2
+    fail "negative control failed for an unexpected reason"
 fi
 
-echo "Build audit passed: six allowlisted package files and no external project references."
+echo "Build audit passed: six allowlisted package files, all evaluated project references are internal, and the external-reference negative control was rejected."

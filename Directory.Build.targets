@@ -6,4 +6,73 @@
       <CompilerVisibleProperty Remove="ProjectDir" />
     </ItemGroup>
   </Target>
+
+  <!--
+    This target is invoked by scripts/audit-build.sh for every release and test
+    project. Keep the checks in MSBuild so they inspect evaluated items and do
+    not depend on the formatting of command-line diagnostic output.
+  -->
+  <Target Name="AuditProjectReferenceBoundaries">
+    <PropertyGroup>
+      <_AuditRepositoryRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)'))</_AuditRepositoryRoot>
+      <_AuditRepositoryPrefix>$(_AuditRepositoryRoot)</_AuditRepositoryPrefix>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <_AuditProjectReference Include="@(ProjectReference)" />
+    </ItemGroup>
+
+    <Error
+      Condition="'@(_AuditProjectReference)' != ''
+        and !$([System.String]::Copy('%(_AuditProjectReference.FullPath)').StartsWith('$(_AuditRepositoryPrefix)'))"
+      Text="ProjectReference escapes the standalone repository: %(_AuditProjectReference.FullPath)" />
+  </Target>
+
+  <Target Name="AuditStandaloneReferences" DependsOnTargets="AuditProjectReferenceBoundaries;ResolveReferences">
+    <PropertyGroup>
+      <_AuditIsProviderProject Condition="'$(MSBuildProjectName)' == 'Jellyfin.Plugin.Database.Npgsql'">true</_AuditIsProviderProject>
+      <_AuditForbiddenRoot Condition="'$(StandaloneAuditForbiddenRoot)' != ''">$([System.IO.Path]::TrimEndingDirectorySeparator('$([System.IO.Path]::GetFullPath('$(StandaloneAuditForbiddenRoot)'))'))</_AuditForbiddenRoot>
+      <_AuditForbiddenPrefix Condition="'$(_AuditForbiddenRoot)' != ''">$(_AuditForbiddenRoot)$([System.IO.Path]::DirectorySeparatorChar)</_AuditForbiddenPrefix>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <_AuditResolvedProjectReference Include="@(ReferencePath)" Condition="'%(ReferencePath.ReferenceSourceTarget)' == 'ProjectReference'" />
+      <_AuditUnmanagedFileReference
+        Include="@(ReferencePath)"
+        Condition="'%(ReferencePath.ReferenceSourceTarget)' != 'ProjectReference'
+          and '%(ReferencePath.NuGetPackageId)' == ''
+          and '%(ReferencePath.FrameworkReferenceName)' == ''" />
+      <_AuditForbiddenHostRuntimeReference
+        Include="@(ReferencePath)"
+        Condition="'$(_AuditIsProviderProject)' == 'true'
+          and '%(ReferencePath.CopyLocal)' == 'true'
+          and (
+            '%(ReferencePath.NuGetPackageId)' == 'Jellyfin.Database.Implementations'
+            or $([System.String]::Copy('%(ReferencePath.Filename)').StartsWith('MediaBrowser.'))
+            or $([System.String]::Copy('%(ReferencePath.Filename)').StartsWith('Microsoft.EntityFrameworkCore'))
+            or $([System.String]::Copy('%(ReferencePath.Filename)').StartsWith('Microsoft.Extensions.'))
+          )" />
+      <_AuditForbiddenResolvedReference
+        Include="@(ReferencePath)"
+        Condition="'$(_AuditForbiddenRoot)' != ''
+          and (
+            '%(ReferencePath.FullPath)' == '$(_AuditForbiddenRoot)'
+            or $([System.String]::Copy('%(ReferencePath.FullPath)').StartsWith('$(_AuditForbiddenPrefix)'))
+          )" />
+    </ItemGroup>
+
+    <Error
+      Condition="'@(_AuditResolvedProjectReference)' != ''
+        and !$([System.String]::Copy('%(_AuditResolvedProjectReference.FullPath)').StartsWith('$(_AuditRepositoryPrefix)'))"
+      Text="Resolved ProjectReference escapes the standalone repository: %(_AuditResolvedProjectReference.FullPath)" />
+    <Error
+      Condition="'@(_AuditUnmanagedFileReference)' != ''"
+      Text="Resolved file reference is neither an internal project, a NuGet package, nor a framework reference: %(_AuditUnmanagedFileReference.FullPath)" />
+    <Error
+      Condition="'@(_AuditForbiddenHostRuntimeReference)' != ''"
+      Text="Provider marks a host-owned reference CopyLocal: %(_AuditForbiddenHostRuntimeReference.Filename)%(_AuditForbiddenHostRuntimeReference.Extension)" />
+    <Error
+      Condition="'@(_AuditForbiddenResolvedReference)' != ''"
+      Text="Resolved reference comes from the forbidden checkout: %(_AuditForbiddenResolvedReference.FullPath)" />
+  </Target>
 </Project>

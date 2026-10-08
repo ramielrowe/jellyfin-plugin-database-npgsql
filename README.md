@@ -36,9 +36,11 @@ dotnet msbuild build/Package.proj -target:Package -property:Configuration=Releas
 
 The package target writes a staged, allowlisted layout and ZIP beneath
 `artifacts/`; the audit rejects host-owned runtime assemblies and external project
-references. Builds are isolated from an enclosing Git repository so moving the
-workspace does not change the release binary. `build.yaml` lists the same six
-package artifacts for the official Jellyfin plugin packager.
+references in every solution project after MSBuild resolves them. The audit also
+runs a negative control that injects a known external project reference and proves
+the guard rejects it. Builds are isolated from an enclosing Git repository so
+moving the workspace does not change the release binary. `build.yaml` lists the
+same six package artifacts for the official Jellyfin plugin packager.
 
 The opt-in black-box feasibility proof remains available as
 `./tests/black-box-smoke.sh`. It requires Docker and a local Jellyfin Git checkout;
