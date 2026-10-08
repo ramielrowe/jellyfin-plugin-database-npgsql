@@ -70,16 +70,29 @@ Connection, cancellation, and pool sizes are also bounded. The provider requires
 an explicit host, database, and username, forces UTC and the `public` search path,
 and rejects connection settings that log parameters, include potentially secret
 server details, retain security information, or preserve pooled session state.
-TLS certificate and passfile settings are validated and loaded before Npgsql
-startup, then their paths are removed from the normalized connection string.
-Configuration failures identify only the setting—not its path or contents. A
-passfile used for authentication must be readable, no larger than 1 MiB, and
-contain well-formed PostgreSQL password entries. The first entry matching the
-configured host, port, database, and user is retained; other passfile
-credentials are discarded. As in Npgsql, an explicitly configured password
-takes precedence over an otherwise unused passfile. Client certificates must be
-a PEM certificate/key pair or a PFX/PKCS#12 file; root certificates must be PEM
-or an unencrypted PFX/PKCS#12 file.
+TLS certificate settings are validated and loaded before Npgsql startup, then
+their paths are removed from the normalized connection string. A configured
+passfile is preflighted, its path is removed, and a password callback safely
+reopens it for each physical connection pool. This preserves Npgsql's multi-host
+behavior: each child pool selects the first entry matching its own host, port,
+database, and user instead of resolving against the parent's comma-separated
+host list. Configuration failures identify only the setting—not its path or
+contents. A passfile used for authentication must be readable, no larger than 1
+MiB, and contain well-formed PostgreSQL password entries. As in Npgsql, lines
+are trimmed, escaped colons and backslashes are decoded, first-match precedence
+applies, and `*` is a wildcard in every field (including a null password).
+An explicitly configured password takes precedence over an otherwise unused
+passfile. Client certificates must be a PEM certificate/key pair or a
+PFX/PKCS#12 file; root certificates must be PEM or an unencrypted PFX/PKCS#12
+file.
+
+Passfile processing streams only through the first applicable entry and clears
+its temporary byte and character buffers. The selected password must be
+returned through Npgsql's managed `string` callback contract; .NET strings are
+immutable and cannot be deterministically wiped after authentication. The
+passfile path remains private callback state so it can be reopened, but neither
+the path nor any credential is placed in the normalized connection string or
+provider diagnostics.
 
 On Unix, a configured passfile, PEM client private key, or client PFX/PKCS#12
 file must have no group or other permission bits; mode `0600` is recommended

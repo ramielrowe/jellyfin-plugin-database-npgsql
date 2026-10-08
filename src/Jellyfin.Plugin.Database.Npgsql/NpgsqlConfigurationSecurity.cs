@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Security.Cryptography;
@@ -63,12 +64,12 @@ internal static class NpgsqlConfigurationSecurity
     /// Validates configured secret files without allowing their paths or contents into an exception chain.
     /// </summary>
     /// <param name="builder">The parsed database.xml connection settings.</param>
-    /// <returns>A data-source configurator that owns the preloaded secret material, or <see langword="null" />.</returns>
+    /// <returns>A data-source configurator that owns or safely resolves the secret material, or <see langword="null" />.</returns>
     internal static Action<NpgsqlDataSourceBuilder>? PrepareSecretFiles(NpgsqlConnectionStringBuilder builder)
     {
         ArgumentNullException.ThrowIfNull(builder);
 
-        string? passfilePassword = null;
+        string? passfilePath = null;
         X509Certificate2Collection? clientCertificates = null;
         X509Certificate2Collection? rootCertificates = null;
 
@@ -79,7 +80,8 @@ internal static class NpgsqlConfigurationSecurity
             // not read or retain an otherwise-unused credential file.
             if (builder.Password is null)
             {
-                passfilePassword = ReadPassfilePassword(builder.Passfile, builder);
+                passfilePath = builder.Passfile;
+                ValidateConfiguredFile(passfilePath, MaximumPassfileBytes, requireOwnerOnlyOnUnix: true);
             }
 
             builder.Passfile = null;
@@ -128,19 +130,22 @@ internal static class NpgsqlConfigurationSecurity
         // the configured collection later when Npgsql opens a connection.
         RejectDefaultFile("client TLS certificate", GetDefaultCertificatePath("postgresql.crt"));
 
-        if (passfilePassword is null && clientCertificates is null && rootCertificates is null)
+        if (passfilePath is null && clientCertificates is null && rootCertificates is null)
         {
             return null;
         }
 
-        var usePassfilePasswordProvider = passfilePassword is not null;
+        var usePassfilePasswordProvider = passfilePath is not null;
         return dataSourceBuilder =>
         {
             if (usePassfilePasswordProvider)
             {
+                // A multi-host data source clones these settings once per
+                // child pool. Resolve against those per-pool settings at open
+                // time so each host gets its own first matching credential.
                 dataSourceBuilder.UsePasswordProvider(
-                    _ => passfilePassword!,
-                    (_, _) => ValueTask.FromResult(passfilePassword!));
+                    settings => ResolvePassfilePassword(passfilePath!, settings)!,
+                    (settings, _) => ValueTask.FromResult(ResolvePassfilePassword(passfilePath!, settings)!));
             }
 
 #pragma warning disable CS0618 // This Npgsql release has no non-obsolete collection API that preserves client certificate chains.
@@ -157,56 +162,337 @@ internal static class NpgsqlConfigurationSecurity
         };
     }
 
-    private static string ReadPassfilePassword(string path, NpgsqlConnectionStringBuilder settings)
+    /// <summary>
+    /// Resolves the first Npgsql-compatible passfile entry for one physical
+    /// connection pool. A <see langword="null" /> result deliberately matches
+    /// Npgsql for either no matching entry or a matching <c>*</c> password.
+    /// </summary>
+    /// <param name="path">The configured passfile path.</param>
+    /// <param name="settings">The settings for the physical connection pool requesting a password.</param>
+    /// <returns>The first matching password, or <see langword="null" />.</returns>
+    internal static string? ResolvePassfilePassword(string path, NpgsqlConnectionStringBuilder settings)
     {
-        byte[]? bytes = null;
         try
         {
-            bytes = ReadConfiguredFile(path, MaximumPassfileBytes, requireOwnerOnlyOnUnix: true);
-            using var reader = new StreamReader(
-                new MemoryStream(bytes, writable: false),
-                Encoding.UTF8,
-                detectEncodingFromByteOrderMarks: true);
-            while (reader.ReadLine() is { } line)
-            {
-                if (line.Length == 0 || line[0] == '#')
-                {
-                    continue;
-                }
-
-                var fields = SplitPassfileLine(line);
-                if (fields.Count != 5
-                    || (fields[1] != "*" && !int.TryParse(fields[1], out _)))
-                {
-                    throw new FormatException();
-                }
-
-                if (Matches(WildcardToNull(fields[0]), settings.Host)
-                    && Matches(WildcardToNull(fields[1]), settings.Port.ToString(System.Globalization.CultureInfo.InvariantCulture))
-                    && Matches(WildcardToNull(fields[2]), settings.Database)
-                    && Matches(WildcardToNull(fields[3]), settings.Username))
-                {
-                    // PostgreSQL uses the first matching line. Retain only the
-                    // credential that can apply to this configured identity,
-                    // rather than every password in the file.
-                    return fields[4];
-                }
-            }
-
-            throw ConfigurationError("Passfile contains no entry matching the configured PostgreSQL endpoint and identity");
+            using var stream = OpenConfiguredFile(path, MaximumPassfileBytes, requireOwnerOnlyOnUnix: true);
+            return ReadFirstMatchingPassfilePassword(stream, settings);
         }
         catch (Exception exception) when (IsSecretFileFailure(exception))
         {
-            throw ConfigurationError(
-                "Passfile must name a readable, well-formed PostgreSQL password file and, on Unix, use owner-only permissions");
+            // This executes while Npgsql is opening a physical connection.
+            // Keep the path, content, and original exception out of the chain.
+            throw new InvalidOperationException(
+                "The configured PostgreSQL passfile could not be read safely or parsed. No password was returned to PostgreSQL.");
+        }
+    }
+
+    private static string? ReadFirstMatchingPassfilePassword(
+        FileStream stream,
+        NpgsqlConnectionStringBuilder settings)
+    {
+        Span<byte> prefix = stackalloc byte[4];
+        var prefixLength = 0;
+        while (prefixLength < prefix.Length)
+        {
+            var value = stream.ReadByte();
+            if (value < 0)
+            {
+                break;
+            }
+
+            prefix[prefixLength++] = (byte)value;
+        }
+
+        var (encoding, bomLength) = DetectPassfileEncoding(prefix[..prefixLength]);
+        var decoder = encoding.GetDecoder();
+        Span<byte> byteBuffer = stackalloc byte[256];
+        Span<char> charBuffer = stackalloc char[256];
+        var lineBuffer = ArrayPool<char>.Shared.Rent(256);
+        var lineLength = 0;
+        long bytesRead = prefixLength;
+
+        try
+        {
+            if (DecodePassfileBytes(
+                    decoder,
+                    prefix[bomLength..prefixLength],
+                    flush: false,
+                    charBuffer,
+                    ref lineBuffer,
+                    ref lineLength,
+                    settings,
+                    out var password))
+            {
+                return password;
+            }
+
+            while (true)
+            {
+                var count = stream.Read(byteBuffer);
+                if (count == 0)
+                {
+                    break;
+                }
+
+                bytesRead += count;
+                if (bytesRead > MaximumPassfileBytes)
+                {
+                    throw new IOException();
+                }
+
+                var matched = DecodePassfileBytes(
+                    decoder,
+                    byteBuffer[..count],
+                    flush: false,
+                    charBuffer,
+                    ref lineBuffer,
+                    ref lineLength,
+                    settings,
+                    out password);
+                CryptographicOperations.ZeroMemory(byteBuffer[..count]);
+                if (matched)
+                {
+                    return password;
+                }
+            }
+
+            if (DecodePassfileBytes(
+                    decoder,
+                    ReadOnlySpan<byte>.Empty,
+                    flush: true,
+                    charBuffer,
+                    ref lineBuffer,
+                    ref lineLength,
+                    settings,
+                    out password))
+            {
+                return password;
+            }
+
+            if (lineLength > 0
+                && TryResolvePassfileLine(lineBuffer.AsSpan(0, lineLength), settings, out password))
+            {
+                return password;
+            }
+
+            // PgPassFile.GetFirstMatchingEntry returns null when no row
+            // matches. Authentication decides whether a password is required.
+            return null;
         }
         finally
         {
-            if (bytes is not null)
+            CryptographicOperations.ZeroMemory(prefix);
+            CryptographicOperations.ZeroMemory(byteBuffer);
+            CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(charBuffer));
+            CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(lineBuffer.AsSpan()));
+            ArrayPool<char>.Shared.Return(lineBuffer, clearArray: true);
+        }
+    }
+
+    private static bool DecodePassfileBytes(
+        Decoder decoder,
+        ReadOnlySpan<byte> bytes,
+        bool flush,
+        Span<char> charBuffer,
+        ref char[] lineBuffer,
+        ref int lineLength,
+        NpgsqlConnectionStringBuilder settings,
+        out string? password)
+    {
+        do
+        {
+            decoder.Convert(bytes, charBuffer, flush, out var bytesUsed, out var charsUsed, out var completed);
+            bytes = bytes[bytesUsed..];
+
+            for (var index = 0; index < charsUsed; index++)
             {
-                CryptographicOperations.ZeroMemory(bytes);
+                if (charBuffer[index] == '\n')
+                {
+                    if (TryResolvePassfileLine(lineBuffer.AsSpan(0, lineLength), settings, out password))
+                    {
+                        return true;
+                    }
+
+                    CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(lineBuffer.AsSpan(0, lineLength)));
+                    lineLength = 0;
+                    continue;
+                }
+
+                if (lineLength == lineBuffer.Length)
+                {
+                    GrowAndClearPassfileLineBuffer(ref lineBuffer, lineLength);
+                }
+
+                lineBuffer[lineLength++] = charBuffer[index];
+            }
+
+            CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(charBuffer[..charsUsed]));
+            if (completed)
+            {
+                break;
             }
         }
+        while (!bytes.IsEmpty || flush);
+
+        password = null;
+        return false;
+    }
+
+    private static bool TryResolvePassfileLine(
+        Span<char> line,
+        NpgsqlConnectionStringBuilder settings,
+        out string? password)
+    {
+        line = line.Trim();
+        password = null;
+        if (line.IsEmpty || line[0] == '#')
+        {
+            return false;
+        }
+
+        Span<int> fieldStarts = stackalloc int[5];
+        Span<int> fieldLengths = stackalloc int[5];
+        var fieldCount = 0;
+        var fieldStart = 0;
+        var writePosition = 0;
+        for (var readPosition = 0; readPosition < line.Length; readPosition++)
+        {
+            var character = line[readPosition];
+            if (character == '\\' && readPosition < line.Length - 1)
+            {
+                var escaped = line[++readPosition];
+                if (escaped is not (':' or '\\'))
+                {
+                    line[writePosition++] = '\\';
+                }
+
+                line[writePosition++] = escaped;
+            }
+            else if (character == ':')
+            {
+                AddPassfileField(fieldStarts, fieldLengths, ref fieldCount, fieldStart, writePosition);
+                fieldStart = writePosition;
+            }
+            else
+            {
+                line[writePosition++] = character;
+            }
+        }
+
+        AddPassfileField(fieldStarts, fieldLengths, ref fieldCount, fieldStart, writePosition);
+        if (fieldCount != 5)
+        {
+            throw new FormatException();
+        }
+
+        var port = GetPassfileField(line, fieldStarts, fieldLengths, 1);
+        var parsedPort = 0;
+        if (!IsWildcard(port) && !int.TryParse(port, out parsedPort))
+        {
+            throw new FormatException();
+        }
+
+        if (!PassfileFieldMatches(GetPassfileField(line, fieldStarts, fieldLengths, 0), settings.Host)
+            || (!IsWildcard(port) && parsedPort != settings.Port)
+            || !PassfileFieldMatches(GetPassfileField(line, fieldStarts, fieldLengths, 2), settings.Database)
+            || !PassfileFieldMatches(GetPassfileField(line, fieldStarts, fieldLengths, 3), settings.Username))
+        {
+            return false;
+        }
+
+        var passwordField = GetPassfileField(line, fieldStarts, fieldLengths, 4);
+
+        // Npgsql maps '*' in every field, including password, to null. The
+        // immutable string required by Npgsql cannot be wiped after auth; all
+        // other buffers in this parser are cleared before returning.
+        password = IsWildcard(passwordField) ? null : passwordField.ToString();
+        return true;
+    }
+
+    private static void AddPassfileField(
+        Span<int> starts,
+        Span<int> lengths,
+        ref int count,
+        int start,
+        int end)
+    {
+        if (count >= starts.Length)
+        {
+            throw new FormatException();
+        }
+
+        starts[count] = start;
+        lengths[count] = end - start;
+        count++;
+    }
+
+    private static ReadOnlySpan<char> GetPassfileField(
+        Span<char> line,
+        ReadOnlySpan<int> starts,
+        ReadOnlySpan<int> lengths,
+        int index)
+        => line.Slice(starts[index], lengths[index]);
+
+    private static bool PassfileFieldMatches(ReadOnlySpan<char> field, string? value)
+        => value is null || IsWildcard(field) || field.Equals(value, StringComparison.Ordinal);
+
+    private static bool IsWildcard(ReadOnlySpan<char> value)
+        => value.Length == 1 && value[0] == '*';
+
+    private static void GrowAndClearPassfileLineBuffer(ref char[] buffer, int usedLength)
+    {
+        if (buffer.Length >= MaximumPassfileBytes)
+        {
+            throw new IOException();
+        }
+
+        var replacement = ArrayPool<char>.Shared.Rent(
+            (int)Math.Min((long)buffer.Length * 2, MaximumPassfileBytes));
+        buffer.AsSpan(0, usedLength).CopyTo(replacement);
+        CryptographicOperations.ZeroMemory(MemoryMarshal.AsBytes(buffer.AsSpan()));
+        ArrayPool<char>.Shared.Return(buffer, clearArray: true);
+        buffer = replacement;
+    }
+
+    private static (Encoding Encoding, int BomLength) DetectPassfileEncoding(ReadOnlySpan<byte> prefix)
+    {
+        if (prefix.Length >= 4
+            && prefix[0] == 0x00
+            && prefix[1] == 0x00
+            && prefix[2] == 0xFE
+            && prefix[3] == 0xFF)
+        {
+            return (new UTF32Encoding(bigEndian: true, byteOrderMark: true), 4);
+        }
+
+        if (prefix.Length >= 4
+            && prefix[0] == 0xFF
+            && prefix[1] == 0xFE
+            && prefix[2] == 0x00
+            && prefix[3] == 0x00)
+        {
+            return (Encoding.UTF32, 4);
+        }
+
+        if (prefix.Length >= 3
+            && prefix[0] == 0xEF
+            && prefix[1] == 0xBB
+            && prefix[2] == 0xBF)
+        {
+            return (Encoding.UTF8, 3);
+        }
+
+        if (prefix.Length >= 2 && prefix[0] == 0xFE && prefix[1] == 0xFF)
+        {
+            return (Encoding.BigEndianUnicode, 2);
+        }
+
+        if (prefix.Length >= 2 && prefix[0] == 0xFF && prefix[1] == 0xFE)
+        {
+            return (Encoding.Unicode, 2);
+        }
+
+        return (Encoding.UTF8, 0);
     }
 
     private static X509Certificate2Collection LoadClientCertificates(string certificatePath, string? keyPath, string? password)
@@ -334,41 +620,22 @@ internal static class NpgsqlConfigurationSecurity
         }
     }
 
-    private static List<string> SplitPassfileLine(string line)
+    private static void ValidateConfiguredFile(string path, long maximumBytes, bool requireOwnerOnlyOnUnix)
     {
-        var fields = new List<string>(5);
-        var field = new StringBuilder();
-        for (var index = 0; index < line.Length; index++)
+        try
         {
-            var character = line[index];
-            if (character == '\\' && index < line.Length - 1)
-            {
-                var escaped = line[++index];
-                if (escaped is not (':' or '\\'))
-                {
-                    field.Append('\\');
-                }
-
-                field.Append(escaped);
-            }
-            else if (character == ':')
-            {
-                fields.Add(field.ToString());
-                field.Clear();
-            }
-            else
-            {
-                field.Append(character);
-            }
+            using var stream = OpenConfiguredFile(path, maximumBytes, requireOwnerOnlyOnUnix);
         }
-
-        fields.Add(field.ToString());
-        return fields;
+        catch (Exception exception) when (IsSecretFileFailure(exception))
+        {
+            throw ConfigurationError(
+                "Passfile must name a readable, well-formed PostgreSQL password file and, on Unix, use owner-only permissions");
+        }
     }
 
-    private static byte[] ReadConfiguredFile(string path, long maximumBytes, bool requireOwnerOnlyOnUnix)
+    private static FileStream OpenConfiguredFile(string path, long maximumBytes, bool requireOwnerOnlyOnUnix)
     {
-        using var stream = new FileStream(
+        var stream = new FileStream(
             path,
             FileMode.Open,
             FileAccess.Read,
@@ -376,24 +643,37 @@ internal static class NpgsqlConfigurationSecurity
             bufferSize: 4096,
             FileOptions.SequentialScan);
 
-        if (!stream.CanSeek || stream.Length > maximumBytes)
+        try
         {
-            throw new IOException();
-        }
-
-        // Inspect the object represented by the open handle rather than the
-        // pathname. If a pathname is a symlink, or is replaced between lookup
-        // and open, this validates the actual file whose bytes are consumed.
-        // Windows has ACLs instead of Unix mode bits; its documented contract
-        // requires operators to restrict the file ACL to the Jellyfin account.
-        if (requireOwnerOnlyOnUnix && !OperatingSystem.IsWindows())
-        {
-            var mode = File.GetUnixFileMode(stream.SafeFileHandle);
-            if ((mode & GroupOrOtherPermissions) != 0)
+            if (!stream.CanSeek || stream.Length > maximumBytes)
             {
-                throw new UnauthorizedAccessException();
+                throw new IOException();
             }
+
+            // Inspect the object represented by the open handle rather than
+            // the pathname. A symlink or pathname swap is therefore judged by
+            // the permissions of the same object whose bytes are consumed.
+            if (requireOwnerOnlyOnUnix && !OperatingSystem.IsWindows())
+            {
+                var mode = File.GetUnixFileMode(stream.SafeFileHandle);
+                if ((mode & GroupOrOtherPermissions) != 0)
+                {
+                    throw new UnauthorizedAccessException();
+                }
+            }
+
+            return stream;
         }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
+    }
+
+    private static byte[] ReadConfiguredFile(string path, long maximumBytes, bool requireOwnerOnlyOnUnix)
+    {
+        using var stream = OpenConfiguredFile(path, maximumBytes, requireOwnerOnlyOnUnix);
 
         var bytes = new byte[stream.Length];
         var complete = false;
@@ -416,9 +696,6 @@ internal static class NpgsqlConfigurationSecurity
             }
         }
     }
-
-    private static bool Matches(string? configured, string? actual)
-        => configured is null || string.Equals(configured, actual, StringComparison.Ordinal);
 
     private static bool IsPkcs12Path(string path)
         => string.Equals(Path.GetExtension(path), ".pfx", StringComparison.OrdinalIgnoreCase)
@@ -492,9 +769,6 @@ internal static class NpgsqlConfigurationSecurity
             throw ConfigurationError("the default PostgreSQL TLS file location could not be checked safely");
         }
     }
-
-    private static string? WildcardToNull(string value)
-        => value == "*" ? null : value;
 
     private static bool IsSecretFileFailure(Exception exception)
         => exception is IOException

@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Xml.Serialization;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Plugin.Database.Npgsql.ValueConverters;
@@ -356,6 +357,97 @@ public sealed class ProviderCoreTests
         Assert.DoesNotContain(files.Directory, dataSource.ConnectionString, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void PassfileResolutionUsesEachMultiHostChildPoolsSettings()
+    {
+        using var files = SecretFiles.Create();
+        File.WriteAllText(
+            files.Passfile,
+            "primary.internal:5544:jellyfin:jellyfin_runtime:primary-password\n"
+            + "standby.internal:5545:jellyfin:jellyfin_runtime:standby-password\n");
+        var primary = PassfileSettings("primary.internal", 5544);
+        var standby = PassfileSettings("standby.internal", 5545);
+
+        Assert.Equal(
+            "primary-password",
+            NpgsqlConfigurationSecurity.ResolvePassfilePassword(files.Passfile, primary));
+        Assert.Equal(
+            "standby-password",
+            NpgsqlConfigurationSecurity.ResolvePassfilePassword(files.Passfile, standby));
+    }
+
+    [Fact]
+    public void PassfileResolutionMatchesNpgsqlTrimmingEscapingAndFirstMatchPrecedence()
+    {
+        using var files = SecretFiles.Create();
+        File.WriteAllText(
+            files.Passfile,
+            "   # leading whitespace still denotes a comment\n"
+            + " database.internal:5544:jelly\\:fin:user\\\\name:first\\:password\\\\tail   \n"
+            + "database.internal:5544:jelly\\:fin:user\\\\name:lower-precedence-secret\n"
+            + "malformed-line-after-the-first-match\n");
+        var settings = PassfileSettings("database.internal", 5544, "jelly:fin", @"user\name");
+
+        var password = NpgsqlConfigurationSecurity.ResolvePassfilePassword(files.Passfile, settings);
+
+        Assert.Equal(@"first:password\tail", password);
+    }
+
+    [Fact]
+    public void PassfileResolutionMatchesNpgsqlWildcardPasswordAndNoMatchSemantics()
+    {
+        using var files = SecretFiles.Create();
+        File.WriteAllText(
+            files.Passfile,
+            "database.internal:*:*:*:*\n"
+            + "malformed-line-after-the-null-match\n");
+
+        Assert.Null(
+            NpgsqlConfigurationSecurity.ResolvePassfilePassword(
+                files.Passfile,
+                PassfileSettings("database.internal", 5544)));
+
+        File.WriteAllText(files.Passfile, "other.internal:5544:jellyfin:jellyfin_runtime:unused-secret\n");
+        Assert.Null(
+            NpgsqlConfigurationSecurity.ResolvePassfilePassword(
+                files.Passfile,
+                PassfileSettings("database.internal", 5544)));
+    }
+
+    [Fact]
+    public void PassfileResolutionDetectsBomLikeNpgsqlStreamReader()
+    {
+        using var files = SecretFiles.Create();
+        File.WriteAllText(
+            files.Passfile,
+            "database.internal:5544:jellyfin:jellyfin_runtime:utf16-password\n",
+            Encoding.Unicode);
+
+        Assert.Equal(
+            "utf16-password",
+            NpgsqlConfigurationSecurity.ResolvePassfilePassword(
+                files.Passfile,
+                PassfileSettings("database.internal", 5544)));
+    }
+
+    [Fact]
+    public void PassfileCallbackParseFailuresRemainSanitized()
+    {
+        using var files = SecretFiles.Create();
+        const string Secret = "callback-parser-secret";
+        File.WriteAllText(files.Passfile, $"malformed-{Secret}\n");
+
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => NpgsqlConfigurationSecurity.ResolvePassfilePassword(
+                files.Passfile,
+                PassfileSettings("database.internal", 5544)));
+
+        Assert.Contains("No password was returned", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(files.Directory, exception.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(Secret, exception.ToString(), StringComparison.Ordinal);
+        Assert.Null(exception.InnerException);
+    }
+
     public static TheoryData<UnixFileMode> InsecureCredentialFileModes
         => new()
         {
@@ -470,6 +562,35 @@ public sealed class ProviderCoreTests
                 $"Host=database.internal;Port=5544;Database=jellyfin;Username=jellyfin_runtime;Passfile={passfileLink}",
                 null),
             files);
+    }
+
+    [Fact]
+    public void PassfileCallbackReopensAndRechecksTheSymlinkTarget()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var files = SecretFiles.Create();
+        var passfileLink = Path.Combine(files.Directory, "callback-pgpass-link");
+        File.CreateSymbolicLink(passfileLink, files.Passfile);
+        var settings = PassfileSettings("database.internal", 5544);
+
+        Assert.Equal(
+            "test-password",
+            NpgsqlConfigurationSecurity.ResolvePassfilePassword(passfileLink, settings));
+
+        File.SetUnixFileMode(
+            files.Passfile,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead);
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => NpgsqlConfigurationSecurity.ResolvePassfilePassword(passfileLink, settings));
+
+        Assert.Contains("No password was returned", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(files.Directory, exception.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("test-password", exception.ToString(), StringComparison.Ordinal);
+        Assert.Null(exception.InnerException);
     }
 
     [Fact]
@@ -601,6 +722,19 @@ public sealed class ProviderCoreTests
 
     private static Collection<CustomDatabaseOption> Options(params (string Key, string Value)[] values)
         => new(values.Select(value => new CustomDatabaseOption { Key = value.Key, Value = value.Value }).ToList());
+
+    private static NpgsqlConnectionStringBuilder PassfileSettings(
+        string host,
+        int port,
+        string database = "jellyfin",
+        string username = "jellyfin_runtime")
+        => new()
+        {
+            Host = host,
+            Port = port,
+            Database = database,
+            Username = username,
+        };
 
     private static void AssertSanitizedCredentialFileFailure(
         Action action,

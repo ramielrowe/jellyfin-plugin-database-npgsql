@@ -193,6 +193,49 @@ assert_secret_file_rejected() {
         "$ADMIN_PASSWORD"
 }
 
+terminate_validation_host() {
+    if [ -n "$HOST_PID" ] && kill -0 "$HOST_PID" 2>/dev/null; then
+        kill -TERM "$HOST_PID" 2>/dev/null || true
+        for _ in $(seq 1 10); do
+            if ! kill -0 "$HOST_PID" 2>/dev/null; then
+                break
+            fi
+
+            sleep 1
+        done
+        kill -KILL "$HOST_PID" 2>/dev/null || true
+        wait "$HOST_PID" 2>/dev/null || true
+    fi
+
+    HOST_PID=""
+}
+
+assert_secret_configuration_accepted() {
+    local test_name=$1
+    shift
+    local log_file="$RUN_ROOT/$test_name.log"
+
+    start_host "$log_file"
+    for _ in $(seq 1 100); do
+        if grep -F "PostgreSQL configured at" "$log_file" >/dev/null; then
+            break
+        fi
+
+        if ! kill -0 "$HOST_PID" 2>/dev/null; then
+            break
+        fi
+
+        sleep 0.1
+    done
+    grep -F "PostgreSQL configured at" "$log_file" >/dev/null \
+        || fail "$test_name did not pass the provider's file and configuration validation"
+    if grep -F "provider configuration in database.xml is invalid" "$log_file" >/dev/null; then
+        fail "$test_name unexpectedly failed provider configuration validation"
+    fi
+    assert_log_redacted "$log_file" "$@" "$APPLICATION_PASSWORD" "$BOOTSTRAP_PASSWORD" "$ADMIN_PASSWORD"
+    terminate_validation_host
+}
+
 start_unsupported_host() {
     local log_file=$1
     "${HOST_ENVIRONMENT[@]}" dotnet "$RUN_ROOT/unsupported-host-publish/jellyfin.dll" \
@@ -478,6 +521,68 @@ assert_log_redacted "$RUN_ROOT/unreadable-client-certificate.log" "$UNREADABLE_C
 chmod 600 "$UNREADABLE_CLIENT_CERTIFICATE" "$UNREADABLE_CLIENT_KEY"
 restore_database_configuration
 
+# Generate real client credential material for untouched-host permission
+# controls. The 0600 checks below prove only that the vanilla host accepts and
+# preloads the configuration before attempting a database connection; they do
+# not claim that a TLS handshake has completed.
+CLIENT_CERTIFICATE="$RUN_ROOT/sensitive-client-$SMOKE_ID.pem"
+CLIENT_KEY="$RUN_ROOT/sensitive-client-key-$SMOKE_ID.pem"
+CLIENT_PKCS12="$RUN_ROOT/sensitive-client-$SMOKE_ID.p12"
+openssl req \
+    -x509 \
+    -newkey rsa:2048 \
+    -sha256 \
+    -days 1 \
+    -nodes \
+    -subj "/CN=jellyfin-smoke-$SMOKE_ID" \
+    -keyout "$CLIENT_KEY" \
+    -out "$CLIENT_CERTIFICATE" \
+    >/dev/null 2>&1
+openssl pkcs12 \
+    -export \
+    -passout pass: \
+    -inkey "$CLIENT_KEY" \
+    -in "$CLIENT_CERTIFICATE" \
+    -out "$CLIENT_PKCS12" \
+    >/dev/null 2>&1
+chmod 600 "$CLIENT_KEY" "$CLIENT_PKCS12"
+
+restore_database_configuration
+set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Password=$APPLICATION_PASSWORD;SSL Mode=Require;SSL Certificate=$CLIENT_CERTIFICATE;SSL Key=$CLIENT_KEY"
+assert_secret_configuration_accepted \
+    "secure-pem-client-configuration" \
+    "$CLIENT_CERTIFICATE" \
+    "$CLIENT_KEY"
+
+restore_database_configuration
+set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Password=$APPLICATION_PASSWORD;SSL Mode=Require;SSL Certificate=$CLIENT_PKCS12"
+assert_secret_configuration_accepted \
+    "secure-pkcs12-client-configuration" \
+    "$CLIENT_PKCS12"
+
+for insecure_mode in 0640 0644 0666; do
+    chmod "$insecure_mode" "$CLIENT_KEY"
+    restore_database_configuration
+    set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Password=$APPLICATION_PASSWORD;SSL Mode=Require;SSL Certificate=$CLIENT_CERTIFICATE;SSL Key=$CLIENT_KEY"
+    assert_secret_file_rejected \
+        "insecure-pem-client-key-$insecure_mode" \
+        "SSL Certificate and SSL Key must name a readable, valid PEM pair" \
+        "$CLIENT_KEY" \
+        "$SECRET_FILE_MARKER"
+    assert_log_redacted "$RUN_ROOT/insecure-pem-client-key-$insecure_mode.log" "$CLIENT_CERTIFICATE"
+    chmod 600 "$CLIENT_KEY"
+
+    chmod "$insecure_mode" "$CLIENT_PKCS12"
+    restore_database_configuration
+    set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Password=$APPLICATION_PASSWORD;SSL Mode=Require;SSL Certificate=$CLIENT_PKCS12"
+    assert_secret_file_rejected \
+        "insecure-pkcs12-client-$insecure_mode" \
+        "SSL Certificate and SSL Key must name a readable, valid PEM pair" \
+        "$CLIENT_PKCS12" \
+        "$SECRET_FILE_MARKER"
+    chmod 600 "$CLIENT_PKCS12"
+done
+
 docker run \
     --detach \
     --name "$POSTGRES_CONTAINER" \
@@ -516,20 +621,25 @@ if docker exec --env PGPASSWORD="$APPLICATION_PASSWORD" "$POSTGRES_CONTAINER" \
 fi
 
 # Use a real passfile for every successful/guarded host start. The provider
-# must preload the matching credential and remove the path before Npgsql owns
-# the data source; this preserves passfile support while making later exception
-# chains incapable of exposing the configured path.
+# must remove its path before Npgsql owns the data source, then reopen it through
+# a sanitized per-pool callback whenever a physical connection needs a password.
 RUNTIME_PASSFILE="$RUN_ROOT/runtime/sensitive-runtime-$SMOKE_ID.pgpass"
 PASSFILE_UNRELATED_SECRET="unrelated-$SECRET_FILE_MARKER"
+PASSFILE_FIRST_HOST_SECRET="first-host-$SECRET_FILE_MARKER"
 PASSFILE_LOWER_PRECEDENCE_SECRET="lower-precedence-$SECRET_FILE_MARKER"
 {
     printf 'unrelated.invalid:%s:jellyfin:jellyfin:%s\n' "$POSTGRES_PORT" "$PASSFILE_UNRELATED_SECRET"
+    printf '127.0.0.2:%s:jellyfin:jellyfin:%s\n' "$POSTGRES_PORT" "$PASSFILE_FIRST_HOST_SECRET"
     printf '127.0.0.1:%s:jellyfin:jellyfin:%s\n' "$POSTGRES_PORT" "$APPLICATION_PASSWORD"
     printf '127.0.0.1:%s:jellyfin:jellyfin:%s\n' "$POSTGRES_PORT" "$PASSFILE_LOWER_PRECEDENCE_SECRET"
 } >"$RUNTIME_PASSFILE"
 chmod 600 "$RUNTIME_PASSFILE"
 restore_database_configuration
-set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Passfile=$RUNTIME_PASSFILE"
+# The first child pool is deliberately unreachable and has a different
+# credential. Reaching PostgreSQL through the second child proves that Npgsql's
+# per-pool callback settings, rather than the comma-separated parent Host or a
+# wildcard credential reused across pools, select each password.
+set_database_connection_string "Host=127.0.0.2,127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Passfile=$RUNTIME_PASSFILE"
 
 # These variables are standard libpq settings but are deliberately not consumed
 # by Npgsql 10.0.3. Supplying hostile values on the real host proves that the
@@ -556,13 +666,14 @@ if [ "${PROVIDER_CORE_ONLY:-false}" = "true" ]; then
         || fail "vanilla Jellyfin did not surface the deliberate migration-backup guard"
     grep -F 'Refusing the operation before making database changes' "$RUN_ROOT/first-start.log" >/dev/null \
         || fail "migration-backup guard did not state its pre-mutation boundary"
-    grep -F "PostgreSQL configured at 127.0.0.1:$POSTGRES_PORT for database jellyfin;" "$RUN_ROOT/first-start.log" >/dev/null \
+    grep -F "PostgreSQL configured at 127.0.0.2,127.0.0.1:$POSTGRES_PORT for database jellyfin;" "$RUN_ROOT/first-start.log" >/dev/null \
         || fail "provider did not emit its endpoint-only configuration diagnostic"
     if grep -F \
         -e "$APPLICATION_PASSWORD" \
         -e "$BOOTSTRAP_PASSWORD" \
         -e "$ADMIN_PASSWORD" \
         -e "$PASSFILE_UNRELATED_SECRET" \
+        -e "$PASSFILE_FIRST_HOST_SECRET" \
         -e "$PASSFILE_LOWER_PRECEDENCE_SECRET" \
         "$RUN_ROOT/first-start.log" >/dev/null; then
         fail "vanilla host log exposed a smoke-test credential"
@@ -599,6 +710,8 @@ if [ "${PROVIDER_CORE_ONLY:-false}" = "true" ]; then
         echo "guarded_mutation=true"
         echo "endpoint_log_redacted=true"
         echo "passfile_path_redacted=true"
+        echo "passfile_multi_host_failover=true"
+        echo "credential_file_modes=0600-accepted,0640-0644-0666-rejected"
     } | tee "$RUN_ROOT/evidence.txt"
 
     echo "Provider-core smoke test passed. Evidence: $RUN_ROOT/evidence.txt"
@@ -761,6 +874,8 @@ stop_host "$HTTP_PORT" "$RECOVERY_TOKEN" || fail "recovery host did not stop cle
     echo "canonical_plugin_folder=$PLUGIN_FOLDER_NAME"
     echo "early_failure_guards=missing-npgsql-driver,missing-npgsql-ef-provider,ambiguous-prefix,unsupported-abi"
     echo "normal_plugin_scans=disabled,active,malformed-metadata"
+    echo "passfile_multi_host_failover=true"
+    echo "credential_file_modes=0600-accepted,0640-0644-0666-rejected"
 } | tee "$RUN_ROOT/evidence.txt"
 
 echo "Black-box smoke test passed. Evidence: $RUN_ROOT/evidence.txt"
