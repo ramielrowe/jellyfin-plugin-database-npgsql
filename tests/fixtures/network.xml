@@ -7,4 +7,8 @@
   <AutoDiscovery>false</AutoDiscovery>
   <EnableIPv4>true</EnableIPv4>
   <EnableIPv6>false</EnableIPv6>
+  <EnableRemoteAccess>false</EnableRemoteAccess>
+  <LocalNetworkAddresses>
+    <string>127.0.0.1</string>
+  </LocalNetworkAddresses>
 </NetworkConfiguration>

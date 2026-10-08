@@ -4,7 +4,7 @@
   <CustomProviderOptions>
     <PluginName>Npgsql Database</PluginName>
     <PluginAssembly>Jellyfin.Plugin.Database.Npgsql.dll</PluginAssembly>
-    <ConnectionString>Host=127.0.0.1;Port=55432;Database=jellyfin_plugin_feasibility;Username=jellyfin_plugin;Password=feasibility</ConnectionString>
+    <ConnectionString>Host=127.0.0.1;Port=__POSTGRES_PORT__;Database=jellyfin;Username=jellyfin;Password=__APPLICATION_PASSWORD__</ConnectionString>
     <Options />
   </CustomProviderOptions>
   <LockingBehavior>NoLock</LockingBehavior>

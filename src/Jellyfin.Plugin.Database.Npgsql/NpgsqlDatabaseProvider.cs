@@ -152,20 +152,70 @@ public sealed class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
                 connection,
                 transaction,
                 """
-                SELECT table_name, column_name
-                FROM information_schema.columns
-                WHERE table_schema = 'public' AND is_identity = 'YES'
-                ORDER BY table_name, column_name
+                SELECT table_record.relname, column_record.attname, sequence_namespace.nspname, sequence_record.relname
+                FROM pg_catalog.pg_class AS table_record
+                JOIN pg_catalog.pg_namespace AS table_namespace ON table_namespace.oid = table_record.relnamespace
+                JOIN pg_catalog.pg_attribute AS column_record ON column_record.attrelid = table_record.oid
+                JOIN pg_catalog.pg_depend AS dependency_record
+                    ON dependency_record.refobjid = table_record.oid
+                    AND dependency_record.refobjsubid = column_record.attnum
+                    AND dependency_record.classid = 'pg_catalog.pg_class'::regclass
+                    AND dependency_record.deptype = 'i'
+                JOIN pg_catalog.pg_class AS sequence_record
+                    ON sequence_record.oid = dependency_record.objid
+                    AND sequence_record.relkind = 'S'
+                JOIN pg_catalog.pg_namespace AS sequence_namespace ON sequence_namespace.oid = sequence_record.relnamespace
+                WHERE table_namespace.nspname = 'public'
+                    AND table_record.relkind IN ('r', 'p')
+                ORDER BY table_record.relname, column_record.attname
                 """,
                 cancellationToken).ConfigureAwait(false);
 
             foreach (var identityColumn in identityColumns)
             {
-                var target = $"{Quote(backupSchema)}.{Quote(identityColumn[0])}";
+                var sourceSequence = $"{Quote(identityColumn[2])}.{Quote(identityColumn[3])}";
+                var sourceState = await ReadRowsAsync(
+                    connection,
+                    transaction,
+                    $"SELECT last_value::text, is_called::text FROM {sourceSequence}",
+                    cancellationToken).ConfigureAwait(false);
+                if (sourceState.Count != 1)
+                {
+                    throw new InvalidOperationException($"Could not read identity sequence state for {sourceSequence}.");
+                }
+
+                var targetSequence = await ReadRowsAsync(
+                    connection,
+                    transaction,
+                    $"""
+                    SELECT sequence_namespace.nspname, sequence_record.relname
+                    FROM pg_catalog.pg_class AS table_record
+                    JOIN pg_catalog.pg_namespace AS table_namespace ON table_namespace.oid = table_record.relnamespace
+                    JOIN pg_catalog.pg_attribute AS column_record ON column_record.attrelid = table_record.oid
+                    JOIN pg_catalog.pg_depend AS dependency_record
+                        ON dependency_record.refobjid = table_record.oid
+                        AND dependency_record.refobjsubid = column_record.attnum
+                        AND dependency_record.classid = 'pg_catalog.pg_class'::regclass
+                        AND dependency_record.deptype = 'i'
+                    JOIN pg_catalog.pg_class AS sequence_record
+                        ON sequence_record.oid = dependency_record.objid
+                        AND sequence_record.relkind = 'S'
+                    JOIN pg_catalog.pg_namespace AS sequence_namespace ON sequence_namespace.oid = sequence_record.relnamespace
+                    WHERE table_namespace.nspname = {Literal(backupSchema)}
+                        AND table_record.relname = {Literal(identityColumn[0])}
+                        AND column_record.attname = {Literal(identityColumn[1])}
+                    """,
+                    cancellationToken).ConfigureAwait(false);
+                if (targetSequence.Count != 1)
+                {
+                    throw new InvalidOperationException(
+                        $"Could not identify the copied identity sequence for {backupSchema}.{identityColumn[0]}.{identityColumn[1]}.");
+                }
+
                 await ExecuteAsync(
                     connection,
                     transaction,
-                    $"SELECT setval(pg_get_serial_sequence('{target.Replace("'", "''", StringComparison.Ordinal)}', '{identityColumn[1].Replace("'", "''", StringComparison.Ordinal)}'), COALESCE(MAX({Quote(identityColumn[1])}), 1), COUNT(*) > 0) FROM {target}",
+                    $"SELECT setval({Literal(Quote(targetSequence[0][0]) + "." + Quote(targetSequence[0][1]))}::regclass, {sourceState[0][0]}, {sourceState[0][1]})",
                     cancellationToken).ConfigureAwait(false);
             }
 
