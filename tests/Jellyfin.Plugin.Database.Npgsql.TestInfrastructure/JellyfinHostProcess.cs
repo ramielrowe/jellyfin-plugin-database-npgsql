@@ -27,6 +27,7 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
     private readonly StreamWriter _processLog;
     private readonly Task _standardOutput;
     private readonly Task _standardError;
+    private readonly LinuxProcessIdentity _processIdentity;
     private bool _disposed;
     private bool _logCompleted;
 
@@ -38,7 +39,8 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         StreamWriter processLog,
         Task standardOutput,
         Task standardError,
-        int httpPort)
+        int httpPort,
+        LinuxProcessIdentity processIdentity)
     {
         _layout = layout;
         _redactor = redactor;
@@ -47,6 +49,7 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         _processLog = processLog;
         _standardOutput = standardOutput;
         _standardError = standardError;
+        _processIdentity = processIdentity;
         BaseAddress = new Uri($"http://127.0.0.1:{httpPort}/", UriKind.Absolute);
     }
 
@@ -67,13 +70,20 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         ArgumentNullException.ThrowIfNull(redactor);
         var httpPort = httpPortReservation.Port;
         ValidatePort(httpPort, nameof(httpPortReservation));
-        var startInfo = new ProcessStartInfo("dotnet")
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("The pristine-host harness requires Linux process-group and socket identity checks.");
+        }
+
+        var startInfo = new ProcessStartInfo("setsid")
         {
             RedirectStandardError = true,
             RedirectStandardOutput = true,
             UseShellExecute = false,
             WorkingDirectory = layout.Publish.DirectoryPath
         };
+        startInfo.ArgumentList.Add("--wait");
+        startInfo.ArgumentList.Add("dotnet");
         startInfo.ArgumentList.Add(layout.Publish.EntryAssemblyPath);
         AddArgument(startInfo, "--datadir", layout.DataDirectory);
         AddArgument(startInfo, "--configdir", layout.ConfigurationDirectory);
@@ -102,16 +112,19 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             }
 
             started = true;
+            var processIdentity = LinuxProcessIdentity.AwaitDedicatedGroup(process, TimeSpan.FromSeconds(1))
+                ?? throw new InvalidOperationException("Jellyfin exited before entering its dedicated test process group.");
 
             var logPath = Path.Combine(layout.RunRoot, $"process-{DateTimeOffset.UtcNow:yyyyMMddHHmmssfff}.log");
-            var processLog = new StreamWriter(logPath, append: false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false))
+            var processLog = new StreamWriter(SecureFileSystem.CreateFile(logPath), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false))
             {
                 AutoFlush = true
             };
             var outputLock = new SemaphoreSlim(1, 1);
-            var standardOutput = CopySanitizedAsync(process.StandardOutput, processLog, outputLock, redactor, "stdout");
-            var standardError = CopySanitizedAsync(process.StandardError, processLog, outputLock, redactor, "stderr");
-            var handler = new SocketsHttpHandler { UseProxy = false };
+            var outputBudget = new OutputBudget(16 * 1024 * 1024);
+            var standardOutput = CopySanitizedAsync(process.StandardOutput, processLog, outputLock, redactor, "stdout", outputBudget);
+            var standardError = CopySanitizedAsync(process.StandardError, processLog, outputLock, redactor, "stderr", outputBudget);
+            var handler = new SocketsHttpHandler { UseProxy = false, AllowAutoRedirect = false };
             var httpClient = new HttpClient(handler)
             {
                 BaseAddress = new Uri($"http://127.0.0.1:{httpPort}/", UriKind.Absolute),
@@ -125,7 +138,8 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
                 processLog,
                 standardOutput,
                 standardError,
-                httpPort);
+                httpPort,
+                processIdentity);
         }
         catch
         {
@@ -172,20 +186,13 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
 
             try
             {
-                using var response = await _httpClient.GetAsync("health", linkedSource.Token).ConfigureAwait(false);
+                using var response = await SendAsync(new HttpRequestMessage(HttpMethod.Get, "health"), linkedSource.Token).ConfigureAwait(false);
                 if (response.StatusCode == HttpStatusCode.OK
                     && string.Equals(
-                        (await response.Content.ReadAsStringAsync(linkedSource.Token).ConfigureAwait(false)).Trim(),
+                        (await ReadBoundedResponseAsync(response, linkedSource.Token).ConfigureAwait(false)).Trim(),
                         "Healthy",
                         StringComparison.Ordinal))
                 {
-                    if (!ProcessOwnsListeningPort(_process.Id, BaseAddress.Port))
-                    {
-                        await TerminateAsync().ConfigureAwait(false);
-                        throw new InvalidOperationException(
-                            "The healthy endpoint is not owned by the Jellyfin process launched for this run; refusing setup, API, or shutdown requests.");
-                    }
-
                     return;
                 }
             }
@@ -196,6 +203,12 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             catch (TaskCanceledException) when (!linkedSource.IsCancellationRequested)
             {
                 // One request timed out; the bounded readiness deadline still applies.
+            }
+            catch (InvalidOperationException) when (
+                _processIdentity.IsCurrent()
+                && GetListenerProcessGroups(BaseAddress.Port).Count == 0)
+            {
+                // The verified process is alive but has not opened its listener yet.
             }
 
             try
@@ -217,10 +230,9 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
 
     public async Task<string> GetStringAsync(string relativePath, CancellationToken cancellationToken)
     {
-        EnsureOwnsEndpoint();
-        using var response = await _httpClient.GetAsync(relativePath, cancellationToken).ConfigureAwait(false);
+        using var response = await SendAsync(new HttpRequestMessage(HttpMethod.Get, relativePath), cancellationToken).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        return await ReadBoundedResponseAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<string> PostJsonAsync(
@@ -229,7 +241,7 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         string? authorization,
         CancellationToken cancellationToken)
     {
-        EnsureOwnsEndpoint();
+        ValidateRelativePath(relativePath);
         using var request = new HttpRequestMessage(HttpMethod.Post, relativePath)
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json")
@@ -239,17 +251,16 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             request.Headers.TryAddWithoutValidation("Authorization", authorization);
         }
 
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendAsync(request, cancellationToken).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
-        return await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        return await ReadBoundedResponseAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task StopGracefullyAsync(string accessToken, TimeSpan timeout, CancellationToken cancellationToken)
     {
-        EnsureOwnsEndpoint();
         using var request = new HttpRequestMessage(HttpMethod.Post, "System/Shutdown");
         request.Headers.TryAddWithoutValidation("Authorization", "MediaBrowser Token=\"" + accessToken + "\"");
-        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        using var response = await SendAsync(request, cancellationToken).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
         await WaitForExitAsync(timeout, cancellationToken).ConfigureAwait(false);
         await CompleteLogAsync().ConfigureAwait(false);
@@ -259,6 +270,11 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
 
     public async Task WaitForExitAsync(TimeSpan timeout, CancellationToken cancellationToken)
     {
+        if (timeout <= TimeSpan.Zero || timeout > TimeSpan.FromMinutes(5))
+        {
+            throw new ArgumentOutOfRangeException(nameof(timeout), "Jellyfin exit timeout must be at most five minutes.");
+        }
+
         using var timeoutSource = new CancellationTokenSource(timeout);
         using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
         try
@@ -281,7 +297,11 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
     {
         if (!_process.HasExited)
         {
-            ExternalCommand.TryTerminate(_process);
+            ExternalCommand.TryTerminate(_process, _processIdentity);
+        }
+        else
+        {
+            _processIdentity.TerminateRemainingGroup();
         }
 
         await CompleteLogAsync().ConfigureAwait(false);
@@ -326,10 +346,15 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
 
     private void EnsureOwnsEndpoint()
     {
-        if (_process.HasExited || !ProcessOwnsListeningPort(_process.Id, BaseAddress.Port))
+        var listenerGroups = GetListenerProcessGroups(BaseAddress.Port);
+        if (_process.HasExited
+            || !_processIdentity.IsCurrent()
+            || !listenerGroups.Contains(_processIdentity.ProcessGroupId))
         {
             throw new InvalidOperationException(
-                "The launched Jellyfin process no longer owns its leased endpoint; refusing to issue an API request.");
+                "The launched Jellyfin process no longer owns its leased endpoint; refusing to issue an API request. "
+                + $"Expected process group {_processIdentity.ProcessGroupId}; observed listener groups: "
+                + (listenerGroups.Count == 0 ? "none" : string.Join(',', listenerGroups)) + ".");
         }
     }
 
@@ -366,6 +391,43 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         return false;
     }
 
+    private static HashSet<int> GetListenerProcessGroups(int port)
+    {
+        var inode = FindLoopbackListenerInode(port);
+        if (inode is null)
+        {
+            return [];
+        }
+
+        var processGroups = new HashSet<int>();
+        foreach (var processDirectory in Directory.EnumerateDirectories("/proc"))
+        {
+            if (!int.TryParse(Path.GetFileName(processDirectory), out var processId))
+            {
+                continue;
+            }
+
+            try
+            {
+                var processIdentity = LinuxProcessIdentity.Capture(processId);
+                foreach (var descriptor in Directory.EnumerateFiles(Path.Combine(processDirectory, "fd")))
+                {
+                    if (string.Equals(new FileInfo(descriptor).LinkTarget, "socket:[" + inode + "]", StringComparison.Ordinal))
+                    {
+                        _ = processGroups.Add(processIdentity.ProcessGroupId);
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DirectoryNotFoundException or InvalidOperationException)
+            {
+                // Processes may exit while /proc is inspected.
+            }
+        }
+
+        return processGroups;
+    }
+
     private static string? FindLoopbackListenerInode(int port)
     {
         var expectedPort = port.ToString("X4", System.Globalization.CultureInfo.InvariantCulture);
@@ -396,17 +458,24 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         StreamWriter destination,
         SemaphoreSlim outputLock,
         SensitiveDataRedactor redactor,
-        string streamName)
+        string streamName,
+        OutputBudget outputBudget)
     {
         string? line;
         try
         {
             while ((line = await source.ReadLineAsync().ConfigureAwait(false)) is not null)
             {
+                var sanitized = $"[{streamName}] {redactor.Redact(line)}{Environment.NewLine}";
+                if (!outputBudget.TryReserve(Encoding.UTF8.GetByteCount(sanitized)))
+                {
+                    continue;
+                }
+
                 await outputLock.WaitAsync().ConfigureAwait(false);
                 try
                 {
-                    await destination.WriteLineAsync($"[{streamName}] {redactor.Redact(line)}").ConfigureAwait(false);
+                    await destination.WriteAsync(sanitized).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -417,6 +486,94 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         catch (Exception ex) when (ex is ObjectDisposedException or IOException)
         {
             // Bounded shutdown closes inherited pipes retained by descendants.
+        }
+    }
+
+    private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        if (request.RequestUri is null || request.RequestUri.IsAbsoluteUri)
+        {
+            throw new InvalidOperationException("Only relative requests to the verified Jellyfin endpoint are allowed.");
+        }
+
+        ValidateRelativePath(request.RequestUri.OriginalString);
+        EnsureOwnsEndpoint();
+        var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            EnsureOwnsEndpoint();
+            if (response.Headers.Location is { IsAbsoluteUri: true })
+            {
+                throw new InvalidOperationException("The verified Jellyfin endpoint attempted an absolute redirect.");
+            }
+
+            return response;
+        }
+        catch
+        {
+            response.Dispose();
+            throw;
+        }
+    }
+
+    private static async Task<string> ReadBoundedResponseAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        const int MaximumResponseBytes = 1024 * 1024;
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+        using var buffer = new MemoryStream();
+        var chunk = new byte[8192];
+        while (true)
+        {
+            var count = await stream.ReadAsync(chunk.AsMemory(), cancellationToken).ConfigureAwait(false);
+            if (count == 0)
+            {
+                break;
+            }
+
+            if (buffer.Length + count > MaximumResponseBytes)
+            {
+                throw new InvalidOperationException("The Jellyfin test response exceeded the bounded one-megabyte limit.");
+            }
+
+            await buffer.WriteAsync(chunk.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
+        }
+
+        return Encoding.UTF8.GetString(buffer.ToArray());
+    }
+
+    private static void ValidateRelativePath(string relativePath)
+    {
+        if (!IsSafeRelativeRequestTarget(relativePath))
+        {
+            throw new InvalidOperationException("Only a relative path without an authority may target the verified Jellyfin endpoint.");
+        }
+    }
+
+    public static bool IsSafeRelativeRequestTarget(string relativePath)
+        => !string.IsNullOrWhiteSpace(relativePath)
+            && !relativePath.StartsWith("/", StringComparison.Ordinal)
+            && !relativePath.StartsWith("\\", StringComparison.Ordinal)
+            && Uri.TryCreate(relativePath, UriKind.Relative, out _);
+
+    private sealed class OutputBudget(int maximumBytes)
+    {
+        private int _remainingBytes = maximumBytes;
+
+        public bool TryReserve(int bytes)
+        {
+            while (true)
+            {
+                var remaining = Volatile.Read(ref _remainingBytes);
+                if (bytes > remaining)
+                {
+                    return false;
+                }
+
+                if (Interlocked.CompareExchange(ref _remainingBytes, remaining - bytes, remaining) == remaining)
+                {
+                    return true;
+                }
+            }
         }
     }
 
@@ -432,7 +589,10 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         {
             _process.StandardOutput.Dispose();
             _process.StandardError.Dispose();
-            _ = await Task.WhenAny(readers, Task.Delay(TimeSpan.FromSeconds(5))).ConfigureAwait(false);
+            if (await Task.WhenAny(readers, Task.Delay(TimeSpan.FromSeconds(5))).ConfigureAwait(false) != readers)
+            {
+                throw new InvalidOperationException("Jellyfin output readers did not terminate after their bounded pipe shutdown.");
+            }
         }
         else
         {

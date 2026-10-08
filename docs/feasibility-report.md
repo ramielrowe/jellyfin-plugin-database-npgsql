@@ -7,24 +7,23 @@ Bead: `jellyfin-38k.1`
 Result: **PASS for an independently packaged provider, with the version and
 installation constraints below.**
 
-> Historical note: this report records the original feasibility bead. The
-> release-shaped package now supports only the automated Jellyfin 12.2 ABI;
-> its black-box gate also publishes unmodified Jellyfin 13.0 and proves the
-> provider rejects that unsupported ABI before database access. Current
-> installation and recovery instructions live in the repository README.
+> This report supersedes the original exploratory result where it described
+> behavior not present in the current branch. The package supports only the
+> Jellyfin 12.2 ABI. Migration backup remains deliberately unsupported pending
+> bead `jellyfin-38k.8`, so the current package is not a usable production
+> database backend.
 
-This is a contract proof, not a production release. It establishes that the
-vanilla loader, model pipeline, migration callbacks, basic Jellyfin CRUD, and
-restart lifecycle are sufficient to build the real provider. Full query-surface,
-long-text, purge, maintenance, packaging, and upgrade coverage remains in the
-dependent implementation beads.
+This is a partial contract proof, not a production release. It establishes the
+vanilla early-loader, packaging, provider configuration, and model-finalization
+boundaries. Migration backup, host health, CRUD, restart persistence, query
+parity, purge, maintenance, and upgrade coverage remain in dependent beads.
 
 ## Tested support matrix
 
 | Component | Tested version | Initial support decision |
 | --- | --- | --- |
 | Jellyfin | 12.2.0, commit `ca0f16eb7c195f720a1493ed469a27c4657db0c6` | Automated black-box gate |
-| Jellyfin development | 13.0.0, master commit `284997ebe2` | Prior manual ABI-binding observation only; not part of the automated gate |
+| Jellyfin development | 13.x | Unsupported and rejected before database access |
 | `Jellyfin.Database.Implementations` reference | NuGet 12.2.0 | Build-time contract |
 | .NET | SDK 10.0.401, runtime 10.0 | Supported |
 | Entity Framework Core | 10.0.11 | Must match the host |
@@ -32,12 +31,9 @@ dependent implementation beads.
 | PostgreSQL | 16.6, image digest `sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36` | Automated black-box gate with runtime version assertion |
 | Host PostgreSQL client programs | `pg_dump` absent; `psql` absent | Not required |
 
-The provider rejects any Jellyfin database assembly outside ABI 12.2.x or 13.0.x
-before it parses the connection string, opens PostgreSQL, or runs a migration.
-ABI 13 had the same provider interface in the manually inspected master commit,
-and the 12.2 reference bound forward in that manual run. That is compatibility
-evidence, not a support guarantee; a pinned automated run is required before
-claiming support for any 13.x release.
+The provider accepts only Jellyfin database ABI 12.2.x. It rejects 13.x and every
+other ABI before parsing the connection string, opening PostgreSQL, or running a
+migration. No manual binding observation is a support claim.
 
 ## Loader and package findings
 
@@ -84,57 +80,27 @@ catalog. That proves this one explicit property facet can be changed after the
 vanilla configuration runs. It does not yet prove equivalent handling for keys,
 indexes, collations, converters, shadow properties, or every future model change.
 
-## Migration, backup, and rollback result
+## Migration, backup, and rollback status
 
-The package contains a PostgreSQL baseline generated from the published Jellyfin
-12.2 model. On a new database, the untouched host:
+The package contains a PostgreSQL baseline generated from the Jellyfin 12.2
+model, but vanilla Jellyfin requires a rollback-capable backup callback before it
+will apply that baseline. The current provider intentionally throws
+`NotSupportedException` from that callback before making database changes. The
+provider-core smoke test verifies this fail-closed boundary and verifies that no
+application table or backup schema was created.
 
-1. created its migration history table;
-2. invoked `MigrationBackupFast`;
-3. applied the plugin baseline;
-4. invoked `DeleteBackup`;
-5. completed its application migrations and became healthy.
+Backup, restore, deletion, forced-failure rollback, and the full healthy-host CRUD
+path are work for bead `jellyfin-38k.8` and later dependent beads. Earlier text
+claiming that those operations completed referred to a superseded host-integrated
+prototype and is not behavior shipped by this standalone plugin branch.
 
-The native backup implementation uses Npgsql and PostgreSQL schemas, not external
-client programs. For the measured schema, it copies Jellyfin tables with data,
-indexes, defaults, identity definitions, and checks. Foreign-key definitions are
-retained as metadata and recreated after restoration so dropping the damaged
-`public` schema cannot cascade them away. For identity-owned sequences it copies
-the source sequence's exact `last_value` and `is_called` state into the snapshot;
-it does not infer sequence state from table rows.
+## Host lifecycle status
 
-The black-box test then installed a test-only migration which committed a table
-outside an EF transaction and deliberately failed with division by zero. Vanilla
-Jellyfin invoked `RestoreBackupFast`. Verification after the failure showed:
-
-- the partially committed marker table was absent;
-- the administrator row and password remained usable;
-- all 28 foreign keys remained;
-- the failed migration was not in `__EFMigrationsHistory`;
-- the temporary backup schema was gone;
-- identity sequences retained exact state when advanced beyond the table maximum,
-  when their only row had been deleted, when never called, and when explicitly
-  advanced with `is_called=false`;
-- replacing the deliberately bad package with the normal package allowed the
-  untouched host to become healthy again.
-
-The snapshot algorithm is sufficient for the measured Jellyfin-managed baseline,
-which contains tables, identity-owned sequences, constraints, and indexes. This
-probe does not claim preservation of standalone sequences, views, materialized
-views, functions, triggers, row-level-security policies, custom grants, ownership
-outside the runtime role, or other schema objects. Production work must reject or
-explicitly preserve such objects. Future core migrations are therefore a mandatory
-compatibility-test trigger.
-
-## Host lifecycle and CRUD result
-
-The smoke test binds both first-run and normal Jellyfin listeners exclusively to
-IPv4 loopback, verifies the live listening socket before invoking setup, and uses
-a random per-run administrator password. It then uses Jellyfin's startup API to
-create the initial administrator and complete setup. It authenticates that user,
-shuts the host down through Jellyfin's API, restarts the same untouched host, and
-authenticates the persisted user again. It repeats the restart and authentication
-after forced migration rollback.
+The harness can bind a copied pristine host to IPv4 loopback and ties every HTTP
+request to the launched process identity, process group, and listening socket.
+The current provider-core gate stops at the deliberate migration-backup guard.
+Setup, CRUD, graceful shutdown, restart persistence, and forced rollback are not
+claimed complete until the backup and parity beads land.
 
 PostgreSQL is bootstrapped separately as its container administrator. The test
 then creates a random-password `jellyfin` login as owner of only the disposable
@@ -155,36 +121,31 @@ negative `CREATE DATABASE`/`CREATE ROLE` attempts prove it is `NOSUPERUSER`,
    this provider does not convert or import an existing SQLite database.
 5. Install the plugin before changing `database.xml`. A missing or incompatible
    provider is startup-fatal by design.
-6. If migration startup fails, leave the database and configuration in place,
-   replace the incompatible plugin package with the previous compatible package,
-   and restart. The provider restores the pre-migration schema before Jellyfin
-   exits. Preserve an independent operator backup for defense in depth.
+6. Do not use the current development package for a migration. Its deliberate
+   backup guard prevents startup before mutation. A future release must document
+   tested recovery behavior and still require an independent operator backup.
 
 ## Reproduction
 
 From this directory:
 
 ```sh
-JELLYFIN_HOST_REPOSITORY=/path/to/jellyfin ./tests/black-box-smoke.sh
+JELLYFIN_HOST_PUBLISH=/path/to/exact-jellyfin-12.2-publish \
+JELLYFIN_HOST_SHA256=<precomputed-publish-digest> \
+PROVIDER_CORE_ONLY=true ./tests/black-box-smoke.sh
 ```
 
-The script archives the exact default Jellyfin commit beneath ignored `.artifacts`,
-builds and publishes that copy, starts the digest-pinned PostgreSQL image, installs
-the minimum package, executes migrate/start/CRUD/shutdown/restart, forces and
-verifies rollback, and records an `evidence.txt`. It uses collision-resistant
-OS-assigned ports, random per-run credentials, and a paired fake `ffmpeg`/`ffprobe`.
-It never edits the archived host and cleans up its Docker container.
+The supported gate requires an explicitly supplied, separately published vanilla
+Jellyfin 12.2 host and its precomputed digest. It starts the digest-pinned
+PostgreSQL image, installs the package, and verifies the pre-mutation provider
+guard. It does not infer, edit, or depend on the parent repository.
 
-`JELLYFIN_HOST_REPOSITORY` identifies the Jellyfin Git checkout. It defaults to
-the plugin directory's parent only when that directory is a valid Jellyfin
-checkout, so the proof remains convenient in this temporary layout and safely
-fails with instructions after the plugin is relocated. `JELLYFIN_HOST_COMMIT` and
-`POSTGRES_IMAGE` parameterize the two pinned inputs for an explicit compatibility
-run; `POSTGRES_PORT`, `HTTP_PORT`, and `HTTPS_PORT` may also be supplied when fixed
-ports are required. The passing default run used
-Jellyfin 12.2.0 and PostgreSQL 16.6 and reported 28 restored foreign keys, the
-single 511-character model override, exact identity sequence state, no host
-`pg_dump` or `psql`, and only the three expected package DLLs.
+The legacy source-build path runs only when `JELLYFIN_HOST_REPOSITORY` is set
+explicitly to a suitable checkout; it is not the supported reproducibility path
+and no parent checkout is inferred. `POSTGRES_IMAGE`, `POSTGRES_PORT`,
+`HTTP_PORT`, and `HTTPS_PORT` remain explicit overrides. A full migration,
+rollback, CRUD, and restart result must not be reported until bead
+`jellyfin-38k.8` and its dependent parity work are complete.
 
 ## Parent-host isolation
 

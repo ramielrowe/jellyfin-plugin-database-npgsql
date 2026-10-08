@@ -40,7 +40,7 @@ public sealed class PostgreSqlTestEnvironment : IAsyncDisposable
             var container = await PostgreSqlTestContainer.StartAsync(options, cancellationToken).ConfigureAwait(false);
             try
             {
-                await PostgreSqlTestDatabase.ValidateServerMajorAsync(container.AdministratorConnectionString, 16, cancellationToken).ConfigureAwait(false);
+                await PostgreSqlTestDatabase.ValidateServerVersionAsync(container.AdministratorConnectionString, 160006, cancellationToken).ConfigureAwait(false);
                 await PostgreSqlTestDatabase.ReclaimStaleResourcesAsync(container.AdministratorConnectionString, cancellationToken).ConfigureAwait(false);
                 return new PostgreSqlTestEnvironment(options, container.AdministratorConnectionString, container);
             }
@@ -52,7 +52,7 @@ public sealed class PostgreSqlTestEnvironment : IAsyncDisposable
         }
 
         _ = PostgreSqlTestDatabase.ValidateAdministratorConnectionString(options.AdministratorConnectionString!);
-        await PostgreSqlTestDatabase.ValidateServerMajorAsync(options.AdministratorConnectionString!, 16, cancellationToken).ConfigureAwait(false);
+        await PostgreSqlTestDatabase.ValidateServerVersionAsync(options.AdministratorConnectionString!, 160006, cancellationToken).ConfigureAwait(false);
         await PostgreSqlTestDatabase.ReclaimStaleResourcesAsync(options.AdministratorConnectionString!, cancellationToken).ConfigureAwait(false);
         return new PostgreSqlTestEnvironment(options, options.AdministratorConnectionString!, null);
     }

@@ -6,9 +6,9 @@ using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Xml.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Xml.Linq;
 using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
 using Xunit;
 
@@ -126,7 +126,7 @@ public sealed class TestInfrastructureTests
             Assert.True(File.Exists(Path.Combine(pluginDirectory, "plugin.dll")));
             Assert.True(File.Exists(Path.Combine(layout.ConfigurationDirectory, "database.xml")));
             var collectedLog = await File.ReadAllTextAsync(
-                Path.Combine(layout.CollectedLogDirectory, "logs_jellyfin.log"),
+                Assert.Single(Directory.EnumerateFiles(layout.CollectedLogDirectory)),
                 TestContext.Current.CancellationToken);
             Assert.Contains("<redacted>", collectedLog, StringComparison.Ordinal);
             Assert.DoesNotContain(LogSecret, collectedLog, StringComparison.Ordinal);
@@ -246,6 +246,15 @@ public sealed class TestInfrastructureTests
             var connection = "Host=localhost;Password=" + Secret;
             layout.WriteDatabaseConfiguration(connection, "folder<&", "plugin.dll");
             layout.WriteNetworkConfiguration(1, 65535);
+            if (!OperatingSystem.IsWindows())
+            {
+                Assert.Equal(
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute,
+                    File.GetUnixFileMode(layout.ConfigurationDirectory));
+                Assert.Equal(
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite,
+                    File.GetUnixFileMode(Path.Combine(layout.ConfigurationDirectory, "database.xml")));
+            }
             var document = XDocument.Load(Path.Combine(layout.ConfigurationDirectory, "database.xml"));
             Assert.Equal(connection, document.Root?.Element("CustomProviderOptions")?.Element("ConnectionString")?.Value);
             Assert.Single(document.Descendants("ConnectionString"));
@@ -271,6 +280,46 @@ public sealed class TestInfrastructureTests
             Directory.Delete(tempRoot, recursive: true);
         }
     }
+
+    [Fact]
+    public async Task SecretScanner_DiscardsAllEvidenceWhenPrivateKeyIsDetected()
+    {
+        var tempRoot = CreateTemporaryDirectory();
+        try
+        {
+            var source = Path.Combine(tempRoot, "source");
+            Directory.CreateDirectory(source);
+            await File.WriteAllTextAsync(Path.Combine(source, "jellyfin.dll"), "host", TestContext.Current.CancellationToken);
+            var hash = await PristineJellyfinPublish.HashDirectoryAsync(source, TestContext.Current.CancellationToken);
+            var publish = await PristineJellyfinPublish.CreateAsync(
+                new PristineJellyfinPublishOptions { PublishDirectory = source, Sha256 = hash },
+                Path.Combine(tempRoot, "publish"),
+                TestContext.Current.CancellationToken);
+            var layout = JellyfinHostLayout.Create(Path.Combine(tempRoot, "artifacts"), publish);
+            await File.WriteAllTextAsync(Path.Combine(layout.LogDirectory, "safe.log"), "bounded evidence", TestContext.Current.CancellationToken);
+            await File.WriteAllTextAsync(Path.Combine(layout.LogDirectory, "key.log"), "-----BEGIN PRIVATE KEY-----", TestContext.Current.CancellationToken);
+
+            Assert.Throws<InvalidOperationException>(() => layout.RetainOnlySanitizedEvidence(new SensitiveDataRedactor()));
+            Assert.False(Directory.Exists(layout.CollectedLogDirectory));
+            Assert.False(Directory.Exists(layout.LogDirectory));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData("https://attacker.invalid/")]
+    [InlineData("//attacker.invalid/path")]
+    [InlineData("/absolute")]
+    [InlineData("\\\\attacker.invalid\\path")]
+    public void HostRequests_RejectAbsoluteOrAuthorityTargets(string target)
+        => Assert.False(JellyfinHostProcess.IsSafeRelativeRequestTarget(target));
+
+    [Fact]
+    public void HostRequests_AcceptRelativeTargets()
+        => Assert.True(JellyfinHostProcess.IsSafeRelativeRequestTarget("Startup/User"));
 
     [Theory]
     [InlineData("0")]
@@ -310,10 +359,53 @@ public sealed class TestInfrastructureTests
             listener.Start();
             Assert.True(JellyfinHostProcess.ProcessOwnsListeningPort(Environment.ProcessId, first.Port));
             Assert.False(JellyfinHostProcess.ProcessOwnsListeningPort(1, first.Port));
+            var firstLock = Path.Combine(root, first.Port + ".lock");
+            var secondLock = Path.Combine(root, second.Port + ".lock");
+            first.Dispose();
+            second.Dispose();
+            Assert.True(File.Exists(firstLock));
+            Assert.True(File.Exists(secondLock));
         }
         finally
         {
             Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ExternalCommand_CapsCapturedOutputWhileContinuingToDrain()
+    {
+        var result = await ExternalCommand.RunAsync(
+            "/bin/sh",
+            new[] { "-c", "head -c 2097152 /dev/zero | tr '\\0' x; head -c 2097152 /dev/zero | tr '\\0' y >&2" },
+            TimeSpan.FromSeconds(10),
+            TestContext.Current.CancellationToken);
+        Assert.Equal(0, result.ExitCode);
+        Assert.InRange(result.StandardOutput.Length, 1, 1024 * 1024);
+        Assert.InRange(result.StandardError.Length, 1, 1024 * 1024);
+    }
+
+    [Fact]
+    public async Task PrebuiltHashHelper_EmitsExactlyOneDigestDespiteStderrWarning()
+    {
+        var root = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var helper = Path.Combine(root, "tests", "Jellyfin.Plugin.Database.Npgsql.TestHarness", "bin", "Release", "net10.0", "Jellyfin.Plugin.Database.Npgsql.TestHarness.dll");
+        var tempRoot = CreateTemporaryDirectory();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(tempRoot, "jellyfin.dll"), "host", TestContext.Current.CancellationToken);
+            var result = await ExternalCommand.RunAsync(
+                "/bin/sh",
+                new[] { "-c", "echo simulated-warning >&2; exec dotnet \"$1\" hash-publish \"$2\"", "hash-test", helper, tempRoot },
+                TimeSpan.FromSeconds(10),
+                TestContext.Current.CancellationToken);
+            Assert.Equal(0, result.ExitCode);
+            Assert.Matches("^[0-9a-f]{64}\\n?$", result.StandardOutput);
+            Assert.Contains("simulated-warning", result.StandardError, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
         }
     }
 

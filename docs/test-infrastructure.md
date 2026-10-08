@@ -29,8 +29,8 @@ dotnet test --project tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jel
 The administrator database name must contain `jellyfin_npgsql_test_admin`, and
 the administrator must have `CREATEDB` and `CREATEROLE`. This explicit safety
 marker is intentional; do not point the fixture at a production cluster.
-The real fixture asserts PostgreSQL major 16. The controlled container asserts
-the exact 16.6 server version as well as the numeric major.
+Both the external fixture and controlled container require the exact numeric
+`server_version_num` value `160006`.
 
 Alternatively, start the immutable PostgreSQL 16.6 test image automatically:
 
@@ -63,11 +63,15 @@ content/path manifest proves the copied host was unchanged after every run.
 Plugin files, configuration, cache, data, media, logs, and the PostgreSQL
 database all live outside the publish directory.
 
-Calculate a publish-directory hash:
+First build the hash helper while dependencies are available, then run the
+prebuilt helper offline. Its stdout is exactly one lowercase 64-hex digest;
+diagnostics use stderr:
 
 ```sh
-dotnet run --project tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/Jellyfin.Plugin.Database.Npgsql.TestHarness.csproj \
-  -- hash-publish /path/to/vanilla-jellyfin-publish
+dotnet build tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/Jellyfin.Plugin.Database.Npgsql.TestHarness.csproj \
+  --configuration Release --no-restore
+dotnet tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/bin/Release/net10.0/Jellyfin.Plugin.Database.Npgsql.TestHarness.dll \
+  hash-publish /path/to/vanilla-jellyfin-publish
 ```
 
 Then exercise two independent stock-host launches, including readiness, setup
@@ -108,8 +112,8 @@ export JELLYFIN_HOST_SHA256=<publish hash>
 PROVIDER_CORE_ONLY=true ./tests/black-box-smoke.sh
 ```
 
-This path uses the same digest-pinned PostgreSQL 16.6 image and verifies both
-`server_version` and `server_version_num` after startup. The reusable C# fixture
+This path uses the same digest-pinned PostgreSQL 16.6 image and requires exact
+`server_version_num = 160006` after startup. The reusable C# fixture
 above is the preferred path for new database tests and supports an external
 administrator connection. The package smoke removes its labeled container and
 retains only redacted logs and evidence with owner-only modes.

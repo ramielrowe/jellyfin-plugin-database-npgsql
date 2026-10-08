@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
@@ -18,17 +19,26 @@ public sealed class PostgreSqlInfrastructureOptInTests
 
         await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
         var crashedIdentity = TestResourceNames.Create("crashed");
+        var markerDecoyIdentity = TestResourceNames.Create("decoy");
+        var orphanIdentity = TestResourceNames.Create("orphan");
+        var staleMarker = "jellyfin-npgsql-test-owner|" + PostgreSqlTestDatabase.TestScope + "|00000000000000000000000000000000";
+        var decoyMarker = "jellyfin-npgsql-test-owner|" + PostgreSqlTestDatabase.TestScope + "|11111111111111111111111111111111";
         await using (var connection = new NpgsqlConnection(environment.AdministratorConnectionString))
         {
             await connection.OpenAsync(cancellationToken);
             await using var command = connection.CreateCommand();
-            var marker = "jellyfin-npgsql-test-owner|" + PostgreSqlTestDatabase.TestScope + "|00000000000000000000000000000000";
             foreach (var statement in new[]
                      {
                          $"CREATE ROLE \"{crashedIdentity.RoleName}\" NOLOGIN",
-                         $"COMMENT ON ROLE \"{crashedIdentity.RoleName}\" IS '{marker}'",
+                         $"COMMENT ON ROLE \"{crashedIdentity.RoleName}\" IS '{staleMarker}'",
                          $"CREATE DATABASE \"{crashedIdentity.DatabaseName}\" OWNER \"{crashedIdentity.RoleName}\"",
-                         $"COMMENT ON DATABASE \"{crashedIdentity.DatabaseName}\" IS '{marker}'"
+                         $"COMMENT ON DATABASE \"{crashedIdentity.DatabaseName}\" IS '{staleMarker}'",
+                         $"CREATE ROLE \"{markerDecoyIdentity.RoleName}\" NOLOGIN",
+                         $"COMMENT ON ROLE \"{markerDecoyIdentity.RoleName}\" IS '{staleMarker}'",
+                         $"CREATE DATABASE \"{markerDecoyIdentity.DatabaseName}\" OWNER \"{markerDecoyIdentity.RoleName}\"",
+                         $"COMMENT ON DATABASE \"{markerDecoyIdentity.DatabaseName}\" IS '{decoyMarker}'",
+                         $"CREATE ROLE \"{orphanIdentity.RoleName}\" NOLOGIN",
+                         $"COMMENT ON ROLE \"{orphanIdentity.RoleName}\" IS '{staleMarker}'"
                      })
             {
                 command.CommandText = statement;
@@ -45,10 +55,37 @@ public sealed class PostgreSqlInfrastructureOptInTests
             environment.AdministratorConnectionString,
             crashedIdentity.RoleName,
             cancellationToken));
+        Assert.False(await PostgreSqlTestDatabase.RoleExistsAsync(
+            environment.AdministratorConnectionString,
+            orphanIdentity.RoleName,
+            cancellationToken));
+        Assert.True(await PostgreSqlTestDatabase.DatabaseExistsAsync(
+            environment.AdministratorConnectionString,
+            markerDecoyIdentity.DatabaseName,
+            cancellationToken));
+        await using (var connection = new NpgsqlConnection(environment.AdministratorConnectionString))
+        {
+            await connection.OpenAsync(cancellationToken);
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"COMMENT ON DATABASE \"{markerDecoyIdentity.DatabaseName}\" IS '{staleMarker}'";
+            await command.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await PostgreSqlTestDatabase.ReclaimStaleResourcesAsync(environment.AdministratorConnectionString, cancellationToken);
+        Assert.False(await PostgreSqlTestDatabase.DatabaseExistsAsync(
+            environment.AdministratorConnectionString,
+            markerDecoyIdentity.DatabaseName,
+            cancellationToken));
+        Assert.False(await PostgreSqlTestDatabase.RoleExistsAsync(
+            environment.AdministratorConnectionString,
+            markerDecoyIdentity.RoleName,
+            cancellationToken));
         if (options.UseContainer)
         {
             var stale = TestResourceNames.Create("stale").ContainerName;
             var decoy = TestResourceNames.Create("decoy").ContainerName;
+            string? staleId = null;
+            string? decoyId = null;
             try
             {
                 var staleCreate = await ExternalCommand.RunAsync(
@@ -66,22 +103,28 @@ public sealed class PostgreSqlInfrastructureOptInTests
                     TimeSpan.FromMinutes(2),
                     cancellationToken);
                 staleCreate.EnsureSuccess("Creating a deliberately stale test container", new SensitiveDataRedactor());
+                staleId = staleCreate.StandardOutput.Trim();
                 var decoyCreate = await ExternalCommand.RunAsync(
                     "docker",
                     new[] { "create", "--name", decoy, options.ContainerImage },
                     TimeSpan.FromMinutes(2),
                     cancellationToken);
                 decoyCreate.EnsureSuccess("Creating an unlabeled decoy test container", new SensitiveDataRedactor());
+                decoyId = decoyCreate.StandardOutput.Trim();
 
                 await using var reclamationEnvironment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
-                Assert.False(await DockerContainerExistsAsync(stale, cancellationToken));
-                Assert.True(await DockerContainerExistsAsync(decoy, cancellationToken));
+                Assert.False(await DockerContainerExistsAsync(staleId, cancellationToken));
+                Assert.True(await DockerContainerExistsAsync(decoyId, cancellationToken));
             }
             finally
             {
+                var immutableIds = new[] { staleId, decoyId }
+                    .Where(id => !string.IsNullOrWhiteSpace(id))
+                    .Select(id => id!)
+                    .ToArray();
                 _ = await ExternalCommand.RunAsync(
                     "docker",
-                    new[] { "rm", "--force", stale, decoy },
+                    new[] { "rm", "--force" }.Concat(immutableIds),
                     TimeSpan.FromSeconds(30),
                     CancellationToken.None);
             }
@@ -106,10 +149,8 @@ public sealed class PostgreSqlInfrastructureOptInTests
             Assert.Equal(8, await first.ExecuteScalarAsync<int>(
                 "SELECT datconnlimit FROM pg_catalog.pg_database WHERE datname = current_database()",
                 cancellationToken));
-            var serverVersion = await first.ExecuteScalarAsync<string>("SHOW server_version", cancellationToken);
             var serverVersionNumber = await first.ExecuteScalarAsync<int>("SELECT current_setting('server_version_num')::integer", cancellationToken);
-            Assert.StartsWith("16.", serverVersion, StringComparison.Ordinal);
-            Assert.Equal(16, serverVersionNumber / 10000);
+            Assert.Equal(160006, serverVersionNumber);
 
             await first.ExecuteAsync("CREATE TABLE worker_probe (id integer PRIMARY KEY)", cancellationToken);
             Assert.True(await first.ExecuteScalarAsync<bool>("SELECT to_regclass('public.worker_probe') IS NOT NULL", cancellationToken));
@@ -203,11 +244,11 @@ public sealed class PostgreSqlInfrastructureOptInTests
             cancellationToken));
     }
 
-    private static async Task<bool> DockerContainerExistsAsync(string name, CancellationToken cancellationToken)
+    private static async Task<bool> DockerContainerExistsAsync(string containerId, CancellationToken cancellationToken)
     {
         var inspect = await ExternalCommand.RunAsync(
             "docker",
-            new[] { "inspect", name },
+            new[] { "inspect", containerId },
             TimeSpan.FromSeconds(30),
             cancellationToken);
         return inspect.ExitCode == 0;

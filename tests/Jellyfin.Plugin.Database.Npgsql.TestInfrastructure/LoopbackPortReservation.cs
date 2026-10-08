@@ -23,7 +23,7 @@ public sealed class LoopbackPortReservation : IDisposable
     public static LoopbackPortReservation Acquire(string coordinationRoot)
     {
         var root = Path.GetFullPath(coordinationRoot);
-        Directory.CreateDirectory(root);
+        SecureFileSystem.CreateDirectory(root);
         for (var attempt = 0; attempt < 100; attempt++)
         {
             var listener = new TcpListener(IPAddress.Loopback, 0);
@@ -32,7 +32,7 @@ public sealed class LoopbackPortReservation : IDisposable
             var leasePath = Path.Combine(root, port.ToString(CultureInfo.InvariantCulture) + ".lock");
             try
             {
-                var lease = new FileStream(leasePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+                var lease = SecureFileSystem.OpenLease(leasePath);
                 return new LoopbackPortReservation(port, lease, listener);
             }
             catch (IOException)

@@ -2,12 +2,16 @@ using System;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Xml.Linq;
 
 namespace Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
 
 public sealed class JellyfinHostLayout
 {
+    private const int MaximumEvidenceFileBytes = 4 * 1024 * 1024;
+    private const int MaximumEvidenceBytes = 32 * 1024 * 1024;
     private JellyfinHostLayout(string runRoot, PristineJellyfinPublish publish)
     {
         RunRoot = runRoot;
@@ -54,12 +58,13 @@ public sealed class JellyfinHostLayout
             throw new InvalidOperationException("The generated test run path escaped its artifact root.");
         }
         var layout = new JellyfinHostLayout(root, publish);
-        Directory.CreateDirectory(layout.ConfigurationDirectory);
-        Directory.CreateDirectory(layout.CacheDirectory);
-        Directory.CreateDirectory(layout.DataDirectory);
-        Directory.CreateDirectory(layout.MediaDirectory);
-        Directory.CreateDirectory(layout.LogDirectory);
-        Directory.CreateDirectory(layout.CollectedLogDirectory);
+        SecureFileSystem.CreateDirectory(layout.RunRoot);
+        SecureFileSystem.CreateDirectory(layout.ConfigurationDirectory);
+        SecureFileSystem.CreateDirectory(layout.CacheDirectory);
+        SecureFileSystem.CreateDirectory(layout.DataDirectory);
+        SecureFileSystem.CreateDirectory(layout.MediaDirectory);
+        SecureFileSystem.CreateDirectory(layout.LogDirectory);
+        SecureFileSystem.CreateDirectory(layout.CollectedLogDirectory);
         return layout;
     }
 
@@ -73,9 +78,9 @@ public sealed class JellyfinHostLayout
         }
 
         var pluginRoot = Path.Combine(DataDirectory, "plugins");
-        Directory.CreateDirectory(pluginRoot);
+        SecureFileSystem.CreateDirectory(pluginRoot);
         var destination = Path.Combine(pluginRoot, pluginFolderName);
-        Directory.CreateDirectory(destination);
+        SecureFileSystem.CreateDirectory(destination);
         PristineJellyfinPublish.ExtractZipSafely(packageZip, destination);
         return destination;
     }
@@ -93,7 +98,7 @@ public sealed class JellyfinHostLayout
                     new XElement("ConnectionString", connectionString),
                     new XElement("Options")),
                 new XElement("LockingBehavior", "NoLock")));
-        document.Save(Path.Combine(ConfigurationDirectory, "database.xml"));
+        SecureFileSystem.WriteAllTextAtomic(Path.Combine(ConfigurationDirectory, "database.xml"), document.ToString());
     }
 
     public void WriteNetworkConfiguration(int httpPort, int httpsPort)
@@ -115,19 +120,47 @@ public sealed class JellyfinHostLayout
                 new XElement("EnableIPv6", false),
                 new XElement("EnableRemoteAccess", false),
                 new XElement("LocalNetworkAddresses", new XElement("string", "127.0.0.1"))));
-        document.Save(Path.Combine(ConfigurationDirectory, "network.xml"));
+        SecureFileSystem.WriteAllTextAtomic(Path.Combine(ConfigurationDirectory, "network.xml"), document.ToString());
     }
 
     public void CollectSanitizedLogs(SensitiveDataRedactor redactor)
     {
-        Directory.CreateDirectory(CollectedLogDirectory);
+        SecureFileSystem.CreateDirectory(CollectedLogDirectory);
+        var retainedBytes = 0;
         foreach (var source in Directory.EnumerateFiles(LogDirectory, "*", SearchOption.AllDirectories)
                      .Concat(Directory.EnumerateFiles(RunRoot, "process*.log", SearchOption.TopDirectoryOnly)))
         {
-            var relative = Path.GetRelativePath(RunRoot, source).Replace(Path.DirectorySeparatorChar, '_');
-            File.WriteAllText(
-                Path.Combine(CollectedLogDirectory, relative),
-                redactor.Redact(File.ReadAllText(source)));
+            var relative = Path.GetRelativePath(RunRoot, source);
+            var sourceBytes = File.ReadAllBytes(source);
+            if (sourceBytes.Length > MaximumEvidenceFileBytes)
+            {
+                Array.Resize(ref sourceBytes, MaximumEvidenceFileBytes);
+            }
+
+            var sourceText = Encoding.UTF8.GetString(sourceBytes);
+            if (sourceText.Contains("PRIVATE KEY-----", StringComparison.Ordinal))
+            {
+                DeleteCollectedEvidence();
+                throw new InvalidOperationException("A private key was detected in test output; no failure artifacts were retained.");
+            }
+
+            var sanitized = redactor.Redact(sourceText);
+            if (redactor.ContainsKnownSecret(sanitized))
+            {
+                DeleteCollectedEvidence();
+                throw new InvalidOperationException("A generated secret survived redaction; no failure artifacts were retained.");
+            }
+
+            var bytes = Encoding.UTF8.GetByteCount(sanitized);
+            if (retainedBytes + bytes > MaximumEvidenceBytes)
+            {
+                break;
+            }
+
+            retainedBytes += bytes;
+            var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(relative))).ToLowerInvariant()[..16];
+            var safeName = new string(Path.GetFileName(source).Select(character => char.IsAsciiLetterOrDigit(character) || character is '.' or '-' ? character : '_').ToArray());
+            SecureFileSystem.WriteAllTextAtomic(Path.Combine(CollectedLogDirectory, hash + "-" + safeName), sanitized);
         }
     }
 
@@ -174,6 +207,7 @@ public sealed class JellyfinHostLayout
             if (redactor.ContainsKnownSecret(contents))
             {
                 File.Delete(evidence);
+                DeleteCollectedEvidence();
                 throw new InvalidOperationException("Sanitized test evidence still contains a generated secret.");
             }
 
@@ -181,6 +215,14 @@ public sealed class JellyfinHostLayout
             {
                 File.SetUnixFileMode(evidence, UnixFileMode.UserRead | UnixFileMode.UserWrite);
             }
+        }
+    }
+
+    private void DeleteCollectedEvidence()
+    {
+        if (Directory.Exists(CollectedLogDirectory))
+        {
+            Directory.Delete(CollectedLogDirectory, recursive: true);
         }
     }
 }

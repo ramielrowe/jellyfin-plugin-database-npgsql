@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
@@ -94,13 +96,37 @@ public sealed class PristineHostOptInTests
             if (!succeeded && Directory.Exists(caseRoot))
             {
                 var retained = Path.Combine(artifactRoot, "failed-" + Path.GetFileName(caseRoot));
-                Directory.CreateDirectory(retained);
+                if (OperatingSystem.IsWindows())
+                {
+                    Directory.CreateDirectory(retained);
+                }
+                else
+                {
+                    Directory.CreateDirectory(retained, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                }
+
                 foreach (var log in Directory.EnumerateFiles(caseRoot, "*", SearchOption.AllDirectories)
                              .Where(path => path.Contains(
                                  Path.DirectorySeparatorChar + "collected-logs" + Path.DirectorySeparatorChar,
                                  StringComparison.Ordinal)))
                 {
-                    File.Copy(log, Path.Combine(retained, Path.GetFileName(log)), overwrite: true);
+                    var relative = Path.GetRelativePath(caseRoot, log);
+                    var prefix = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(relative))).ToLowerInvariant()[..16];
+                    var destination = Path.Combine(retained, prefix + "-" + Path.GetFileName(log));
+                    var options = new FileStreamOptions
+                    {
+                        Access = FileAccess.Write,
+                        Mode = FileMode.CreateNew,
+                        Share = FileShare.None
+                    };
+                    if (!OperatingSystem.IsWindows())
+                    {
+                        options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+                    }
+
+                    using var source = File.OpenRead(log);
+                    using var output = new FileStream(destination, options);
+                    source.CopyTo(output);
                 }
 
                 if (!OperatingSystem.IsWindows())

@@ -22,6 +22,7 @@ public sealed record ExternalCommandResult(int ExitCode, string StandardOutput, 
 public static class ExternalCommand
 {
     private static readonly TimeSpan TerminationGracePeriod = TimeSpan.FromSeconds(5);
+    private const int MaximumCapturedCharacters = 1024 * 1024;
 
     public static async Task<ExternalCommandResult> RunAsync(
         string fileName,
@@ -35,12 +36,18 @@ public static class ExternalCommand
             throw new ArgumentOutOfRangeException(nameof(timeout), "External command timeout must be between zero and ten minutes.");
         }
 
-        var startInfo = new ProcessStartInfo(fileName)
+        var startInfo = new ProcessStartInfo(OperatingSystem.IsLinux() ? "setsid" : fileName)
         {
             RedirectStandardError = true,
             RedirectStandardOutput = true,
             UseShellExecute = false
         };
+        if (OperatingSystem.IsLinux())
+        {
+            startInfo.ArgumentList.Add("--wait");
+            startInfo.ArgumentList.Add(fileName);
+        }
+
         foreach (var argument in arguments)
         {
             startInfo.ArgumentList.Add(argument);
@@ -69,6 +76,12 @@ public static class ExternalCommand
                 ex);
         }
 
+        LinuxProcessIdentity? identity = null;
+        if (OperatingSystem.IsLinux())
+        {
+            identity = LinuxProcessIdentity.AwaitDedicatedGroup(process, TimeSpan.FromSeconds(1));
+        }
+
         var stdout = new StringBuilder();
         var stderr = new StringBuilder();
         var readStdout = ReadAsync(process.StandardOutput, stdout);
@@ -81,7 +94,7 @@ public static class ExternalCommand
         }
         catch (OperationCanceledException)
         {
-            TryTerminate(process);
+            TryTerminate(process, identity);
             await DrainOutputBoundedAsync(process, readStdout, readStderr).ConfigureAwait(false);
             if (timeoutSource.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
@@ -95,19 +108,37 @@ public static class ExternalCommand
         return new ExternalCommandResult(process.ExitCode, stdout.ToString(), stderr.ToString());
     }
 
-    public static void TryTerminate(Process process)
+    internal static void TryTerminate(Process process, LinuxProcessIdentity? identity = null)
     {
-        try
+        if (!process.HasExited)
         {
-            if (!process.HasExited)
+            if (OperatingSystem.IsLinux())
+            {
+                var verifiedIdentity = identity ?? LinuxProcessIdentity.Capture(process.Id);
+                var descendants = LinuxProcessIdentity.CaptureDescendants(verifiedIdentity.ProcessId);
+                verifiedIdentity.TerminateGroup(TerminationGracePeriod);
+                foreach (var descendant in descendants)
+                {
+                    if (descendant.IsCurrent())
+                    {
+                        using var descendantProcess = Process.GetProcessById(descendant.ProcessId);
+                        descendantProcess.Kill(entireProcessTree: true);
+                        if (!descendantProcess.WaitForExit(5_000))
+                        {
+                            throw new InvalidOperationException("A detached external-command descendant could not be confirmed terminated.");
+                        }
+                    }
+                }
+            }
+            else
             {
                 process.Kill(entireProcessTree: true);
-                process.WaitForExit(10_000);
             }
-        }
-        catch (InvalidOperationException)
-        {
-            // The process exited between the checks.
+
+            if (!process.WaitForExit(10_000))
+            {
+                throw new InvalidOperationException("The external test command could not be confirmed terminated.");
+            }
         }
     }
 
@@ -119,7 +150,11 @@ public static class ExternalCommand
         {
             while ((count = await reader.ReadAsync(buffer).ConfigureAwait(false)) != 0)
             {
-                destination.Append(buffer, 0, count);
+                var remaining = MaximumCapturedCharacters - destination.Length;
+                if (remaining > 0)
+                {
+                    destination.Append(buffer, 0, Math.Min(count, remaining));
+                }
             }
         }
         catch (Exception ex) when (ex is ObjectDisposedException or System.IO.IOException)
@@ -140,6 +175,9 @@ public static class ExternalCommand
 
         process.StandardOutput.Dispose();
         process.StandardError.Dispose();
-        _ = await Task.WhenAny(readers, Task.Delay(TerminationGracePeriod)).ConfigureAwait(false);
+        if (await Task.WhenAny(readers, Task.Delay(TerminationGracePeriod)).ConfigureAwait(false) != readers)
+        {
+            throw new InvalidOperationException("External-command output readers did not terminate after bounded pipe shutdown.");
+        }
     }
 }

@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 PLUGIN_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+docker() {
+    command timeout --foreground 65s docker "$@"
+}
+
+curl() {
+    command timeout --foreground 15s curl --connect-timeout 2 --max-time 10 --proto '=http' --max-redirs 0 "$@"
+}
 
 validate_port() {
     local name=$1
@@ -40,11 +49,13 @@ SMOKE_ID="$(date -u +%Y%m%d%H%M%S)-$$-$(tr -d '-' </proc/sys/kernel/random/uuid)
 RUN_ROOT="$PLUGIN_ROOT/.artifacts/smoke-$SMOKE_ID"
 POSTGRES_CONTAINER="jellyfin-npgsql-smoke-$SMOKE_ID"
 CONTAINER_LEASE_ROOT="$PLUGIN_ROOT/.artifacts/container-leases"
-mkdir -p "$CONTAINER_LEASE_ROOT"
+mkdir -p -m 700 "$CONTAINER_LEASE_ROOT"
+chmod 700 "$CONTAINER_LEASE_ROOT"
 exec {CONTAINER_LEASE_FD}>"$CONTAINER_LEASE_ROOT/$SMOKE_ID.lock"
 flock -n "$CONTAINER_LEASE_FD" || { echo "FAIL: could not acquire this smoke run's container lease" >&2; exit 1; }
 PORT_LEASE_ROOT="$PLUGIN_ROOT/.artifacts/port-leases"
-mkdir -p "$PORT_LEASE_ROOT"
+mkdir -p -m 700 "$PORT_LEASE_ROOT"
+chmod 700 "$PORT_LEASE_ROOT"
 
 reserve_port() {
     local output_name=$1
@@ -89,6 +100,8 @@ fi
 NUGET_PACKAGES="$PLUGIN_ROOT/.packages"
 NUGET_HTTP_CACHE_PATH="$PLUGIN_ROOT/.nuget-http"
 PLUGIN_PROJECT="$PLUGIN_ROOT/src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj"
+HASH_HELPER_PROJECT="$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/Jellyfin.Plugin.Database.Npgsql.TestHarness.csproj"
+HASH_HELPER="$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/bin/Release/net10.0/Jellyfin.Plugin.Database.Npgsql.TestHarness.dll"
 PACKAGE_ZIP="$PLUGIN_ROOT/artifacts/jellyfin-plugin-database-npgsql_0.1.0.0.zip"
 PLUGIN_FOLDER_NAME="Npgsql Database_0.1.0.0"
 PLUGIN_FOLDER="$RUN_ROOT/runtime/data/plugins/$PLUGIN_FOLDER_NAME"
@@ -98,88 +111,71 @@ BOOTSTRAP_PASSWORD=$(tr -d '-' </proc/sys/kernel/random/uuid)
 APPLICATION_PASSWORD=$(tr -d '-' </proc/sys/kernel/random/uuid)
 ADMIN_PASSWORD=$(tr -d '-' </proc/sys/kernel/random/uuid)
 HOST_PID=""
+HOST_START=""
+HOST_PGID=""
+POSTGRES_CONTAINER_ID=""
 OWNER_START=$(awk '{print $22}' "/proc/$$/stat")
 SMOKE_SCOPE=$(printf '%s' "$PLUGIN_ROOT" | sha256sum | cut -d' ' -f1)
-HOST_ENVIRONMENT=(
-    env
-    -u PGUSER
-    -u PGPASSWORD
-    -u PGPASSFILE
-    -u PGSSLCERT
-    -u PGSSLKEY
-    -u PGSSLROOTCERT
-    -u PGCLIENTENCODING
-    -u PGTZ
-    -u PGOPTIONS
-    -u PGTARGETSESSIONATTRS
-    -u PGSSLNEGOTIATION
-    -u PGGSSENCMODE
-    -u PGREQUIREAUTH
-    -u PGAPPNAME
-)
-
 export NUGET_PACKAGES NUGET_HTTP_CACHE_PATH
+mkdir -p -m 700 "$RUN_ROOT"
+chmod 700 "$RUN_ROOT"
 
 cleanup() {
     local original_status=$?
     trap - EXIT
     set +e
-    if [ -n "$HOST_PID" ] && kill -0 "$HOST_PID" 2>/dev/null; then
-        kill -TERM "$HOST_PID" 2>/dev/null || true
-        for _ in $(seq 1 10); do
-            if ! kill -0 "$HOST_PID" 2>/dev/null; then
-                break
-            fi
+    terminate_host_group || original_status=1
 
-            sleep 1
-        done
-        kill -KILL "$HOST_PID" 2>/dev/null || true
-        wait "$HOST_PID" 2>/dev/null || true
-    fi
-
-    if [[ "$POSTGRES_CONTAINER" =~ ^jellyfin-npgsql-smoke-[0-9]{14}-[0-9]+-[0-9a-f]{32}$ ]] \
-        && [ "$(docker inspect --format '{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-managed"}}' "$POSTGRES_CONTAINER" 2>/dev/null || true)" = "true" ] \
-        && [ "$(docker inspect --format '{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-scope"}}' "$POSTGRES_CONTAINER" 2>/dev/null || true)" = "$SMOKE_SCOPE" ] \
-        && [ "$(docker inspect --format '{{index .Config.Labels "org.jellyfin.database-npgsql.owner-lease"}}' "$POSTGRES_CONTAINER" 2>/dev/null || true)" = "$SMOKE_ID" ] \
-        && [ "$(docker inspect --format '{{index .Config.Labels "org.jellyfin.database-npgsql.owner-pid"}}' "$POSTGRES_CONTAINER" 2>/dev/null || true)" = "$$" ] \
-        && [ "$(docker inspect --format '{{index .Config.Labels "org.jellyfin.database-npgsql.owner-start"}}' "$POSTGRES_CONTAINER" 2>/dev/null || true)" = "$OWNER_START" ]; then
-        docker rm --force "$POSTGRES_CONTAINER" >/dev/null 2>&1 || true
+    if [[ "$POSTGRES_CONTAINER_ID" =~ ^[0-9a-f]{64}$ ]] \
+        && [ "$(docker inspect --format '{{.Id}}|{{.Name}}|{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-managed"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-scope"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-lease"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-pid"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-start"}}' "$POSTGRES_CONTAINER_ID" 2>/dev/null || true)" = "$POSTGRES_CONTAINER_ID|/$POSTGRES_CONTAINER|true|$SMOKE_SCOPE|$SMOKE_ID|$$|$OWNER_START" ]; then
+        docker rm --force "$POSTGRES_CONTAINER_ID" >/dev/null 2>&1 || original_status=1
     fi
     eval "exec ${CONTAINER_LEASE_FD}>&-"
-    rm -f "$CONTAINER_LEASE_ROOT/$SMOKE_ID.lock"
     eval "exec ${POSTGRES_PORT_LEASE_FD}>&-"
     eval "exec ${HTTP_PORT_LEASE_FD}>&-"
     eval "exec ${HTTPS_PORT_LEASE_FD}>&-"
-    rm -f "$PORT_LEASE_ROOT/$POSTGRES_PORT.lock" "$PORT_LEASE_ROOT/$HTTP_PORT.lock" "$PORT_LEASE_ROOT/$HTTPS_PORT.lock"
 
     if [ -d "$RUN_ROOT" ]; then
         chmod -R u+rwX "$RUN_ROOT" 2>/dev/null || true
         local retained="$RUN_ROOT.retained"
         rm -rf "$retained"
-        mkdir -p "$retained"
-        python3 - "$RUN_ROOT" "$retained" \
+        mkdir -p -m 700 "$retained"
+        local redaction_secrets="$RUN_ROOT/.redaction-secrets"
+        printf '%s\n' \
             "$BOOTSTRAP_PASSWORD" "$APPLICATION_PASSWORD" "$ADMIN_PASSWORD" \
             "${SECRET_FILE_MARKER:-}" "${PASSFILE_UNRELATED_SECRET:-}" \
             "${PASSFILE_FIRST_HOST_SECRET:-}" "${PASSFILE_LOWER_PRECEDENCE_SECRET:-}" \
             "${RUNTIME_PASSFILE:-}" "${FIRST_TOKEN:-}" "${RESTART_TOKEN:-}" \
-            "${MALFORMED_TOKEN:-}" "${RECOVERY_TOKEN:-}" "$RUN_ROOT" <<'PY'
+            "${MALFORMED_TOKEN:-}" "${RECOVERY_TOKEN:-}" "$RUN_ROOT" >"$redaction_secrets"
+        chmod 600 "$redaction_secrets"
+        python3 - "$RUN_ROOT" "$retained" "$redaction_secrets" <<'PY'
 import pathlib, sys
-source, retained, *secrets = sys.argv[1:]
+source, retained, secret_file = sys.argv[1:]
 source, retained = pathlib.Path(source), pathlib.Path(retained)
-secrets = sorted((item.encode() for item in secrets if item), key=len, reverse=True)
+secrets = sorted((item.encode() for item in pathlib.Path(secret_file).read_text().splitlines() if item), key=len, reverse=True)
 files = list(source.glob("*.log"))
 evidence = source / "evidence.txt"
 if evidence.exists():
     files.append(evidence)
+unsafe = False
 for path in files:
     data = path.read_bytes()
+    if b"PRIVATE KEY-----" in data:
+        unsafe = True
+        continue
     for secret in secrets:
         data = data.replace(secret, b"<redacted>")
-    (retained / path.name).write_bytes(data)
+    destination = retained / path.name
+    destination.write_bytes(data[:4 * 1024 * 1024])
+    destination.chmod(0o600)
 for path in retained.iterdir():
     data = path.read_bytes()
     if any(secret in data for secret in secrets) or b"PRIVATE KEY-----" in data:
-        raise SystemExit(f"retained artifact still contains sensitive material: {path.name}")
+        unsafe = True
+if unsafe:
+    for path in retained.iterdir():
+        path.unlink()
+    raise SystemExit("secret material detected; retained no failure artifacts")
 PY
         local scan_status=$?
         rm -rf "$RUN_ROOT"
@@ -200,12 +196,18 @@ fail() {
     exit 1
 }
 
+dotnet build "$HASH_HELPER_PROJECT" --configuration Release --no-restore --nologo >/dev/null
+[ -f "$HASH_HELPER" ] || fail "the prebuilt machine-readable hash helper is missing"
+
 hash_host_publish() {
-    dotnet run \
-        --project "$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/Jellyfin.Plugin.Database.Npgsql.TestHarness.csproj" \
-        --configuration Release \
-        --no-restore \
-        -- hash-publish "$1"
+    local digest diagnostics
+    diagnostics=$(mktemp "$RUN_ROOT/hash-errors.XXXXXX")
+    digest=$(dotnet "$HASH_HELPER" hash-publish "$1" 2>"$diagnostics") \
+        || { sed -n '1,20p' "$diagnostics" >&2; rm -f "$diagnostics"; return 1; }
+    rm -f "$diagnostics"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] \
+        || { echo "FAIL: hash helper produced non-machine-readable output" >&2; return 1; }
+    printf '%s\n' "$digest"
 }
 
 assert_pristine_host_unchanged() {
@@ -259,14 +261,12 @@ fi
 wait_for_health() {
     local port=$1
     for _ in $(seq 1 120); do
-        if ss -H -ltnp "sport = :$port" 2>/dev/null | grep -q . \
-            && ! ss -H -ltnp "sport = :$port" 2>/dev/null | grep -F "pid=$HOST_PID," >/dev/null; then
-            return 2
-        fi
-
-        if curl --silent --fail "http://127.0.0.1:$port/health" 2>/dev/null | grep -qx 'Healthy'; then
+        if ss -H -ltnp "sport = :$port" 2>/dev/null | grep -q .; then
             assert_host_owns_listener "$port"
-            return 0
+            if curl --silent --fail "http://127.0.0.1:$port/health" 2>/dev/null | grep -qx 'Healthy'; then
+                assert_host_owns_listener "$port"
+                return 0
+            fi
         fi
 
         if ! kill -0 "$HOST_PID" 2>/dev/null; then
@@ -281,27 +281,141 @@ wait_for_health() {
 
 assert_host_owns_listener() {
     local port=$1
+    assert_host_identity
+    local listener_pid listener_pgid
+    listener_pid=$(ss -H -ltnp "sport = :$port" 2>/dev/null \
+        | sed -n 's/.*127\.0\.0\.1:'"$port"'.*pid=\([0-9][0-9]*\),.*/\1/p' | head -n 1)
+    [ -n "$listener_pid" ] || fail "the expected loopback listener is absent"
+    listener_pgid=$(awk '{print $5}' "/proc/$listener_pid/stat" 2>/dev/null || true)
+    [ "$listener_pgid" = "$HOST_PGID" ] \
+        || fail "refusing to control a listener outside the launched Jellyfin process group"
+}
+
+assert_host_identity() {
     [ -n "$HOST_PID" ] && kill -0 "$HOST_PID" 2>/dev/null \
         || fail "the launched Jellyfin process is not running"
-    ss -H -ltnp "sport = :$port" 2>/dev/null \
-        | grep -F "127.0.0.1:$port" \
-        | grep -F "pid=$HOST_PID," >/dev/null \
-        || fail "refusing to control a listener which is not owned by launched Jellyfin PID $HOST_PID"
+    local current_start current_pgid
+    read -r current_pgid current_start < <(awk '{print $5, $22}' "/proc/$HOST_PID/stat" 2>/dev/null) \
+        || fail "could not read the launched Jellyfin process identity"
+    [ "$current_start" = "$HOST_START" ] && [ "$current_pgid" = "$HOST_PGID" ] && [ "$HOST_PGID" = "$HOST_PID" ] \
+        || fail "the launched Jellyfin PID start time or dedicated process group changed"
+}
+
+capture_host_identity() {
+    HOST_START=$(awk '{print $22}' "/proc/$HOST_PID/stat") \
+        || fail "could not capture the launched Jellyfin PID start time"
+    HOST_PGID=$HOST_PID
+    local current_start current_pgid
+    for _ in $(seq 1 100); do
+        kill -0 "$HOST_PID" 2>/dev/null || fail "Jellyfin exited before entering its dedicated process group"
+        read -r current_pgid current_start < <(awk '{print $5, $22}' "/proc/$HOST_PID/stat") \
+            || fail "could not read the launched Jellyfin process identity"
+        [ "$current_start" = "$HOST_START" ] \
+            || fail "the launched Jellyfin PID was reused during startup"
+        if [ "$current_pgid" = "$HOST_PID" ]; then
+            return 0
+        fi
+        sleep 0.01
+    done
+    fail "Jellyfin did not enter a dedicated process group within one second"
+}
+
+launch_host_process() {
+    local environment_file=$1
+    local log_file=$2
+    shift 2
+    setsid --wait python3 -c 'import os, pathlib, signal, subprocess, sys
+environment_path, log_path, *command = sys.argv[1:]
+for name in ("PGUSER", "PGPASSWORD", "PGPASSFILE", "PGSSLCERT", "PGSSLKEY", "PGSSLROOTCERT", "PGCLIENTENCODING", "PGTZ", "PGOPTIONS", "PGTARGETSESSIONATTRS", "PGSSLNEGOTIATION", "PGGSSENCMODE", "PGREQUIREAUTH", "PGAPPNAME"):
+    os.environ.pop(name, None)
+for item in open(environment_path, "rb").read().split(b"\0"):
+    if item:
+        name, value = item.decode().split("=", 1)
+        os.environ[name] = value
+os.unlink(environment_path)
+limit = 16 * 1024 * 1024
+written = 0
+signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
+with pathlib.Path(log_path).open("xb") as output:
+    os.chmod(log_path, 0o600)
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=os.environ)
+    while True:
+        chunk = child.stdout.read1(65536)
+        if not chunk:
+            break
+        if written < limit:
+            kept = chunk[:limit - written]
+            output.write(kept)
+            output.flush()
+            written += len(kept)
+    status = child.wait()
+raise SystemExit(status if status >= 0 else 128 - status)' "$environment_file" "$log_file" "$@" >/dev/null 2>&1 &
+    HOST_PID=$!
+    capture_host_identity
+}
+
+terminate_host_group() {
+    [ -n "$HOST_PID" ] || return 0
+    if ! kill -0 "$HOST_PID" 2>/dev/null; then
+        wait "$HOST_PID" 2>/dev/null || true
+        if kill -0 -- "-$HOST_PGID" 2>/dev/null; then
+            if [ -r "/proc/$HOST_PGID/stat" ] && [ "$(awk '{print $22}' "/proc/$HOST_PGID/stat")" != "$HOST_START" ]; then
+                echo "FAIL: refusing to signal a reused Jellyfin process-group ID" >&2
+                return 1
+            fi
+            kill -KILL -- "-$HOST_PGID" || return 1
+        fi
+        HOST_PID="" HOST_START="" HOST_PGID=""
+        return 0
+    fi
+
+    assert_host_identity
+    kill -TERM -- "-$HOST_PGID" || return 1
+    for _ in $(seq 1 100); do
+        kill -0 -- "-$HOST_PGID" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 -- "-$HOST_PGID" 2>/dev/null; then
+        local stat member_pid member_pgid member_start current_start
+        for stat in /proc/[0-9]*/stat; do
+            [ -r "$stat" ] || continue
+            read -r member_pid member_pgid member_start < <(awk '{print $1, $5, $22}' "$stat") || continue
+            [ "$member_pgid" = "$HOST_PGID" ] && [ "$member_pid" != "$HOST_PID" ] || continue
+            current_start=$(awk '{print $22}' "$stat" 2>/dev/null || true)
+            [ "$current_start" = "$member_start" ] || continue
+            kill -KILL "$member_pid" 2>/dev/null || true
+        done
+        for _ in $(seq 1 50); do
+            kill -0 "$HOST_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$HOST_PID" 2>/dev/null; then
+            assert_host_identity
+            kill -KILL "$HOST_PID" || return 1
+        fi
+    fi
+    wait "$HOST_PID" 2>/dev/null || true
+    if kill -0 -- "-$HOST_PGID" 2>/dev/null; then
+        echo "FAIL: could not confirm termination of the Jellyfin process group" >&2
+        return 1
+    fi
+    HOST_PID="" HOST_START="" HOST_PGID=""
 }
 
 start_host() {
     local log_file=$1
     shift
-    "${HOST_ENVIRONMENT[@]}" "$@" dotnet "$RUN_ROOT/host-publish/jellyfin.dll" \
+    local environment_file="$RUN_ROOT/host-environment-$(basename "$log_file").bin"
+    printf '%s\0' "$@" >"$environment_file"
+    chmod 600 "$environment_file"
+    launch_host_process "$environment_file" "$log_file" dotnet "$RUN_ROOT/host-publish/jellyfin.dll" \
         --datadir "$RUN_ROOT/runtime/data" \
         --configdir "$RUN_ROOT/runtime/config" \
         --cachedir "$RUN_ROOT/runtime/cache" \
         --logdir "$RUN_ROOT/runtime/log" \
         --nowebclient \
         --nonetchange \
-        --ffmpeg "$PLUGIN_ROOT/tests/fixtures/fake-ffmpeg.sh" \
-        >"$log_file" 2>&1 &
-    HOST_PID=$!
+        --ffmpeg "$PLUGIN_ROOT/tests/fixtures/fake-ffmpeg.sh"
 }
 
 restore_database_configuration() {
@@ -310,16 +424,16 @@ restore_database_configuration() {
 
 set_database_connection_string() {
     local connection_string=$1
-    python3 -c 'import sys, xml.etree.ElementTree as ET
-path, connection_string = sys.argv[1:]
+    printf '%s' "$connection_string" | python3 -c 'import sys, xml.etree.ElementTree as ET
+path = sys.argv[1]
+connection_string = sys.stdin.read()
 tree = ET.parse(path)
 node = tree.find("./CustomProviderOptions/ConnectionString")
 if node is None:
     raise SystemExit("database.xml has no ConnectionString element")
 node.text = connection_string
 tree.write(path, encoding="utf-8", xml_declaration=True)' \
-        "$RUN_ROOT/runtime/config/database.xml" \
-        "$connection_string"
+        "$RUN_ROOT/runtime/config/database.xml"
 }
 
 assert_log_redacted() {
@@ -328,7 +442,9 @@ assert_log_redacted() {
     local sensitive
     for sensitive in "$@"; do
         [ -n "$sensitive" ] || continue
-        if grep -F -- "$sensitive" "$log_file" >/dev/null; then
+        if printf '%s' "$sensitive" | python3 -c 'import pathlib, sys
+secret = sys.stdin.buffer.read()
+raise SystemExit(0 if secret and secret in pathlib.Path(sys.argv[1]).read_bytes() else 1)' "$log_file"; then
             fail "startup log exposed sensitive configuration from $log_file"
         fi
     done
@@ -373,20 +489,7 @@ assert_secret_file_rejected() {
 }
 
 terminate_validation_host() {
-    if [ -n "$HOST_PID" ] && kill -0 "$HOST_PID" 2>/dev/null; then
-        kill -TERM "$HOST_PID" 2>/dev/null || true
-        for _ in $(seq 1 10); do
-            if ! kill -0 "$HOST_PID" 2>/dev/null; then
-                break
-            fi
-
-            sleep 1
-        done
-        kill -KILL "$HOST_PID" 2>/dev/null || true
-        wait "$HOST_PID" 2>/dev/null || true
-    fi
-
-    HOST_PID=""
+    terminate_host_group || fail "validation host process group could not be terminated"
 }
 
 assert_secret_configuration_accepted() {
@@ -396,7 +499,7 @@ assert_secret_configuration_accepted() {
 
     start_host "$log_file"
     for _ in $(seq 1 100); do
-        if grep -F "PostgreSQL configured at" "$log_file" >/dev/null; then
+        if grep -F "PostgreSQL configured at" "$log_file" >/dev/null 2>&1; then
             break
         fi
 
@@ -417,16 +520,17 @@ assert_secret_configuration_accepted() {
 
 start_unsupported_host() {
     local log_file=$1
-    "${HOST_ENVIRONMENT[@]}" dotnet "$RUN_ROOT/unsupported-host-publish/jellyfin.dll" \
+    local environment_file="$RUN_ROOT/host-environment-unsupported.bin"
+    : >"$environment_file"
+    chmod 600 "$environment_file"
+    launch_host_process "$environment_file" "$log_file" dotnet "$RUN_ROOT/unsupported-host-publish/jellyfin.dll" \
         --datadir "$RUN_ROOT/runtime/data" \
         --configdir "$RUN_ROOT/runtime/config" \
         --cachedir "$RUN_ROOT/runtime/cache" \
         --logdir "$RUN_ROOT/runtime/log" \
         --nowebclient \
         --nonetchange \
-        --ffmpeg "$PLUGIN_ROOT/tests/fixtures/fake-ffmpeg.sh" \
-        >"$log_file" 2>&1 &
-    HOST_PID=$!
+        --ffmpeg "$PLUGIN_ROOT/tests/fixtures/fake-ffmpeg.sh"
 }
 
 assert_loopback_listener() {
@@ -451,7 +555,11 @@ wait_for_host_exit() {
     for _ in $(seq 1 60); do
         if ! kill -0 "$HOST_PID" 2>/dev/null; then
             wait "$HOST_PID" 2>/dev/null || true
-            HOST_PID=""
+            if kill -0 -- "-$HOST_PGID" 2>/dev/null; then
+                echo "FAIL: Jellyfin exited while descendants remained in its process group" >&2
+                return 1
+            fi
+            HOST_PID="" HOST_START="" HOST_PGID=""
             return 0
         fi
 
@@ -484,29 +592,41 @@ assert_missing_dependency() {
 authenticate() {
     local port=$1
     local device_id=$2
+    local request_file="$RUN_ROOT/auth-$device_id.json"
+    printf '{"Username":"feasibility-admin","Pw":"%s"}' "$ADMIN_PASSWORD" >"$request_file"
+    chmod 600 "$request_file"
     assert_host_owns_listener "$port"
     curl --silent --show-error --fail \
         --request POST \
         --header 'Content-Type: application/json' \
         --header "Authorization: MediaBrowser Client=\"npgsql-feasibility\", Device=\"smoke\", DeviceId=\"$device_id\", Version=\"0.0.1\"" \
-        --data "{\"Username\":\"feasibility-admin\",\"Pw\":\"$ADMIN_PASSWORD\"}" \
+        --data-binary "@$request_file" \
         "http://127.0.0.1:$port/Users/AuthenticateByName" \
         | sed -n 's/.*"AccessToken":"\([^"]*\)".*/\1/p'
+    local curl_status=${PIPESTATUS[0]}
+    rm -f "$request_file"
+    [ "$curl_status" -eq 0 ] || return "$curl_status"
+    assert_host_owns_listener "$port"
 }
 
 stop_host() {
     local port=$1
     local token=$2
+    local config_file="$RUN_ROOT/shutdown-curl-$SMOKE_ID.conf"
+    printf 'request = "POST"\nheader = "Authorization: MediaBrowser Token=\\"%s\\""\nurl = "http://127.0.0.1:%s/System/Shutdown"\n' "$token" "$port" >"$config_file"
+    chmod 600 "$config_file"
     assert_host_owns_listener "$port"
-    curl --silent --show-error --fail \
-        --request POST \
-        --header "Authorization: MediaBrowser Token=\"$token\"" \
-        "http://127.0.0.1:$port/System/Shutdown" >/dev/null
+    curl --silent --show-error --fail --config "$config_file" >/dev/null
+    rm -f "$config_file"
 
     for _ in $(seq 1 30); do
         if ! kill -0 "$HOST_PID" 2>/dev/null; then
             wait "$HOST_PID" 2>/dev/null || true
-            HOST_PID=""
+            if kill -0 -- "-$HOST_PGID" 2>/dev/null; then
+                echo "FAIL: graceful shutdown left descendants in the Jellyfin process group" >&2
+                return 1
+            fi
+            HOST_PID="" HOST_START="" HOST_PGID=""
             return 0
         fi
 
@@ -518,15 +638,15 @@ stop_host() {
 
 psql_value() {
     docker exec \
-        --env PGPASSWORD="$APPLICATION_PASSWORD" \
-        "$POSTGRES_CONTAINER" \
+        --env PGPASSFILE=/run/jellyfin-test-secrets/application.pgpass \
+        "$POSTGRES_CONTAINER_ID" \
         psql --username jellyfin --dbname jellyfin --tuples-only --no-align --command "$1"
 }
 
 psql_exec() {
     docker exec \
-        --env PGPASSWORD="$APPLICATION_PASSWORD" \
-        "$POSTGRES_CONTAINER" \
+        --env PGPASSFILE=/run/jellyfin-test-secrets/application.pgpass \
+        "$POSTGRES_CONTAINER_ID" \
         psql --username jellyfin --dbname jellyfin --set ON_ERROR_STOP=1 --command "$1" >/dev/null
 }
 
@@ -538,7 +658,7 @@ identity_sequence_state() {
     psql_value "SELECT last_value::text || '|' || is_called::text FROM $sequence_name"
 }
 
-mkdir -p \
+mkdir -p -m 700 \
     "$RUN_ROOT/host-publish" \
     "$RUN_ROOT/unsupported-host-publish" \
     "$RUN_ROOT/failure-plugin" \
@@ -547,6 +667,7 @@ mkdir -p \
     "$RUN_ROOT/runtime/cache" \
     "$RUN_ROOT/runtime/log" \
     "$RUN_ROOT/runtime/media"
+find "$RUN_ROOT" -type d -exec chmod 700 '{}' +
 
 if [ "$HOST_INPUT_MODE" = "legacy-repository" ]; then
     mkdir -p "$RUN_ROOT/host-source" "$RUN_ROOT/unsupported-host-source"
@@ -605,9 +726,21 @@ if [ "${package_dlls[*]}" != "${expected_dlls[*]}" ]; then
     fail "package DLL set contains a host assembly: ${package_dlls[*]}"
 fi
 
-python3 - "$RUN_ROOT/runtime/config/database.xml" "$POSTGRES_PORT" "$APPLICATION_PASSWORD" <<'PY'
+CONTAINER_SECRET_ROOT="$RUN_ROOT/container-secrets"
+mkdir -p -m 700 "$CONTAINER_SECRET_ROOT"
+BOOTSTRAP_PASSWORD_FILE="$CONTAINER_SECRET_ROOT/bootstrap-password"
+APPLICATION_PASSWORD_FILE="$CONTAINER_SECRET_ROOT/application-password"
+ADMIN_PASSFILE="$CONTAINER_SECRET_ROOT/admin.pgpass"
+APPLICATION_PASSFILE="$CONTAINER_SECRET_ROOT/application.pgpass"
+printf '%s\n' "$BOOTSTRAP_PASSWORD" >"$BOOTSTRAP_PASSWORD_FILE"
+printf '%s' "$APPLICATION_PASSWORD" >"$APPLICATION_PASSWORD_FILE"
+printf '*:*:*:postgres:%s\n' "$BOOTSTRAP_PASSWORD" >"$ADMIN_PASSFILE"
+printf '*:*:*:jellyfin:%s\n' "$APPLICATION_PASSWORD" >"$APPLICATION_PASSFILE"
+chmod 600 "$BOOTSTRAP_PASSWORD_FILE" "$APPLICATION_PASSWORD_FILE" "$ADMIN_PASSFILE" "$APPLICATION_PASSFILE"
+python3 - "$RUN_ROOT/runtime/config/database.xml" "$POSTGRES_PORT" "$APPLICATION_PASSWORD_FILE" <<'PY'
 import sys, xml.etree.ElementTree as ET
-path, port, password = sys.argv[1:]
+path, port, password_file = sys.argv[1:]
+password = open(password_file, encoding="utf-8").read()
 root = ET.Element("DatabaseConfigurationOptions")
 ET.SubElement(root, "DatabaseType").text = "PLUGIN_PROVIDER"
 custom = ET.SubElement(root, "CustomProviderOptions")
@@ -633,6 +766,26 @@ addresses = ET.SubElement(root, "LocalNetworkAddresses")
 ET.SubElement(addresses, "string").text = "127.0.0.1"
 ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
 PY
+
+for private_directory in \
+    "$RUN_ROOT" \
+    "$RUN_ROOT/runtime" \
+    "$RUN_ROOT/runtime/config" \
+    "$CONTAINER_SECRET_ROOT"; do
+    [ "$(stat -c '%a' "$private_directory")" = "700" ] \
+        || fail "secret-bearing directory was not mode 0700 before host launch: $private_directory"
+done
+for private_file in \
+    "$RUN_ROOT/runtime/config/database.xml" \
+    "$RUN_ROOT/runtime/config/network.xml" \
+    "$RUN_ROOT/database.xml.baseline" \
+    "$BOOTSTRAP_PASSWORD_FILE" \
+    "$APPLICATION_PASSWORD_FILE" \
+    "$ADMIN_PASSFILE" \
+    "$APPLICATION_PASSFILE"; do
+    [ "$(stat -c '%a' "$private_file")" = "600" ] \
+        || fail "secret-bearing file was not mode 0600 before host launch: $private_file"
+done
 
 # These failures occur before PostgreSQL is started. They prove that either
 # independently missing ZIP dependency and Jellyfin's prefix-selected ambiguous
@@ -797,7 +950,8 @@ for insecure_mode in 0640 0644 0666; do
     chmod 600 "$CLIENT_PKCS12"
 done
 
-while IFS='|' read -r stale_name stale_lease stale_pid stale_start; do
+while IFS='|' read -r stale_short_id stale_name stale_lease stale_pid stale_start; do
+    [[ "$stale_short_id" =~ ^[0-9a-f]{12,64}$ ]] || continue
     [[ "$stale_name" =~ ^jellyfin-npgsql-smoke-[0-9]{14}-[0-9]+-[0-9a-f]{32}$ ]] || continue
     [[ "$stale_lease" =~ ^[0-9]{14}-[0-9]+-[0-9a-f]{32}$ ]] || continue
     exec {stale_lease_fd}>"$CONTAINER_LEASE_ROOT/$stale_lease.lock"
@@ -806,15 +960,20 @@ while IFS='|' read -r stale_name stale_lease stale_pid stale_start; do
         continue
     fi
 
-    docker rm --force "$stale_name" >/dev/null
+    stale_id=$(docker inspect --format '{{.Id}}' "$stale_short_id")
+    [[ "$stale_id" =~ ^[0-9a-f]{64}$ ]] || fail "Docker returned a malformed stale container ID"
+    stale_identity=$(docker inspect --format '{{.Id}}|{{.Name}}|{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-managed"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-scope"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-lease"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-pid"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-start"}}' "$stale_id")
+    [ "$stale_identity" = "$stale_id|/$stale_name|true|$SMOKE_SCOPE|$stale_lease|$stale_pid|$stale_start" ] \
+        || fail "stale container identity changed before cleanup"
+    docker rm --force "$stale_id" >/dev/null \
+        || fail "could not confirm removal of the exact stale container ID"
     eval "exec ${stale_lease_fd}>&-"
-    rm -f "$CONTAINER_LEASE_ROOT/$stale_lease.lock"
 done < <(docker ps --all \
     --filter 'label=org.jellyfin.database-npgsql.smoke-managed=true' \
     --filter "label=org.jellyfin.database-npgsql.smoke-scope=$SMOKE_SCOPE" \
-    --format '{{.Names}}|{{.Label "org.jellyfin.database-npgsql.owner-lease"}}|{{.Label "org.jellyfin.database-npgsql.owner-pid"}}|{{.Label "org.jellyfin.database-npgsql.owner-start"}}')
+    --format '{{.ID}}|{{.Names}}|{{.Label "org.jellyfin.database-npgsql.owner-lease"}}|{{.Label "org.jellyfin.database-npgsql.owner-pid"}}|{{.Label "org.jellyfin.database-npgsql.owner-start"}}')
 
-docker run \
+POSTGRES_CONTAINER_ID=$(docker run \
     --detach \
     --name "$POSTGRES_CONTAINER" \
     --label org.jellyfin.database-npgsql.smoke-managed=true \
@@ -823,32 +982,29 @@ docker run \
     --label "org.jellyfin.database-npgsql.owner-pid=$$" \
     --label "org.jellyfin.database-npgsql.owner-start=$OWNER_START" \
     --env POSTGRES_USER=postgres \
-    --env POSTGRES_PASSWORD="$BOOTSTRAP_PASSWORD" \
+    --mount "type=bind,source=$CONTAINER_SECRET_ROOT,target=/run/jellyfin-test-secrets,readonly" \
+    --env POSTGRES_PASSWORD_FILE=/run/jellyfin-test-secrets/bootstrap-password \
     --env POSTGRES_DB=postgres \
     --publish "127.0.0.1:$POSTGRES_PORT:5432" \
     "$POSTGRES_IMAGE" \
-    postgres -c max_connections=20 >/dev/null
+    postgres -c max_connections=20)
+[[ "$POSTGRES_CONTAINER_ID" =~ ^[0-9a-f]{64}$ ]] || fail "Docker did not return one immutable lowercase container ID"
 
 for _ in $(seq 1 60); do
-    if docker exec "$POSTGRES_CONTAINER" pg_isready --username postgres --dbname postgres >/dev/null 2>&1; then
+    if docker exec "$POSTGRES_CONTAINER_ID" pg_isready --username postgres --dbname postgres >/dev/null 2>&1; then
         break
     fi
 
     sleep 1
 done
-docker exec "$POSTGRES_CONTAINER" pg_isready --username postgres --dbname postgres >/dev/null
-POSTGRES_SERVER_VERSION=$(docker exec "$POSTGRES_CONTAINER" psql --username postgres --dbname postgres --tuples-only --no-align --command 'SHOW server_version')
-POSTGRES_SERVER_VERSION_NUM=$(docker exec "$POSTGRES_CONTAINER" psql --username postgres --dbname postgres --tuples-only --no-align --command "SELECT current_setting('server_version_num')::integer")
-[[ "$POSTGRES_SERVER_VERSION" = 16.6* ]] \
-    || fail "the pinned PostgreSQL image reported '$POSTGRES_SERVER_VERSION', expected 16.6"
-[ "$((POSTGRES_SERVER_VERSION_NUM / 10000))" -eq 16 ] \
-    || fail "the pinned PostgreSQL image is not PostgreSQL major 16"
-docker exec \
-    --env PGPASSWORD="$BOOTSTRAP_PASSWORD" \
-    "$POSTGRES_CONTAINER" \
-    psql --username postgres --dbname postgres --set ON_ERROR_STOP=1 \
-    --command "CREATE ROLE jellyfin LOGIN PASSWORD '$APPLICATION_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 6" \
-    --command 'CREATE DATABASE jellyfin OWNER jellyfin CONNECTION LIMIT 8' >/dev/null
+docker exec "$POSTGRES_CONTAINER_ID" pg_isready --username postgres --dbname postgres >/dev/null
+POSTGRES_SERVER_VERSION=$(docker exec --env PGPASSFILE=/run/jellyfin-test-secrets/admin.pgpass "$POSTGRES_CONTAINER_ID" psql --username postgres --dbname postgres --tuples-only --no-align --command 'SHOW server_version')
+POSTGRES_SERVER_VERSION_NUM=$(docker exec --env PGPASSFILE=/run/jellyfin-test-secrets/admin.pgpass "$POSTGRES_CONTAINER_ID" psql --username postgres --dbname postgres --tuples-only --no-align --command "SELECT current_setting('server_version_num')::integer")
+[ "$POSTGRES_SERVER_VERSION_NUM" = "160006" ] \
+    || fail "the pinned PostgreSQL image did not report exact server_version_num 160006"
+printf "CREATE ROLE jellyfin LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 6;\nCREATE DATABASE jellyfin OWNER jellyfin CONNECTION LIMIT 8;\n" "$APPLICATION_PASSWORD" \
+    | docker exec --interactive --env PGPASSFILE=/run/jellyfin-test-secrets/admin.pgpass "$POSTGRES_CONTAINER_ID" \
+        psql --username postgres --dbname postgres --set ON_ERROR_STOP=1 >/dev/null
 
 [ "$(psql_value "SELECT rolcanlogin::text || '|' || rolsuper::text || '|' || rolcreatedb::text || '|' || rolcreaterole::text || '|' || rolreplication::text || '|' || rolbypassrls::text || '|' || rolconnlimit::text FROM pg_catalog.pg_roles WHERE rolname = current_user")" = "true|false|false|false|false|false|6" ] \
     || fail "Jellyfin runtime role has unexpected cluster privileges"
@@ -856,11 +1012,11 @@ docker exec \
     || fail "Jellyfin runtime role does not own its database"
 [ "$(psql_value "SELECT datconnlimit FROM pg_catalog.pg_database WHERE datname = current_database()")" = "8" ] \
     || fail "Jellyfin database does not have the required connection limit"
-if docker exec --env PGPASSWORD="$APPLICATION_PASSWORD" "$POSTGRES_CONTAINER" \
+if docker exec --env PGPASSFILE=/run/jellyfin-test-secrets/application.pgpass "$POSTGRES_CONTAINER_ID" \
     psql --username jellyfin --dbname jellyfin --command 'CREATE DATABASE jellyfin_privilege_probe' >/dev/null 2>&1; then
     fail "Jellyfin runtime role unexpectedly created a database"
 fi
-if docker exec --env PGPASSWORD="$APPLICATION_PASSWORD" "$POSTGRES_CONTAINER" \
+if docker exec --env PGPASSFILE=/run/jellyfin-test-secrets/application.pgpass "$POSTGRES_CONTAINER_ID" \
     psql --username jellyfin --dbname jellyfin --command 'CREATE ROLE jellyfin_privilege_probe' >/dev/null 2>&1; then
     fail "Jellyfin runtime role unexpectedly created a role"
 fi
@@ -897,7 +1053,7 @@ start_host \
     "PGSSLMODE=disable"
 if [ "${PROVIDER_CORE_ONLY:-false}" = "true" ]; then
     for _ in $(seq 1 60); do
-        if grep -F 'does not yet implement the rollback-capable PostgreSQL migration backup protocol required by vanilla Jellyfin' "$RUN_ROOT/first-start.log" >/dev/null; then
+        if grep -F 'does not yet implement the rollback-capable PostgreSQL migration backup protocol required by vanilla Jellyfin' "$RUN_ROOT/first-start.log" >/dev/null 2>&1; then
             break
         fi
 
@@ -913,16 +1069,10 @@ if [ "${PROVIDER_CORE_ONLY:-false}" = "true" ]; then
         || fail "migration-backup guard did not state its pre-mutation boundary"
     grep -F "PostgreSQL configured at 127.0.0.2,127.0.0.1:$POSTGRES_PORT for database jellyfin;" "$RUN_ROOT/first-start.log" >/dev/null \
         || fail "provider did not emit its endpoint-only configuration diagnostic"
-    if grep -F \
-        -e "$APPLICATION_PASSWORD" \
-        -e "$BOOTSTRAP_PASSWORD" \
-        -e "$ADMIN_PASSWORD" \
-        -e "$PASSFILE_UNRELATED_SECRET" \
-        -e "$PASSFILE_FIRST_HOST_SECRET" \
-        -e "$PASSFILE_LOWER_PRECEDENCE_SECRET" \
-        "$RUN_ROOT/first-start.log" >/dev/null; then
-        fail "vanilla host log exposed a smoke-test credential"
-    fi
+    assert_log_redacted \
+        "$RUN_ROOT/first-start.log" \
+        "$APPLICATION_PASSWORD" "$BOOTSTRAP_PASSWORD" "$ADMIN_PASSWORD" \
+        "$PASSFILE_UNRELATED_SECRET" "$PASSFILE_FIRST_HOST_SECRET" "$PASSFILE_LOWER_PRECEDENCE_SECRET"
     if grep -F "$RUNTIME_PASSFILE" "$RUN_ROOT/first-start.log" >/dev/null; then
         fail "vanilla host log exposed the configured passfile path"
     fi
@@ -933,17 +1083,7 @@ if [ "${PROVIDER_CORE_ONLY:-false}" = "true" ]; then
 
     # Jellyfin keeps its setup listener alive after reporting this startup
     # failure, so terminate the deliberately failed process after assertions.
-    kill -TERM "$HOST_PID" 2>/dev/null || true
-    for _ in $(seq 1 10); do
-        if ! kill -0 "$HOST_PID" 2>/dev/null; then
-            break
-        fi
-
-        sleep 1
-    done
-    kill -KILL "$HOST_PID" 2>/dev/null || true
-    wait "$HOST_PID" 2>/dev/null || true
-    HOST_PID=""
+    terminate_host_group || fail "guarded-start host process group could not be terminated"
     assert_pristine_host_unchanged
 
     {
@@ -983,13 +1123,21 @@ grep -q 'Skipping disabled plugin.*Npgsql Database' "$RUN_ROOT/first-start.log" 
 grep -q 'Deleted PostgreSQL migration snapshot' "$RUN_ROOT/first-start.log" \
     || fail "successful migration did not exercise DeleteBackup"
 
+assert_host_owns_listener "$HTTP_PORT"
 curl --silent --show-error --fail "http://127.0.0.1:$HTTP_PORT/Startup/User" >/dev/null
+assert_host_owns_listener "$HTTP_PORT"
+SETUP_USER_FILE="$RUN_ROOT/setup-user.json"
+printf '{"Name":"feasibility-admin","Password":"%s"}' "$ADMIN_PASSWORD" >"$SETUP_USER_FILE"
+chmod 600 "$SETUP_USER_FILE"
 curl --silent --show-error --fail \
     --request POST \
     --header 'Content-Type: application/json' \
-    --data "{\"Name\":\"feasibility-admin\",\"Password\":\"$ADMIN_PASSWORD\"}" \
+    --data-binary "@$SETUP_USER_FILE" \
     "http://127.0.0.1:$HTTP_PORT/Startup/User" >/dev/null
+rm -f "$SETUP_USER_FILE"
+assert_host_owns_listener "$HTTP_PORT"
 curl --silent --show-error --fail --request POST "http://127.0.0.1:$HTTP_PORT/Startup/Complete" >/dev/null
+assert_host_owns_listener "$HTTP_PORT"
 
 FIRST_TOKEN=$(authenticate "$HTTP_PORT" "npgsql-first")
 [ -n "$FIRST_TOKEN" ] || fail "could not authenticate the user created through Jellyfin"
@@ -1061,17 +1209,7 @@ grep -q 'ForcedNonTransactionalFailure' "$RUN_ROOT/forced-failure.log" \
     || fail "forced non-transactional migration was not attempted"
 grep -q 'Restored PostgreSQL migration snapshot' "$RUN_ROOT/forced-failure.log" \
     || fail "RestoreBackupFast was not completed"
-kill -TERM "$HOST_PID" 2>/dev/null || true
-for _ in $(seq 1 10); do
-    if ! kill -0 "$HOST_PID" 2>/dev/null; then
-        break
-    fi
-
-    sleep 1
-done
-kill -KILL "$HOST_PID" 2>/dev/null || true
-wait "$HOST_PID" 2>/dev/null || true
-HOST_PID=""
+terminate_host_group || fail "forced-failure host process group could not be terminated"
 
 [ "$(psql_value "SELECT to_regclass('\"FeasibilityFailureMarker\"') IS NULL")" = "t" ] \
     || fail "partial migration table survived restore"
