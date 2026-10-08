@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<NetworkConfiguration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <InternalHttpPort>18096</InternalHttpPort>
+  <InternalHttpsPort>18920</InternalHttpsPort>
+  <PublicHttpPort>18096</PublicHttpPort>
+  <PublicHttpsPort>18920</PublicHttpsPort>
+  <AutoDiscovery>false</AutoDiscovery>
+  <EnableIPv4>true</EnableIPv4>
+  <EnableIPv6>false</EnableIPv6>
+</NetworkConfiguration>

@@ -1,0 +1,6 @@
+/.artifacts/
+/.packages/
+/.nuget-http/
+/.dotnet/
+**/bin/
+**/obj/
