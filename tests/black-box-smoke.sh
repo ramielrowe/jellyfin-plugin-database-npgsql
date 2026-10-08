@@ -51,6 +51,11 @@ fail() {
     exit 1
 }
 
+JELLYFIN_HOST_COMMIT=$(
+    git -C "$HOST_REPOSITORY" rev-parse --verify --end-of-options "$JELLYFIN_HOST_COMMIT^{commit}"
+) || fail "could not resolve Jellyfin host revision to a commit"
+readonly JELLYFIN_HOST_COMMIT
+
 wait_for_health() {
     local port=$1
     for _ in $(seq 1 120); do
@@ -164,7 +169,6 @@ mkdir -p \
     "$RUN_ROOT/runtime/cache" \
     "$RUN_ROOT/runtime/log"
 
-git -C "$HOST_REPOSITORY" cat-file -e "$JELLYFIN_HOST_COMMIT^{commit}"
 git -C "$HOST_REPOSITORY" archive "$JELLYFIN_HOST_COMMIT" | tar -x -C "$RUN_ROOT/host-source"
 dotnet publish \
     "$RUN_ROOT/host-source/Jellyfin.Server/Jellyfin.Server.csproj" \
