@@ -1,304 +1,173 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Extensions.Logging;
+using Jellyfin.Database.Implementations;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Npgsql;
 
 namespace Jellyfin.Plugin.Database.Npgsql;
 
 /// <summary>
-/// Contains database operations that may load Npgsql only after package validation succeeds.
+/// Contains Npgsql operations that are reachable only after package validation succeeds.
 /// </summary>
-internal static partial class NpgsqlDatabaseOperations
+internal static class NpgsqlDatabaseOperations
 {
-    private const string BackupSchemaPrefix = "jellyfin_migration_backup_";
-    private const string ForeignKeyMetadataTable = "__JellyfinMigrationBackupForeignKeys";
-    private static readonly Regex BackupKeyPattern = MyRegex();
-
     /// <summary>
-    /// Creates a provider-native migration snapshot.
+    /// Runs bounded, allowlisted PostgreSQL maintenance against model-owned tables.
     /// </summary>
-    /// <param name="connectionString">The configured PostgreSQL connection string.</param>
-    /// <param name="logger">The host logger.</param>
-    /// <param name="cancellationToken">The cancellation token.</param>
-    /// <returns>The snapshot schema name.</returns>
-    internal static async Task<string> MigrationBackupFast(
-        string connectionString,
-        ILogger logger,
+    /// <param name="factory">The initialized Jellyfin context factory.</param>
+    /// <param name="command">The allowlisted maintenance command.</param>
+    /// <param name="cancellationToken">The operation cancellation token.</param>
+    /// <returns>A task representing maintenance.</returns>
+    internal static async Task ExecuteMaintenanceAsync(
+        IDbContextFactory<JellyfinDbContext> factory,
+        string command,
         CancellationToken cancellationToken)
     {
-        var connection = new NpgsqlConnection(connectionString);
-        await using (connection.ConfigureAwait(false))
+        cancellationToken.ThrowIfCancellationRequested();
+        if (command is not ("ANALYZE" or "VACUUM (ANALYZE)"))
         {
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            var backupSchema = BackupSchemaPrefix + Guid.NewGuid().ToString("N");
-            await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            throw new ArgumentException("The PostgreSQL maintenance command is not allowlisted.", nameof(command));
+        }
 
-            await ExecuteAsync(connection, transaction, $"CREATE SCHEMA {Quote(backupSchema)}", cancellationToken).ConfigureAwait(false);
-            await ExecuteAsync(connection, transaction, $"SET LOCAL search_path TO {Quote(backupSchema)}, public", cancellationToken).ConfigureAwait(false);
-
-            var tableNames = await ReadStringsAsync(
-                connection,
-                transaction,
-                "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public' ORDER BY tablename",
-                cancellationToken).ConfigureAwait(false);
-
-            foreach (var tableName in tableNames)
+        var context = await factory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await using (context.ConfigureAwait(false))
+        {
+            var sql = BuildMaintenanceSql(context.Model, command);
+            if (sql is not null)
             {
-                var source = $"public.{Quote(tableName)}";
-                var target = $"{Quote(backupSchema)}.{Quote(tableName)}";
-                await ExecuteAsync(connection, transaction, $"CREATE TABLE {target} (LIKE {source} INCLUDING ALL)", cancellationToken).ConfigureAwait(false);
-                await ExecuteAsync(connection, transaction, $"INSERT INTO {target} OVERRIDING SYSTEM VALUE SELECT * FROM {source}", cancellationToken).ConfigureAwait(false);
+                // VACUUM intentionally runs without a transaction. The command
+                // timeout configured during Initialise bounds the server work.
+                await context.Database.ExecuteSqlRawAsync(sql, cancellationToken).ConfigureAwait(false);
             }
-
-            var foreignKeys = await ReadRowsAsync(
-                connection,
-                transaction,
-                """
-                SELECT relation.relname, constraint_record.conname, pg_get_constraintdef(constraint_record.oid)
-                FROM pg_catalog.pg_constraint AS constraint_record
-                JOIN pg_catalog.pg_class AS relation ON relation.oid = constraint_record.conrelid
-                JOIN pg_catalog.pg_namespace AS namespace_record ON namespace_record.oid = relation.relnamespace
-                WHERE namespace_record.nspname = 'public' AND constraint_record.contype = 'f'
-                ORDER BY relation.relname, constraint_record.conname
-                """,
-                cancellationToken).ConfigureAwait(false);
-
-            await ExecuteAsync(
-                connection,
-                transaction,
-                $"CREATE TABLE {Quote(backupSchema)}.{Quote(ForeignKeyMetadataTable)} (\"TableName\" text NOT NULL, \"ConstraintName\" text NOT NULL, \"Definition\" text NOT NULL)",
-                cancellationToken).ConfigureAwait(false);
-            foreach (var foreignKey in foreignKeys)
-            {
-                await ExecuteAsync(
-                    connection,
-                    transaction,
-                    $"INSERT INTO {Quote(backupSchema)}.{Quote(ForeignKeyMetadataTable)} VALUES ({Literal(foreignKey[0])}, {Literal(foreignKey[1])}, {Literal(foreignKey[2])})",
-                    cancellationToken).ConfigureAwait(false);
-            }
-
-            var identityColumns = await ReadRowsAsync(
-                connection,
-                transaction,
-                """
-                SELECT table_record.relname, column_record.attname, sequence_namespace.nspname, sequence_record.relname
-                FROM pg_catalog.pg_class AS table_record
-                JOIN pg_catalog.pg_namespace AS table_namespace ON table_namespace.oid = table_record.relnamespace
-                JOIN pg_catalog.pg_attribute AS column_record ON column_record.attrelid = table_record.oid
-                JOIN pg_catalog.pg_depend AS dependency_record
-                    ON dependency_record.refobjid = table_record.oid
-                    AND dependency_record.refobjsubid = column_record.attnum
-                    AND dependency_record.classid = 'pg_catalog.pg_class'::regclass
-                    AND dependency_record.deptype = 'i'
-                JOIN pg_catalog.pg_class AS sequence_record
-                    ON sequence_record.oid = dependency_record.objid
-                    AND sequence_record.relkind = 'S'
-                JOIN pg_catalog.pg_namespace AS sequence_namespace ON sequence_namespace.oid = sequence_record.relnamespace
-                WHERE table_namespace.nspname = 'public'
-                    AND table_record.relkind IN ('r', 'p')
-                ORDER BY table_record.relname, column_record.attname
-                """,
-                cancellationToken).ConfigureAwait(false);
-
-            foreach (var identityColumn in identityColumns)
-            {
-                var sourceSequence = $"{Quote(identityColumn[2])}.{Quote(identityColumn[3])}";
-                var sourceState = await ReadRowsAsync(
-                    connection,
-                    transaction,
-                    $"SELECT last_value::text, is_called::text FROM {sourceSequence}",
-                    cancellationToken).ConfigureAwait(false);
-                if (sourceState.Count != 1)
-                {
-                    throw new InvalidOperationException($"Could not read identity sequence state for {sourceSequence}.");
-                }
-
-                var targetSequence = await ReadRowsAsync(
-                    connection,
-                    transaction,
-                    $"""
-                    SELECT sequence_namespace.nspname, sequence_record.relname
-                    FROM pg_catalog.pg_class AS table_record
-                    JOIN pg_catalog.pg_namespace AS table_namespace ON table_namespace.oid = table_record.relnamespace
-                    JOIN pg_catalog.pg_attribute AS column_record ON column_record.attrelid = table_record.oid
-                    JOIN pg_catalog.pg_depend AS dependency_record
-                        ON dependency_record.refobjid = table_record.oid
-                        AND dependency_record.refobjsubid = column_record.attnum
-                        AND dependency_record.classid = 'pg_catalog.pg_class'::regclass
-                        AND dependency_record.deptype = 'i'
-                    JOIN pg_catalog.pg_class AS sequence_record
-                        ON sequence_record.oid = dependency_record.objid
-                        AND sequence_record.relkind = 'S'
-                    JOIN pg_catalog.pg_namespace AS sequence_namespace ON sequence_namespace.oid = sequence_record.relnamespace
-                    WHERE table_namespace.nspname = {Literal(backupSchema)}
-                        AND table_record.relname = {Literal(identityColumn[0])}
-                        AND column_record.attname = {Literal(identityColumn[1])}
-                    """,
-                    cancellationToken).ConfigureAwait(false);
-                if (targetSequence.Count != 1)
-                {
-                    throw new InvalidOperationException(
-                        $"Could not identify the copied identity sequence for {backupSchema}.{identityColumn[0]}.{identityColumn[1]}.");
-                }
-
-                await ExecuteAsync(
-                    connection,
-                    transaction,
-                    $"SELECT setval({Literal(Quote(targetSequence[0][0]) + "." + Quote(targetSequence[0][1]))}::regclass, {sourceState[0][0]}, {sourceState[0][1]})",
-                    cancellationToken).ConfigureAwait(false);
-            }
-
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            LogBackupCreated(logger, backupSchema, tableNames.Count);
-            return backupSchema;
         }
     }
 
     /// <summary>
-    /// Restores a provider-native migration snapshot.
+    /// Purges only tables mapped by the supplied Jellyfin model.
     /// </summary>
-    /// <param name="connectionString">The configured PostgreSQL connection string.</param>
-    /// <param name="logger">The host logger.</param>
-    /// <param name="key">The snapshot schema name.</param>
-    /// <param name="cancellationToken">The cancellation token.</param>
-    /// <returns>A task representing the restore.</returns>
-    internal static async Task RestoreBackupFast(
-        string connectionString,
-        ILogger logger,
-        string key,
-        CancellationToken cancellationToken)
+    /// <param name="dbContext">The active Jellyfin context.</param>
+    /// <param name="tableNames">Mapped schema-qualified table names, or null for all mapped tables.</param>
+    /// <returns>A task representing the purge.</returns>
+    internal static async Task PurgeDatabaseAsync(
+        JellyfinDbContext dbContext,
+        IEnumerable<string>? tableNames)
     {
-        ValidateBackupKey(key);
-        var connection = new NpgsqlConnection(connectionString);
-        await using (connection.ConfigureAwait(false))
+        ArgumentNullException.ThrowIfNull(dbContext);
+        var sql = BuildPurgeSql(dbContext.Model, tableNames);
+        if (sql is null)
         {
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            await using var transaction = await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-            await ExecuteAsync(connection, transaction, "DROP SCHEMA public CASCADE", cancellationToken).ConfigureAwait(false);
-            await ExecuteAsync(connection, transaction, $"ALTER SCHEMA {Quote(key)} RENAME TO public", cancellationToken).ConfigureAwait(false);
-            await ExecuteAsync(connection, transaction, "SET LOCAL search_path TO public", cancellationToken).ConfigureAwait(false);
-            var foreignKeys = await ReadRowsAsync(
-                connection,
-                transaction,
-                $"SELECT \"TableName\", \"ConstraintName\", \"Definition\" FROM public.{Quote(ForeignKeyMetadataTable)} ORDER BY \"TableName\", \"ConstraintName\"",
-                cancellationToken).ConfigureAwait(false);
-            foreach (var foreignKey in foreignKeys)
-            {
-                await ExecuteAsync(
-                    connection,
-                    transaction,
-                    $"ALTER TABLE public.{Quote(foreignKey[0])} ADD CONSTRAINT {Quote(foreignKey[1])} {foreignKey[2]}",
-                    cancellationToken).ConfigureAwait(false);
-            }
+            return;
+        }
 
-            await ExecuteAsync(connection, transaction, $"DROP TABLE public.{Quote(ForeignKeyMetadataTable)}", cancellationToken).ConfigureAwait(false);
-            await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-            LogBackupRestored(logger, key);
+        var ownsTransaction = dbContext.Database.CurrentTransaction is null;
+        await using var transaction = ownsTransaction
+            ? await dbContext.Database.BeginTransactionAsync().ConfigureAwait(false)
+            : null;
+
+        await dbContext.Database.ExecuteSqlRawAsync(sql).ConfigureAwait(false);
+        if (transaction is not null)
+        {
+            await transaction.CommitAsync().ConfigureAwait(false);
         }
     }
 
     /// <summary>
-    /// Deletes a provider-native migration snapshot.
+    /// Retires only the pool identified by this provider's normalized connection string.
     /// </summary>
-    /// <param name="connectionString">The configured PostgreSQL connection string.</param>
-    /// <param name="logger">The host logger.</param>
-    /// <param name="key">The snapshot schema name.</param>
-    /// <returns>A task representing the deletion.</returns>
-    internal static async Task DeleteBackup(string connectionString, ILogger logger, string key)
+    /// <param name="connectionString">The normalized connection string.</param>
+    internal static void ClearPool(string connectionString)
     {
-        ValidateBackupKey(key);
-        var connection = new NpgsqlConnection(connectionString);
-        await using (connection.ConfigureAwait(false))
-        {
-            await connection.OpenAsync().ConfigureAwait(false);
-            await ExecuteAsync(connection, null, $"DROP SCHEMA {Quote(key)} CASCADE", CancellationToken.None).ConfigureAwait(false);
-            LogBackupDeleted(logger, key);
-        }
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionString);
+        using var connection = new NpgsqlConnection(connectionString);
+        NpgsqlConnection.ClearPool(connection);
     }
 
-    private static string Quote(string identifier) => '"' + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + '"';
-
-    private static string Literal(string value) => '\'' + value.Replace("'", "''", StringComparison.Ordinal) + '\'';
-
-    private static void ValidateBackupKey(string key)
+    /// <summary>
+    /// Builds maintenance SQL for model-owned tables.
+    /// </summary>
+    /// <param name="model">The finalized Jellyfin model.</param>
+    /// <param name="command">An allowlisted PostgreSQL maintenance command.</param>
+    /// <returns>The SQL, or null when the model contains no tables.</returns>
+    internal static string? BuildMaintenanceSql(IReadOnlyModel model, string command)
     {
-        if (!BackupKeyPattern.IsMatch(key))
+        ArgumentNullException.ThrowIfNull(model);
+        if (command is not ("ANALYZE" or "VACUUM (ANALYZE)"))
         {
-            throw new ArgumentException("The migration backup key is invalid.", nameof(key));
+            throw new ArgumentException("The PostgreSQL maintenance command is not allowlisted.", nameof(command));
         }
+
+        var tables = GetModelTables(model).Values
+            .Select(table => QuoteTableName(table.Schema, table.Table))
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        return tables.Length == 0 ? null : $"{command} {string.Join(", ", tables)}";
     }
 
-    private static async Task ExecuteAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction? transaction,
-        string commandText,
-        CancellationToken cancellationToken)
+    /// <summary>
+    /// Builds purge SQL after validating every requested table against the model.
+    /// </summary>
+    /// <param name="model">The finalized Jellyfin model.</param>
+    /// <param name="tableNames">Mapped schema-qualified table names, or null for all mapped tables.</param>
+    /// <returns>The SQL, or null when no tables were requested.</returns>
+    internal static string? BuildPurgeSql(IReadOnlyModel model, IEnumerable<string>? tableNames)
     {
-        var command = new NpgsqlCommand(commandText, connection, transaction);
-        await using (command.ConfigureAwait(false))
+        ArgumentNullException.ThrowIfNull(model);
+        var modelTables = GetModelTables(model);
+        var requestedNames = tableNames?.Distinct(StringComparer.Ordinal).ToArray()
+            ?? modelTables.Keys.Order(StringComparer.Ordinal).ToArray();
+        if (requestedNames.Length == 0)
         {
-            await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            return null;
         }
-    }
 
-    private static async Task<List<string>> ReadStringsAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        string commandText,
-        CancellationToken cancellationToken)
-        => [.. (await ReadRowsAsync(connection, transaction, commandText, cancellationToken).ConfigureAwait(false)).Select(row => row[0])];
-
-    private static async Task<List<string[]>> ReadRowsAsync(
-        NpgsqlConnection connection,
-        NpgsqlTransaction transaction,
-        string commandText,
-        CancellationToken cancellationToken)
-    {
-        var rows = new List<string[]>();
-        var command = new NpgsqlCommand(commandText, connection, transaction);
-        await using (command.ConfigureAwait(false))
+        var quotedTables = new List<string>(requestedNames.Length);
+        foreach (var requestedName in requestedNames)
         {
-            var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            await using (reader.ConfigureAwait(false))
+            if (!modelTables.TryGetValue(requestedName, out var table))
             {
-                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                {
-                    var row = new string[reader.FieldCount];
-                    for (var index = 0; index < reader.FieldCount; index++)
-                    {
-                        row[index] = reader.GetString(index);
-                    }
-
-                    rows.Add(row);
-                }
+                throw new InvalidOperationException(
+                    $"Refusing to purge PostgreSQL table '{requestedName}' because it is not mapped by the Jellyfin database model.");
             }
+
+            quotedTables.Add(QuoteTableName(table.Schema, table.Table));
         }
 
-        return rows;
+        // A single statement lets PostgreSQL validate every foreign-key
+        // relationship before mutation. Deliberately omit CASCADE.
+        return $"TRUNCATE TABLE {string.Join(", ", quotedTables)} RESTART IDENTITY";
     }
 
-    [GeneratedRegex("^jellyfin_migration_backup_[0-9a-f]{32}$", RegexOptions.CultureInvariant)]
-    private static partial Regex MyRegex();
+    /// <summary>
+    /// Quotes a PostgreSQL identifier by doubling embedded quote characters.
+    /// </summary>
+    /// <param name="identifier">The identifier.</param>
+    /// <returns>A quoted identifier.</returns>
+    internal static string QuoteIdentifier(string identifier)
+    {
+        ArgumentNullException.ThrowIfNull(identifier);
+        return $"\"{identifier.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
+    }
 
-    [LoggerMessage(
-        EventId = 2,
-        Level = LogLevel.Information,
-        Message = "Created PostgreSQL migration snapshot in schema {BackupSchema} with {TableCount} tables")]
-    private static partial void LogBackupCreated(ILogger logger, string backupSchema, int tableCount);
+    private static Dictionary<string, (string? Schema, string Table)> GetModelTables(IReadOnlyModel model)
+        => model.GetEntityTypes()
+            .Select(entityType => new
+            {
+                SchemaQualifiedName = entityType.GetSchemaQualifiedTableName(),
+                Schema = entityType.GetSchema(),
+                Table = entityType.GetTableName(),
+            })
+            .Where(table => table.SchemaQualifiedName is not null && table.Table is not null)
+            .GroupBy(table => table.SchemaQualifiedName!, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => (group.First().Schema, group.First().Table!),
+                StringComparer.Ordinal);
 
-    [LoggerMessage(
-        EventId = 3,
-        Level = LogLevel.Information,
-        Message = "Restored PostgreSQL migration snapshot {BackupSchema}")]
-    private static partial void LogBackupRestored(ILogger logger, string backupSchema);
-
-    [LoggerMessage(
-        EventId = 4,
-        Level = LogLevel.Information,
-        Message = "Deleted PostgreSQL migration snapshot {BackupSchema}")]
-    private static partial void LogBackupDeleted(ILogger logger, string backupSchema);
+    private static string QuoteTableName(string? schema, string table)
+        => $"{QuoteIdentifier(string.IsNullOrEmpty(schema) ? "public" : schema)}.{QuoteIdentifier(table)}";
 }

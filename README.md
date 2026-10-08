@@ -42,6 +42,47 @@ plugin enablement, activates an early database provider. Keeping the ordinary
 plugin entry disabled avoids loading a redundant collectible copy later in the
 same process. No ordinary `IPlugin` descriptor or service registrator is needed.
 
+## Database configuration
+
+`database.xml` is the only configuration source used by the provider. A minimal
+configuration is:
+
+```xml
+<DatabaseConfigurationOptions>
+  <DatabaseType>PLUGIN_PROVIDER</DatabaseType>
+  <CustomProviderOptions>
+    <PluginName>Npgsql Database_0.1.0.0</PluginName>
+    <PluginAssembly>Jellyfin.Plugin.Database.Npgsql.dll</PluginAssembly>
+    <ConnectionString>Host=db.example;Database=jellyfin;Username=jellyfin_runtime;Passfile=/run/secrets/jellyfin-pgpass;SSL Mode=VerifyFull;Root Certificate=/run/secrets/postgresql-root.crt</ConnectionString>
+    <Options>
+      <CustomDatabaseOption>
+        <Key>command-timeout</Key>
+        <Value>30</Value>
+      </CustomDatabaseOption>
+    </Options>
+  </CustomProviderOptions>
+  <LockingBehavior>NoLock</LockingBehavior>
+</DatabaseConfigurationOptions>
+```
+
+The command timeout is case-insensitive and bounded from 1 to 3600 seconds.
+Connection, cancellation, and pool sizes are also bounded. The provider requires
+an explicit host, database, and username, forces UTC and the `public` search path,
+and rejects connection settings that log parameters, include potentially secret
+server details, retain security information, or preserve pooled session state.
+TLS certificate and passfile settings are passed to Npgsql but their paths and
+contents are never logged.
+
+Create the UTF8 database before starting Jellyfin. The configured login should
+own the Jellyfin objects and needs `CONNECT` on that database plus `USAGE` and
+`CREATE` on its `public` schema. It does not need superuser, `CREATEDB`, or
+`CREATEROLE`. Do not share that schema with unrelated application objects.
+
+This development version deliberately rejects Jellyfin's fast migration-backup
+calls. The provider will remain unsuitable for normal startup until the dedicated
+backup work adds a rollback-capable implementation; it does not silently claim
+that an external or nonexistent backup can be restored.
+
 ## Build and test
 
 The following commands work from this directory without a sibling Jellyfin source
@@ -73,6 +114,15 @@ pass its location explicitly:
 
 ```sh
 JELLYFIN_HOST_REPOSITORY=/path/to/jellyfin ./tests/black-box-smoke.sh
+```
+
+Until the backup bead lands, run its provider-core stage instead. It exercises
+the packaged ZIP, early dependency/ABI guards, a restricted real PostgreSQL role,
+and the untouched vanilla startup path, then proves the deliberate backup guard
+stops before application tables are created and does not leak credentials:
+
+```sh
+PROVIDER_CORE_ONLY=true JELLYFIN_HOST_REPOSITORY=/path/to/jellyfin ./tests/black-box-smoke.sh
 ```
 
 Without that setting, the script safely uses the plugin directory's parent only

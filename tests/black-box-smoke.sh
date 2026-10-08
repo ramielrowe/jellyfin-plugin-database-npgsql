@@ -353,6 +353,61 @@ if docker exec --env PGPASSWORD="$APPLICATION_PASSWORD" "$POSTGRES_CONTAINER" \
 fi
 
 start_host "$RUN_ROOT/first-start.log"
+if [ "${PROVIDER_CORE_ONLY:-false}" = "true" ]; then
+    for _ in $(seq 1 60); do
+        if grep -F 'does not yet implement the rollback-capable PostgreSQL migration backup protocol required by vanilla Jellyfin' "$RUN_ROOT/first-start.log" >/dev/null; then
+            break
+        fi
+
+        if ! kill -0 "$HOST_PID" 2>/dev/null; then
+            break
+        fi
+
+        sleep 1
+    done
+    grep -F 'does not yet implement the rollback-capable PostgreSQL migration backup protocol required by vanilla Jellyfin' "$RUN_ROOT/first-start.log" >/dev/null \
+        || fail "vanilla Jellyfin did not surface the deliberate migration-backup guard"
+    grep -F 'Refusing the operation before making database changes' "$RUN_ROOT/first-start.log" >/dev/null \
+        || fail "migration-backup guard did not state its pre-mutation boundary"
+    grep -F "PostgreSQL configured at 127.0.0.1:$POSTGRES_PORT for database jellyfin;" "$RUN_ROOT/first-start.log" >/dev/null \
+        || fail "provider did not emit its endpoint-only configuration diagnostic"
+    if grep -F -e "$APPLICATION_PASSWORD" -e "$BOOTSTRAP_PASSWORD" -e "$ADMIN_PASSWORD" "$RUN_ROOT/first-start.log" >/dev/null; then
+        fail "vanilla host log exposed a smoke-test credential"
+    fi
+    [ "$(psql_value "SELECT COUNT(*) FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename <> '__EFMigrationsHistory'")" = "0" ] \
+        || fail "the guarded startup created application tables"
+    [ "$(psql_value "SELECT COUNT(*) FROM pg_catalog.pg_namespace WHERE nspname LIKE 'jellyfin_migration_backup_%'")" = "0" ] \
+        || fail "the guarded startup created a migration-backup schema"
+
+    # Jellyfin keeps its setup listener alive after reporting this startup
+    # failure, so terminate the deliberately failed process after assertions.
+    kill -TERM "$HOST_PID" 2>/dev/null || true
+    for _ in $(seq 1 10); do
+        if ! kill -0 "$HOST_PID" 2>/dev/null; then
+            break
+        fi
+
+        sleep 1
+    done
+    kill -KILL "$HOST_PID" 2>/dev/null || true
+    wait "$HOST_PID" 2>/dev/null || true
+    HOST_PID=""
+
+    {
+        echo "result=PASS"
+        echo "scope=provider-core-before-backup-protocol"
+        echo "host_commit=$JELLYFIN_HOST_COMMIT"
+        echo "plugin_database_reference=12.2.0"
+        echo "postgres_image=$POSTGRES_IMAGE"
+        echo "runtime_role_flags=LOGIN,NOSUPERUSER,NOCREATEDB,NOCREATEROLE,NOREPLICATION,NOBYPASSRLS"
+        echo "guarded_mutation=true"
+        echo "endpoint_log_redacted=true"
+    } | tee "$RUN_ROOT/evidence.txt"
+
+    echo "Provider-core smoke test passed. Evidence: $RUN_ROOT/evidence.txt"
+    exit 0
+fi
+
 wait_for_health "$HTTP_PORT" || fail "vanilla Jellyfin 12.2 did not become healthy"
 assert_loopback_listener "$HTTP_PORT"
 grep -q 'Npgsql database provider 0.1.0.0 loaded.*in Default' "$RUN_ROOT/first-start.log" \

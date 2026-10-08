@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
+using Jellyfin.Plugin.Database.Npgsql.ValueConverters;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
@@ -20,6 +21,8 @@ namespace Jellyfin.Plugin.Database.Npgsql;
 /// <param name="logger">The host logger.</param>
 public sealed partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvider> logger) : IJellyfinDatabaseProvider
 {
+    private const string PluginProviderType = "PLUGIN_PROVIDER";
+
     private static readonly (string FileName, string AssemblyName, Version Version)[] RuntimeDependencies =
     [
         ("Npgsql.dll", "Npgsql", new Version(10, 0, 3, 0)),
@@ -49,35 +52,37 @@ public sealed partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvide
                 + "Jellyfin version and provider package. No database connection was attempted.");
         }
 
-        var customOptions = databaseConfiguration.CustomProviderOptions
-            ?? throw new InvalidOperationException(
-                "The Npgsql provider requires CustomProviderOptions in database.xml. No database connection was attempted.");
-        this.ValidateSelectedDirectory(customOptions.PluginName);
+        var customOptions = ValidateDatabaseConfiguration(databaseConfiguration);
+        this.ValidateSelectedDirectory(customOptions.PluginName, customOptions.PluginAssembly);
 
         var providerAssembly = this.GetType().Assembly;
         var pluginDirectory = Path.GetDirectoryName(providerAssembly.Location)
             ?? throw new InvalidOperationException("The Npgsql provider assembly has no installation directory.");
         var dependencyAssemblies = LoadAdjacentDependencies(pluginDirectory);
 
-        var configuredConnectionString = customOptions.ConnectionString;
-        if (string.IsNullOrWhiteSpace(configuredConnectionString))
-        {
-            throw new InvalidOperationException(
-                "The Npgsql provider requires CustomProviderOptions.ConnectionString in database.xml. No database connection was attempted.");
-        }
-
-        this.connectionString = configuredConnectionString;
+        // Keep this call behind the adjacent dependency checks. The no-inline
+        // bootstrap owns the first method body that references the Npgsql EF
+        // assembly, so a missing package file reaches our recovery diagnostic.
+        var configured = NpgsqlOptionsBootstrap.Configure(
+            options,
+            customOptions.ConnectionString,
+            customOptions.Options);
+        this.connectionString = configured.ConnectionString;
 
         LogProviderLoaded(
             this.logger,
             PluginMetadata.Version,
             providerAssembly.Location,
             AssemblyLoadContext.GetLoadContext(providerAssembly)?.Name ?? "Default");
-
-        // Keep this call behind the adjacent dependency checks. The no-inline
-        // bootstrap owns the first method body that references the Npgsql EF
-        // assembly, so a missing package file reaches our recovery diagnostic.
-        NpgsqlOptionsBootstrap.Configure(options, configuredConnectionString);
+        LogDatabaseEndpoint(
+            this.logger,
+            configured.Host,
+            configured.Port,
+            configured.Database,
+            configured.SslMode,
+            configured.Pooling,
+            configured.PassfileConfigured,
+            configured.CommandTimeout);
 
         this.LogAssembly("provider", providerAssembly);
         this.LogAssembly("host database", hostDatabaseAssembly);
@@ -89,39 +94,77 @@ public sealed partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvide
     /// <inheritdoc />
     public void OnModelCreating(ModelBuilder modelBuilder)
     {
+        ArgumentNullException.ThrowIfNull(modelBuilder);
+
+        // Provider-specific final-model work is deliberately applied by
+        // NpgsqlModelCustomizer after Jellyfin's shared configurations.
     }
 
     /// <inheritdoc />
     public void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
     {
+        ArgumentNullException.ThrowIfNull(configurationBuilder);
+
+        // Jellyfin's persisted timestamps represent UTC instants. Npgsql maps
+        // these to timestamp with time zone and rejects non-UTC DateTime values.
+        configurationBuilder.Properties<DateTime>()
+            .HaveConversion<UtcDateTimeValueConverter>()
+            .HaveColumnType("timestamp with time zone");
+        configurationBuilder.Properties<DateTimeOffset>()
+            .HaveConversion<UtcDateTimeOffsetValueConverter>()
+            .HaveColumnType("timestamp with time zone");
     }
 
     /// <inheritdoc />
-    public Task RunScheduledOptimisation(CancellationToken cancellationToken) => Task.CompletedTask;
+    public Task RunScheduledOptimisation(CancellationToken cancellationToken)
+    {
+        LogScheduledMaintenance(this.logger);
+        return NpgsqlDatabaseOperations.ExecuteMaintenanceAsync(
+            this.RequireFactory(cancellationToken),
+            "VACUUM (ANALYZE)",
+            cancellationToken);
+    }
 
     /// <inheritdoc />
-    public Task RunShutdownTask(CancellationToken cancellationToken) => Task.CompletedTask;
+    public Task RefreshStatistics(CancellationToken cancellationToken)
+    {
+        LogStatisticsMaintenance(this.logger);
+        return NpgsqlDatabaseOperations.ExecuteMaintenanceAsync(
+            this.RequireFactory(cancellationToken),
+            "ANALYZE",
+            cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public Task RunShutdownTask(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var configuredConnectionString = this.connectionString;
+        if (configuredConnectionString is not null)
+        {
+            // Pool retirement is synchronous, bounded by local bookkeeping, and
+            // does not contact PostgreSQL or grow with the database size.
+            NpgsqlDatabaseOperations.ClearPool(configuredConnectionString);
+        }
+
+        return Task.CompletedTask;
+    }
 
     /// <inheritdoc />
     public Task<string> MigrationBackupFast(CancellationToken cancellationToken)
-        => NpgsqlDatabaseOperations.MigrationBackupFast(this.RequireConnectionString(), this.logger, cancellationToken);
+        => throw CreateFastBackupNotSupportedException();
 
     /// <inheritdoc />
     public Task RestoreBackupFast(string key, CancellationToken cancellationToken)
-    {
-        ArgumentNullException.ThrowIfNull(key);
-        return NpgsqlDatabaseOperations.RestoreBackupFast(this.RequireConnectionString(), this.logger, key, cancellationToken);
-    }
+        => throw CreateFastBackupNotSupportedException();
 
     /// <inheritdoc />
     public Task DeleteBackup(string key)
-    {
-        ArgumentNullException.ThrowIfNull(key);
-        return NpgsqlDatabaseOperations.DeleteBackup(this.RequireConnectionString(), this.logger, key);
-    }
+        => throw CreateFastBackupNotSupportedException();
 
     /// <inheritdoc />
-    public Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames) => Task.CompletedTask;
+    public Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames)
+        => NpgsqlDatabaseOperations.PurgeDatabaseAsync(dbContext, tableNames);
 
     /// <summary>
     /// Determines whether a host database assembly belongs to this release's supported ABI family.
@@ -130,6 +173,40 @@ public sealed partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvide
     /// <returns><see langword="true" /> when the ABI is supported.</returns>
     internal static bool SupportsHostDatabaseAbi(Version version)
         => version.Major == 12 && version.Minor == 2;
+
+    /// <summary>
+    /// Validates the unmodified Jellyfin database configuration contract.
+    /// </summary>
+    /// <param name="databaseConfiguration">The configuration deserialized by Jellyfin from database.xml.</param>
+    /// <returns>The required custom-provider section.</returns>
+    internal static CustomDatabaseOptions ValidateDatabaseConfiguration(DatabaseConfigurationOptions databaseConfiguration)
+    {
+        ArgumentNullException.ThrowIfNull(databaseConfiguration);
+        if (!string.Equals(databaseConfiguration.DatabaseType, PluginProviderType, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "The Npgsql provider must be selected by setting DatabaseType to PLUGIN_PROVIDER in database.xml. "
+                + "No database connection was attempted.");
+        }
+
+        if (databaseConfiguration.LockingBehavior != DatabaseLockingBehaviorTypes.NoLock)
+        {
+            throw new InvalidOperationException(
+                "The Npgsql provider requires LockingBehavior NoLock because PostgreSQL supplies database-level concurrency control. "
+                + "No database connection was attempted.");
+        }
+
+        var customOptions = databaseConfiguration.CustomProviderOptions
+            ?? throw new InvalidOperationException(
+                "The Npgsql provider requires CustomProviderOptions in database.xml. No database connection was attempted.");
+        if (string.IsNullOrWhiteSpace(customOptions.ConnectionString))
+        {
+            throw new InvalidOperationException(
+                "The Npgsql provider requires CustomProviderOptions.ConnectionString in database.xml. No database connection was attempted.");
+        }
+
+        return customOptions;
+    }
 
     /// <summary>
     /// Validates and loads the exact plugin-shipped runtime assemblies from the installation directory.
@@ -182,7 +259,19 @@ public sealed partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvide
         return loaded;
     }
 
-    private void ValidateSelectedDirectory(string pluginName)
+    private static InvalidOperationException MissingDependency(string dependency, string pluginDirectory, Exception? innerException)
+        => new(
+            $"Required Npgsql dependency '{dependency}' is missing or incompatible in '{pluginDirectory}'. Restore the complete "
+            + $"Jellyfin.Plugin.Database.Npgsql {PluginMetadata.Version} ZIP in '{PluginMetadata.InstallationDirectory}', or reinstall the previous "
+            + "compatible package before restarting. No database connection was attempted.",
+            innerException);
+
+    private static NotSupportedException CreateFastBackupNotSupportedException()
+        => new(
+            "This development release does not yet implement the rollback-capable PostgreSQL migration backup protocol required by vanilla Jellyfin. "
+            + "Refusing the operation before making database changes; install a release that implements migration backup and restore.");
+
+    private void ValidateSelectedDirectory(string pluginName, string pluginAssembly)
     {
         var providerAssembly = this.GetType().Assembly;
         var loadContext = AssemblyLoadContext.GetLoadContext(providerAssembly);
@@ -196,24 +285,23 @@ public sealed partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvide
         var selectedDirectory = Path.GetFileName(Path.GetDirectoryName(providerAssembly.Location));
         if (string.IsNullOrWhiteSpace(pluginName)
             || !string.Equals(pluginName, PluginMetadata.InstallationDirectory, StringComparison.Ordinal)
-            || !string.Equals(selectedDirectory, pluginName, StringComparison.Ordinal))
+            || !string.Equals(selectedDirectory, pluginName, StringComparison.Ordinal)
+            || !string.Equals(pluginAssembly, PluginMetadata.AssemblyFileName, StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
                 $"Jellyfin selected the Npgsql provider from folder '{selectedDirectory}', but this release requires the exact folder and PluginName "
-                + $"'{PluginMetadata.InstallationDirectory}'. Remove ambiguous prefix-matching folders, restore the complete release ZIP there, update "
-                + "database.xml atomically, and restart. No database connection was attempted.");
+                + $"'{PluginMetadata.InstallationDirectory}' plus PluginAssembly '{PluginMetadata.AssemblyFileName}'. Remove ambiguous prefix-matching "
+                + "folders, restore the complete release ZIP there, update database.xml atomically, and restart. No database connection was attempted.");
         }
     }
 
-    private static InvalidOperationException MissingDependency(string dependency, string pluginDirectory, Exception? innerException)
-        => new(
-            $"Required Npgsql dependency '{dependency}' is missing or incompatible in '{pluginDirectory}'. Restore the complete "
-            + $"Jellyfin.Plugin.Database.Npgsql {PluginMetadata.Version} ZIP in '{PluginMetadata.InstallationDirectory}', or reinstall the previous "
-            + "compatible package before restarting. No database connection was attempted.",
-            innerException);
-
-    private string RequireConnectionString()
-        => this.connectionString ?? throw new InvalidOperationException("The Npgsql provider has not been initialized.");
+    private IDbContextFactory<JellyfinDbContext> RequireFactory(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return this.DbContextFactory
+            ?? throw new InvalidOperationException(
+                "The Npgsql provider database factory is unavailable; Jellyfin did not finish database initialization.");
+    }
 
     private void LogAssembly(string role, Assembly assembly)
     {
@@ -238,6 +326,26 @@ public sealed partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvide
         Level = LogLevel.Information,
         Message = "Npgsql database provider {PluginVersion} loaded from {AssemblyLocation} in {LoadContext}")]
     private static partial void LogProviderLoaded(ILogger logger, string pluginVersion, string assemblyLocation, string loadContext);
+
+    [LoggerMessage(
+        EventId = 2,
+        Level = LogLevel.Information,
+        Message = "PostgreSQL configured at {Host}:{Port} for database {Database}; TLS {SslMode}, pooling {Pooling}, passfile {PassfileConfigured}, command timeout {CommandTimeoutSeconds}s")]
+    internal static partial void LogDatabaseEndpoint(
+        ILogger logger,
+        string host,
+        int port,
+        string database,
+        string sslMode,
+        bool pooling,
+        bool passfileConfigured,
+        int commandTimeoutSeconds);
+
+    [LoggerMessage(EventId = 3, Level = LogLevel.Debug, Message = "Running PostgreSQL VACUUM and statistics maintenance")]
+    private static partial void LogScheduledMaintenance(ILogger logger);
+
+    [LoggerMessage(EventId = 4, Level = LogLevel.Debug, Message = "Refreshing PostgreSQL query planner statistics")]
+    private static partial void LogStatisticsMaintenance(ILogger logger);
 
     [LoggerMessage(
         EventId = 5,
