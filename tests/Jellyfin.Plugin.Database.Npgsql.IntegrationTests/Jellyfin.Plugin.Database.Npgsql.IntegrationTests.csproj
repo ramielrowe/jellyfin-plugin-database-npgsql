@@ -22,6 +22,5 @@
   <ItemGroup>
     <ProjectReference Include="../../src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj" />
     <ProjectReference Include="../Jellyfin.Plugin.Database.Npgsql.TestInfrastructure/Jellyfin.Plugin.Database.Npgsql.TestInfrastructure.csproj" />
-    <ProjectReference Include="../Jellyfin.Plugin.Database.Npgsql.TestProvider/Jellyfin.Plugin.Database.Npgsql.TestProvider.csproj" />
   </ItemGroup>
 </Project>

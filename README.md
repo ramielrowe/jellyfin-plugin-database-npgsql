@@ -121,10 +121,10 @@ own the Jellyfin objects and needs `CONNECT` on that database plus `USAGE` and
 `CREATE` on its `public` schema. It does not need superuser, `CREATEDB`, or
 `CREATEROLE`. Do not share that schema with unrelated application objects.
 
-This development version deliberately rejects Jellyfin's fast migration-backup
-calls. The provider will remain unsuitable for normal startup until the dedicated
-backup work adds a rollback-capable implementation; it does not silently claim
-that an external or nonexistent backup can be restored.
+Before vanilla Jellyfin runs a pending database migration, the provider creates
+a managed, streamed, rollback-capable snapshot below the Jellyfin data path. It
+does not invoke external PostgreSQL clients or require elevated database
+privileges. Unsupported populated layouts fail before mutation.
 
 ## Build and test
 
@@ -163,16 +163,16 @@ recorded in [`docs/model-compatibility.md`](docs/model-compatibility.md).
 The independent migration lineage, design-time workflow, hand-authored SQL
 boundary, and pinned host migration audit are documented in
 [`docs/migrations.md`](docs/migrations.md).
+The atomic backup format, validation boundaries, and transactional restore are
+documented in [`docs/migration-backups.md`](docs/migration-backups.md).
 
-Until the backup bead lands, run its provider-core stage instead. It exercises
-the packaged ZIP, early dependency/ABI guards, a restricted real PostgreSQL role,
-and the untouched vanilla startup path, then proves the deliberate backup guard
-stops before application tables are created and does not leak credentials:
+The black-box smoke test exercises the packaged ZIP, early dependency/ABI
+guards, restricted PostgreSQL role, and untouched vanilla startup path:
 
 ```sh
 JELLYFIN_HOST_PUBLISH=/path/to/vanilla-jellyfin-publish \
 JELLYFIN_HOST_SHA256=<documented-publish-hash> \
-PROVIDER_CORE_ONLY=true ./tests/black-box-smoke.sh
+./tests/black-box-smoke.sh
 ```
 
 The script never infers a parent checkout. `JELLYFIN_HOST_REPOSITORY` remains an

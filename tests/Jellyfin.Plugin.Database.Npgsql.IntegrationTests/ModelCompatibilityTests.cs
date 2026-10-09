@@ -5,7 +5,6 @@ using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Locking;
 using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
-using Jellyfin.Plugin.Database.Npgsql.TestProvider;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
@@ -1065,14 +1064,11 @@ public sealed class ModelCompatibilityTests
                 "artifacts",
                 "jellyfin-plugin-database-npgsql_" + PluginMetadata.Version + ".zip");
             Assert.True(File.Exists(package), "Build the audited plugin ZIP before running the full-host model proof.");
-            var pluginDirectory = layout.InstallPluginZip(package, PluginMetadata.InstallationDirectory);
-            File.Copy(
-                typeof(TestOnlyNpgsqlDatabaseProvider).Assembly.Location,
-                Path.Combine(pluginDirectory, TestOnlyNpgsqlDatabaseProvider.AssemblyFileName));
+            layout.InstallPluginZip(package, PluginMetadata.InstallationDirectory);
             layout.WriteDatabaseConfiguration(
                 database.RuntimeConnectionString,
                 PluginMetadata.InstallationDirectory,
-                TestOnlyNpgsqlDatabaseProvider.AssemblyFileName);
+                PluginMetadata.AssemblyFileName);
             var portLeaseRoot = Path.Combine(artifactRoot, ".port-leases");
             using var httpPort = LoopbackPortReservation.Acquire(portLeaseRoot);
             using var httpsPort = LoopbackPortReservation.Acquire(portLeaseRoot);

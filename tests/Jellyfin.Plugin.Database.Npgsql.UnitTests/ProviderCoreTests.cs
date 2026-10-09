@@ -748,17 +748,16 @@ public sealed class ProviderCoreTests
     }
 
     [Fact]
-    public async Task FastBackupOperationsAreDeliberatelyGuardedPendingBackupProtocol()
+    public async Task FastBackupOperationsRequireInitializedProviderAndSafeKeys()
     {
         var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
 
-        var create = await Assert.ThrowsAsync<NotSupportedException>(
+        var create = await Assert.ThrowsAsync<InvalidOperationException>(
             () => provider.MigrationBackupFast(CancellationToken.None));
-        await Assert.ThrowsAsync<NotSupportedException>(
+        await Assert.ThrowsAsync<InvalidOperationException>(
             () => provider.RestoreBackupFast("unused", CancellationToken.None));
-        await Assert.ThrowsAsync<NotSupportedException>(() => provider.DeleteBackup("unused"));
-        Assert.Contains("rollback-capable", create.Message, StringComparison.Ordinal);
-        Assert.Contains("before making database changes", create.Message, StringComparison.Ordinal);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => provider.DeleteBackup("unused"));
+        Assert.Contains("factory is unavailable", create.Message, StringComparison.Ordinal);
     }
 
     private static DatabaseConfigurationOptions CreateConfiguration()

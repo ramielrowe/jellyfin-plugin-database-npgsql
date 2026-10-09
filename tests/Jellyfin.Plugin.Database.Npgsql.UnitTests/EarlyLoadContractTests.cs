@@ -24,12 +24,18 @@ public sealed class EarlyLoadContractTests
     }
 
     [Fact]
-    public void ProviderConstructorUsesOnlyTheEarlyLoggerService()
+    public void ProviderConstructorsUseOnlyEarlyHostServices()
     {
-        var constructor = Assert.Single(typeof(NpgsqlDatabaseProvider).GetConstructors());
-        var parameter = Assert.Single(constructor.GetParameters());
-
-        Assert.Equal(typeof(ILogger<NpgsqlDatabaseProvider>), parameter.ParameterType);
+        var constructors = typeof(NpgsqlDatabaseProvider).GetConstructors();
+        Assert.Equal(2, constructors.Length);
+        Assert.Contains(
+            constructors,
+            constructor => constructor.GetParameters().Select(parameter => parameter.ParameterType).SequenceEqual(
+                [typeof(ILogger<NpgsqlDatabaseProvider>)]));
+        Assert.Contains(
+            constructors,
+            constructor => constructor.GetParameters().Select(parameter => parameter.ParameterType).SequenceEqual(
+                [typeof(IServiceProvider), typeof(ILogger<NpgsqlDatabaseProvider>)]));
     }
 
     [Fact]

@@ -2,7 +2,6 @@ using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Locking;
 using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
-using Jellyfin.Plugin.Database.Npgsql.TestProvider;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
@@ -52,14 +51,11 @@ public sealed class MigrationIntegrationTests
                 "artifacts",
                 "jellyfin-plugin-database-npgsql_" + PluginMetadata.Version + ".zip");
             Assert.True(File.Exists(package), "Build the audited plugin ZIP before running the fresh-setup migration proof.");
-            var pluginDirectory = layout.InstallPluginZip(package, PluginMetadata.InstallationDirectory);
-            File.Copy(
-                typeof(TestOnlyNpgsqlDatabaseProvider).Assembly.Location,
-                Path.Combine(pluginDirectory, TestOnlyNpgsqlDatabaseProvider.AssemblyFileName));
+            layout.InstallPluginZip(package, PluginMetadata.InstallationDirectory);
             layout.WriteDatabaseConfiguration(
                 database.RuntimeConnectionString,
                 PluginMetadata.InstallationDirectory,
-                TestOnlyNpgsqlDatabaseProvider.AssemblyFileName);
+                PluginMetadata.AssemblyFileName);
             var ffmpeg = Path.Combine(repositoryRoot, "tests", "fixtures", "fake-ffmpeg.sh");
             var portLeaseRoot = Path.Combine(artifactRoot, ".port-leases");
             using var httpPort = LoopbackPortReservation.Acquire(portLeaseRoot);
