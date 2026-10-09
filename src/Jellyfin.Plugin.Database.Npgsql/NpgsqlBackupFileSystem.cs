@@ -15,6 +15,7 @@ internal static class NpgsqlBackupFileSystem
     private const uint OpenExisting = 3;
     private const uint BackupSemantics = 0x02000000;
     private static readonly AsyncLocal<Action<string>?> FaultCallback = new();
+    private static readonly AsyncLocal<WriteFailure?> WriteFailureCallback = new();
 
     /// <summary>Installs a per-async-flow fault callback for integration tests.</summary>
     /// <param name="callback">A callback which may throw at a named durability point.</param>
@@ -25,6 +26,30 @@ internal static class NpgsqlBackupFileSystem
         var previous = FaultCallback.Value;
         FaultCallback.Value = callback;
         return new FaultScope(previous);
+    }
+
+    /// <summary>Installs a deterministic partial-write failure for integration tests.</summary>
+    /// <param name="point">The exact write stream which should fail.</param>
+    /// <param name="successfulBytes">The number of bytes which reach the underlying file before failure.</param>
+    /// <returns>A scope which restores the previous write failure.</returns>
+    internal static IDisposable InjectWriteFailure(string point, long successfulBytes)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(point);
+        ArgumentOutOfRangeException.ThrowIfNegative(successfulBytes);
+        var previous = WriteFailureCallback.Value;
+        WriteFailureCallback.Value = new WriteFailure(point, successfulBytes);
+        return new WriteFailureScope(previous);
+    }
+
+    /// <summary>Wraps a private file with the bounded, per-flow test write seam.</summary>
+    /// <param name="stream">The private destination file.</param>
+    /// <param name="point">The exact write stream identity.</param>
+    /// <returns>A non-owning stream which may fail after a configured number of bytes.</returns>
+    internal static Stream WrapWrites(FileStream stream, string point)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        ArgumentException.ThrowIfNullOrWhiteSpace(point);
+        return new FaultingWriteStream(stream, point);
     }
 
     /// <summary>Reaches a deterministic testable filesystem boundary without changing state.</summary>
@@ -134,5 +159,108 @@ internal static class NpgsqlBackupFileSystem
     private sealed class FaultScope(Action<string>? previous) : IDisposable
     {
         public void Dispose() => FaultCallback.Value = previous;
+    }
+
+    private sealed class WriteFailureScope(WriteFailure? previous) : IDisposable
+    {
+        public void Dispose() => WriteFailureCallback.Value = previous;
+    }
+
+    private sealed class WriteFailure(string point, long remainingBytes)
+    {
+        public string Point { get; } = point;
+
+        public long RemainingBytes { get; set; } = remainingBytes;
+    }
+
+    private sealed class FaultingWriteStream(FileStream inner, string point) : Stream
+    {
+        public override bool CanRead => false;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => true;
+
+        public override long Length => inner.Length;
+
+        public override long Position
+        {
+            get => inner.Position;
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush() => inner.Flush();
+
+        public override Task FlushAsync(CancellationToken cancellationToken) => inner.FlushAsync(cancellationToken);
+
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override void Write(byte[] buffer, int offset, int count)
+            => this.Write(buffer.AsSpan(offset, count));
+
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            var failure = this.ActiveFailure();
+            if (failure is null)
+            {
+                inner.Write(buffer);
+                return;
+            }
+
+            var allowed = (int)Math.Min(buffer.Length, failure.RemainingBytes);
+            if (allowed != 0)
+            {
+                inner.Write(buffer[..allowed]);
+                failure.RemainingBytes -= allowed;
+            }
+
+            if (allowed != buffer.Length)
+            {
+                throw new IOException("Injected partial write failure (simulated ENOSPC).");
+            }
+        }
+
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            => this.WriteAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var failure = this.ActiveFailure();
+            if (failure is null)
+            {
+                await inner.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+
+            var allowed = (int)Math.Min(buffer.Length, failure.RemainingBytes);
+            if (allowed != 0)
+            {
+                await inner.WriteAsync(buffer[..allowed], cancellationToken).ConfigureAwait(false);
+                failure.RemainingBytes -= allowed;
+            }
+
+            if (allowed != buffer.Length)
+            {
+                throw new IOException("Injected partial write failure (simulated ENOSPC).");
+            }
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            // The caller owns and durably flushes the underlying FileStream.
+            base.Dispose(disposing);
+        }
+
+        private WriteFailure? ActiveFailure()
+        {
+            var failure = WriteFailureCallback.Value;
+            return failure is not null && string.Equals(failure.Point, point, StringComparison.Ordinal)
+                ? failure
+                : null;
+        }
     }
 }

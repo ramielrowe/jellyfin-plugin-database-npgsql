@@ -100,15 +100,15 @@ internal static partial class NpgsqlMigrationBackup
                 {
                     throw new InvalidOperationException("The provider could not generate the rollback schema before migration; no backup was published.");
                 }
-
-                schemaFingerprint = await ReadSchemaFingerprintAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
-                await ValidateGeneratedSchemaContractAsync(
-                    connection,
-                    transaction,
-                    schemaSql,
-                    schemaFingerprint,
-                    cancellationToken).ConfigureAwait(false);
             }
+
+            schemaFingerprint = await ReadSchemaFingerprintAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+            await ValidateGeneratedSchemaContractAsync(
+                connection,
+                transaction,
+                schemaSql,
+                schemaFingerprint,
+                cancellationToken).ConfigureAwait(false);
 
             var tableSnapshots = new List<TableSnapshot>(tables.Count);
             for (var index = 0; index < tables.Count; index++)
@@ -120,9 +120,11 @@ internal static partial class NpgsqlMigrationBackup
                 var filePath = Path.Combine(partialDirectory, fileName);
                 var copySql = $"COPY {Quote(table.Schema)}.{Quote(table.Name)} ({string.Join(", ", copiedColumns.Select(column => Quote(column.Name)))}) TO STDOUT (FORMAT BINARY)";
                 await using (var output = CreatePrivateFile(filePath))
+                await using (var guardedOutput = NpgsqlBackupFileSystem.WrapWrites(output, $"write-table-{index:D4}"))
                 await using (var copy = await connection.BeginRawBinaryCopyAsync(copySql, cancellationToken).ConfigureAwait(false))
                 {
-                    await copy.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
+                    await copy.CopyToAsync(guardedOutput, cancellationToken).ConfigureAwait(false);
+                    await guardedOutput.FlushAsync(cancellationToken).ConfigureAwait(false);
                     await output.FlushAsync(cancellationToken).ConfigureAwait(false);
                     NpgsqlBackupFileSystem.FlushFile(output, $"flush-table-{index:D4}");
                 }
@@ -142,9 +144,6 @@ internal static partial class NpgsqlMigrationBackup
             var foreignKeys = empty
                 ? []
                 : await ReadForeignKeysAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
-            schemaFingerprint ??= empty
-                ? HashString("empty")
-                : await ReadSchemaFingerprintAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
             await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
 
             string? schemaFile = null;
@@ -154,7 +153,8 @@ internal static partial class NpgsqlMigrationBackup
                 schemaFile = "schema.sql";
                 var schemaPath = Path.Combine(partialDirectory, schemaFile);
                 await using (var stream = CreatePrivateFile(schemaPath))
-                await using (var writer = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true))
+                await using (var guardedStream = NpgsqlBackupFileSystem.WrapWrites(stream, "write-schema"))
+                await using (var writer = new StreamWriter(guardedStream, new UTF8Encoding(false), leaveOpen: true))
                 {
                     await writer.WriteAsync(schemaSql.AsMemory(), cancellationToken).ConfigureAwait(false);
                     await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
@@ -184,8 +184,10 @@ internal static partial class NpgsqlMigrationBackup
                 foreignKeys);
             var manifestPath = Path.Combine(partialDirectory, ManifestFile);
             await using (var stream = CreatePrivateFile(manifestPath))
+            await using (var guardedStream = NpgsqlBackupFileSystem.WrapWrites(stream, "write-manifest"))
             {
-                await JsonSerializer.SerializeAsync(stream, manifest, JsonOptions, cancellationToken).ConfigureAwait(false);
+                await JsonSerializer.SerializeAsync(guardedStream, manifest, JsonOptions, cancellationToken).ConfigureAwait(false);
+                await guardedStream.FlushAsync(cancellationToken).ConfigureAwait(false);
                 await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
                 NpgsqlBackupFileSystem.FlushFile(stream, "flush-manifest");
             }
@@ -193,8 +195,10 @@ internal static partial class NpgsqlMigrationBackup
             var manifestHash = await HashFileAsync(manifestPath, cancellationToken).ConfigureAwait(false);
             var completionPath = Path.Combine(partialDirectory, CompletionFile);
             await using (var stream = CreatePrivateFile(completionPath))
+            await using (var guardedStream = NpgsqlBackupFileSystem.WrapWrites(stream, "write-completion"))
             {
-                await stream.WriteAsync(Encoding.ASCII.GetBytes(manifestHash + "\n"), cancellationToken).ConfigureAwait(false);
+                await guardedStream.WriteAsync(Encoding.ASCII.GetBytes(manifestHash + "\n"), cancellationToken).ConfigureAwait(false);
+                await guardedStream.FlushAsync(cancellationToken).ConfigureAwait(false);
                 await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
                 NpgsqlBackupFileSystem.FlushFile(stream, "flush-completion");
             }
@@ -286,7 +290,7 @@ internal static partial class NpgsqlMigrationBackup
             await ExecuteNonQueryAsync(
                 connection,
                 transaction,
-                "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public AUTHORIZATION pg_database_owner; GRANT USAGE ON SCHEMA public TO PUBLIC",
+                "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public AUTHORIZATION pg_database_owner; GRANT USAGE ON SCHEMA public TO PUBLIC; COMMENT ON SCHEMA public IS 'standard public schema'",
                 operationToken).ConfigureAwait(false);
             if (!manifest.Empty)
             {
@@ -335,12 +339,12 @@ internal static partial class NpgsqlMigrationBackup
                         $"ALTER TABLE {Quote(foreignKey.Schema)}.{Quote(foreignKey.Table)} ALTER CONSTRAINT {Quote(foreignKey.Name)} {characteristics}",
                         operationToken).ConfigureAwait(false);
                 }
+            }
 
-                var restoredFingerprint = await ReadSchemaFingerprintAsync(connection, transaction, operationToken).ConfigureAwait(false);
-                if (!FixedHashEquals(restoredFingerprint, manifest.SchemaFingerprint))
-                {
-                    throw new InvalidDataException("The restored PostgreSQL schema did not match the captured schema; the restore transaction was rolled back.");
-                }
+            var restoredFingerprint = await ReadSchemaFingerprintAsync(connection, transaction, operationToken).ConfigureAwait(false);
+            if (!FixedHashEquals(restoredFingerprint, manifest.SchemaFingerprint))
+            {
+                throw new InvalidDataException("The restored PostgreSQL schema did not match the captured schema; the restore transaction was rolled back.");
             }
 
             await transaction.CommitAsync(operationToken).ConfigureAwait(false);
@@ -999,38 +1003,65 @@ internal static partial class NpgsqlMigrationBackup
         const string Sql = """
             SELECT string_agg(definition, E'\n' ORDER BY definition)
             FROM (
-              SELECT 'relation|' || namespace.nspname || '|' || relation.relname || '|' || relation.relkind::text || '|' || relation.relpersistence::text || '|' || pg_get_userbyid(relation.relowner) || '|' || coalesce(relation.relacl::text, '') || '|' || relation.relrowsecurity || '|' || relation.relforcerowsecurity || '|' || coalesce(relation.reloptions::text, '') AS definition
-              FROM pg_catalog.pg_class relation JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
-              WHERE namespace.nspname = 'public' AND relation.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+              SELECT 'schema|' || namespace.nspname || '|' || pg_get_userbyid(namespace.nspowner) || '|' || coalesce(namespace.nspacl::text, '') || '|' || coalesce(obj_description(namespace.oid, 'pg_namespace'), '') AS definition
+              FROM pg_catalog.pg_namespace namespace WHERE namespace.nspname = 'public'
               UNION ALL
-              SELECT 'column|' || namespace.nspname || '|' || relation.relname || '|' || attribute.attname || '|' || attribute.attnum || '|' || pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) || '|' || attribute.attnotnull || '|' || attribute.attidentity::text || '|' || attribute.attgenerated::text || '|' || coalesce(collation_namespace.nspname || '.' || collation_definition.collname, '') || '|' || coalesce(pg_get_expr(default_definition.adbin, default_definition.adrelid), '') || '|' || coalesce(attribute.attacl::text, '')
+              SELECT 'relation|' || namespace.nspname || '|' || relation.relname || '|' || relation.relkind::text || '|' || relation.relpersistence::text || '|' || pg_get_userbyid(relation.relowner) || '|' || coalesce(relation.relacl::text, '') || '|' || relation.relrowsecurity || '|' || relation.relforcerowsecurity || '|' || relation.relreplident::text || '|' || relation.relispartition || '|' || relation.relchecks || '|' || relation.relhasrules || '|' || relation.relhastriggers || '|' || coalesce(access_method.amname, '') || '|' || coalesce(tablespace.spcname, '') || '|' || coalesce(relation.reloptions::text, '') || '|' || coalesce(obj_description(relation.oid, 'pg_class'), '') AS definition
+              FROM pg_catalog.pg_class relation JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
+              LEFT JOIN pg_catalog.pg_am access_method ON access_method.oid = relation.relam
+              LEFT JOIN pg_catalog.pg_tablespace tablespace ON tablespace.oid = relation.reltablespace
+              WHERE namespace.nspname = 'public'
+              UNION ALL
+              SELECT 'column|' || namespace.nspname || '|' || relation.relname || '|' || attribute.attname || '|' || attribute.attnum || '|' || pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) || '|' || attribute.attnotnull || '|' || attribute.attidentity::text || '|' || attribute.attgenerated::text || '|' || coalesce(collation_namespace.nspname || '.' || collation_definition.collname, '') || '|' || coalesce(pg_get_expr(default_definition.adbin, default_definition.adrelid), '') || '|' || coalesce(attribute.attacl::text, '') || '|' || attribute.attstattarget || '|' || attribute.attstorage::text || '|' || attribute.attcompression::text || '|' || attribute.atthasmissing || '|' || coalesce(attribute.attmissingval::text, '') || '|' || attribute.attislocal || '|' || attribute.attinhcount || '|' || coalesce(attribute.attoptions::text, '') || '|' || coalesce(attribute.attfdwoptions::text, '') || '|' || coalesce(information.character_maximum_length::text, '') || '|' || coalesce(information.numeric_precision::text, '') || '|' || coalesce(information.numeric_scale::text, '') || '|' || coalesce(information.datetime_precision::text, '') || '|' || coalesce(col_description(relation.oid, attribute.attnum), '')
               FROM pg_catalog.pg_attribute attribute
               JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
               JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
               LEFT JOIN pg_catalog.pg_attrdef default_definition ON default_definition.adrelid = relation.oid AND default_definition.adnum = attribute.attnum
               LEFT JOIN pg_catalog.pg_collation collation_definition ON collation_definition.oid = attribute.attcollation AND attribute.attcollation <> 0
               LEFT JOIN pg_catalog.pg_namespace collation_namespace ON collation_namespace.oid = collation_definition.collnamespace
+              LEFT JOIN information_schema.columns information ON information.table_schema = namespace.nspname AND information.table_name = relation.relname AND information.column_name = attribute.attname
               WHERE namespace.nspname = 'public' AND attribute.attnum > 0 AND NOT attribute.attisdropped
               UNION ALL
-              SELECT 'constraint|' || n.nspname || '|' || c.relname || '|' || con.conname || '|' || con.contype::text || '|' || con.condeferrable || '|' || con.condeferred || '|' || con.convalidated || '|' || pg_get_constraintdef(con.oid, true)
+              SELECT 'constraint|' || n.nspname || '|' || c.relname || '|' || con.conname || '|' || con.contype::text || '|' || con.condeferrable || '|' || con.condeferred || '|' || con.convalidated || '|' || con.connoinherit || '|' || con.coninhcount || '|' || pg_get_constraintdef(con.oid, true) || '|' || coalesce(obj_description(con.oid, 'pg_constraint'), '')
               FROM pg_catalog.pg_constraint con JOIN pg_catalog.pg_class c ON c.oid = con.conrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public'
               UNION ALL
-              SELECT 'index|' || namespace.nspname || '|' || relation.relname || '|' || index_relation.relname || '|' || index_definition.indisunique || '|' || index_definition.indisprimary || '|' || index_definition.indisvalid || '|' || index_definition.indisready || '|' || index_definition.indislive || '|' || pg_get_indexdef(index_relation.oid)
+              SELECT 'index|' || namespace.nspname || '|' || relation.relname || '|' || index_relation.relname || '|' || index_definition.indisunique || '|' || index_definition.indisprimary || '|' || index_definition.indisexclusion || '|' || index_definition.indimmediate || '|' || index_definition.indisclustered || '|' || index_definition.indisvalid || '|' || index_definition.indcheckxmin || '|' || index_definition.indisready || '|' || index_definition.indislive || '|' || index_definition.indisreplident || '|' || index_definition.indnullsnotdistinct || '|' || index_definition.indnatts || '|' || index_definition.indnkeyatts || '|' || index_definition.indkey::text || '|' || index_definition.indcollation::text || '|' || index_definition.indclass::text || '|' || index_definition.indoption::text || '|' || coalesce(pg_get_expr(index_definition.indexprs, index_definition.indrelid), '') || '|' || coalesce(pg_get_expr(index_definition.indpred, index_definition.indrelid), '') || '|' || pg_get_indexdef(index_relation.oid)
               FROM pg_catalog.pg_index index_definition
               JOIN pg_catalog.pg_class relation ON relation.oid = index_definition.indrelid
               JOIN pg_catalog.pg_class index_relation ON index_relation.oid = index_definition.indexrelid
               JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
               WHERE namespace.nspname = 'public'
               UNION ALL
-              SELECT 'function|' || n.nspname || '|' || p.proname || '|' || pg_catalog.oidvectortypes(p.proargtypes) || '|' || pg_get_userbyid(p.proowner) || '|' || coalesce(p.proacl::text, '') || '|' || p.prosecdef || '|' || p.provolatile::text || '|' || p.proparallel::text || '|' || pg_get_functiondef(p.oid) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public'
+              SELECT 'function|' || n.nspname || '|' || p.proname || '|' || pg_catalog.oidvectortypes(p.proargtypes) || '|' || pg_get_userbyid(p.proowner) || '|' || coalesce(p.proacl::text, '') || '|' || p.prokind::text || '|' || p.prosecdef || '|' || p.proleakproof || '|' || p.proisstrict || '|' || p.proretset || '|' || p.provolatile::text || '|' || p.proparallel::text || '|' || p.procost || '|' || p.prorows || '|' || coalesce(p.proconfig::text, '') || '|' || pg_get_functiondef(p.oid) || '|' || coalesce(obj_description(p.oid, 'pg_proc'), '') FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public'
               UNION ALL
-              SELECT 'trigger|' || n.nspname || '|' || c.relname || '|' || t.tgname || '|' || t.tgenabled::text || '|' || pg_get_triggerdef(t.oid, true) FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND NOT t.tgisinternal
+              SELECT 'trigger|' || n.nspname || '|' || c.relname || '|' || t.tgname || '|' || t.tgenabled::text || '|' || pg_get_triggerdef(t.oid, true) || '|' || coalesce(obj_description(t.oid, 'pg_trigger'), '') FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND NOT t.tgisinternal
               UNION ALL
               SELECT 'policy|' || namespace.nspname || '|' || relation.relname || '|' || policy.polname || '|' || policy.polcmd::text || '|' || policy.polpermissive || '|' || policy.polroles::text || '|' || coalesce(pg_get_expr(policy.polqual, policy.polrelid), '') || '|' || coalesce(pg_get_expr(policy.polwithcheck, policy.polrelid), '')
               FROM pg_catalog.pg_policy policy JOIN pg_catalog.pg_class relation ON relation.oid = policy.polrelid JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace WHERE namespace.nspname = 'public'
               UNION ALL
               SELECT 'sequence|' || sequences.schemaname || '|' || sequences.sequencename || '|' || sequences.data_type::text || '|' || sequences.start_value || '|' || sequences.min_value || '|' || sequences.max_value || '|' || sequences.increment_by || '|' || sequences.cycle || '|' || sequences.cache_size || '|' || sequences.sequenceowner
               FROM pg_catalog.pg_sequences sequences WHERE sequences.schemaname = 'public'
+              UNION ALL
+              SELECT 'sequence-owner|' || sequence_namespace.nspname || '|' || sequence_relation.relname || '|' || dependency.deptype::text || '|' || table_namespace.nspname || '|' || table_relation.relname || '|' || table_attribute.attname
+              FROM pg_catalog.pg_depend dependency
+              JOIN pg_catalog.pg_class sequence_relation ON sequence_relation.oid = dependency.objid AND sequence_relation.relkind = 'S'
+              JOIN pg_catalog.pg_namespace sequence_namespace ON sequence_namespace.oid = sequence_relation.relnamespace
+              JOIN pg_catalog.pg_class table_relation ON table_relation.oid = dependency.refobjid
+              JOIN pg_catalog.pg_namespace table_namespace ON table_namespace.oid = table_relation.relnamespace
+              JOIN pg_catalog.pg_attribute table_attribute ON table_attribute.attrelid = table_relation.oid AND table_attribute.attnum = dependency.refobjsubid
+              WHERE dependency.classid = 'pg_class'::regclass AND dependency.refclassid = 'pg_class'::regclass AND dependency.deptype IN ('a', 'i') AND sequence_namespace.nspname = 'public'
+              UNION ALL
+              SELECT 'type|' || namespace.nspname || '|' || type_definition.typname || '|' || type_definition.typtype::text || '|' || type_definition.typcategory::text || '|' || pg_get_userbyid(type_definition.typowner) || '|' || coalesce(type_definition.typacl::text, '') || '|' || type_definition.typnotnull || '|' || type_definition.typispreferred || '|' || type_definition.typdelim::text || '|' || coalesce(type_definition.typdefault, '') || '|' || coalesce(obj_description(type_definition.oid, 'pg_type'), '')
+              FROM pg_catalog.pg_type type_definition JOIN pg_catalog.pg_namespace namespace ON namespace.oid = type_definition.typnamespace WHERE namespace.nspname = 'public'
+              UNION ALL
+              SELECT 'collation|' || namespace.nspname || '|' || collation_definition.collname || '|' || pg_get_userbyid(collation_definition.collowner) || '|' || collation_definition.collprovider::text || '|' || collation_definition.collisdeterministic || '|' || collation_definition.collencoding || '|' || coalesce(collation_definition.collcollate, '') || '|' || coalesce(collation_definition.collctype, '') || '|' || coalesce(collation_definition.colliculocale, '') || '|' || coalesce(obj_description(collation_definition.oid, 'pg_collation'), '')
+              FROM pg_catalog.pg_collation collation_definition JOIN pg_catalog.pg_namespace namespace ON namespace.oid = collation_definition.collnamespace WHERE namespace.nspname = 'public'
+              UNION ALL
+              SELECT 'rule|' || namespace.nspname || '|' || relation.relname || '|' || rewrite.rulename || '|' || rewrite.ev_enabled::text || '|' || rewrite.is_instead || '|' || pg_get_ruledef(rewrite.oid, true) || '|' || coalesce(obj_description(rewrite.oid, 'pg_rewrite'), '')
+              FROM pg_catalog.pg_rewrite rewrite JOIN pg_catalog.pg_class relation ON relation.oid = rewrite.ev_class JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace WHERE namespace.nspname = 'public'
+              UNION ALL
+              SELECT 'statistics|' || namespace.nspname || '|' || statistics.stxname || '|' || pg_get_userbyid(statistics.stxowner) || '|' || statistics.stxstattarget || '|' || statistics.stxkind::text || '|' || pg_get_statisticsobjdef(statistics.oid) || '|' || coalesce(obj_description(statistics.oid, 'pg_statistic_ext'), '')
+              FROM pg_catalog.pg_statistic_ext statistics JOIN pg_catalog.pg_namespace namespace ON namespace.oid = statistics.stxnamespace WHERE namespace.nspname = 'public'
               UNION ALL
               SELECT 'extension|' || extension.extname || '|' || extension.extversion || '|' || namespace.nspname
               FROM pg_catalog.pg_extension extension JOIN pg_catalog.pg_namespace namespace ON namespace.oid = extension.extnamespace WHERE namespace.nspname = 'public'
@@ -1042,14 +1073,15 @@ internal static partial class NpgsqlMigrationBackup
         var canonical = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string ?? string.Empty;
         canonical = canonical
             .Replace(Quote(schema), "<schema>", StringComparison.Ordinal)
-            .Replace(schema, "<schema>", StringComparison.Ordinal);
+            .Replace(schema, "<schema>", StringComparison.Ordinal)
+            .Replace("standard public schema", "standard <schema> schema", StringComparison.Ordinal);
         return canonical;
     }
 
     private static async Task ValidateGeneratedSchemaContractAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
-        string schemaSql,
+        string? schemaSql,
         string actualFingerprint,
         CancellationToken cancellationToken)
     {
@@ -1061,7 +1093,12 @@ internal static partial class NpgsqlMigrationBackup
             throw new InvalidOperationException("The PostgreSQL schema changed while its migration backup contract was being validated.");
         }
 
-        await ExecuteNonQueryAsync(connection, transaction, $"SAVEPOINT {Savepoint}; CREATE SCHEMA {Quote(schema)}", cancellationToken).ConfigureAwait(false);
+        await ValidateNoUnrepresentedObjectsAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+        await ExecuteNonQueryAsync(
+            connection,
+            transaction,
+            $"SAVEPOINT {Savepoint}; CREATE SCHEMA {Quote(schema)} AUTHORIZATION pg_database_owner; GRANT USAGE ON SCHEMA {Quote(schema)} TO PUBLIC; COMMENT ON SCHEMA {Quote(schema)} IS 'standard public schema'",
+            cancellationToken).ConfigureAwait(false);
         try
         {
             await ExecuteNonQueryAsync(
@@ -1069,10 +1106,14 @@ internal static partial class NpgsqlMigrationBackup
                 transaction,
                 $"SET LOCAL search_path = {Quote(schema)}, pg_catalog",
                 cancellationToken).ConfigureAwait(false);
-            var isolatedSql = schemaSql
-                .Replace("public.", Quote(schema) + ".", StringComparison.Ordinal)
-                .Replace("pg_catalog, public", "pg_catalog, " + Quote(schema), StringComparison.Ordinal);
-            await ExecuteNonQueryAsync(connection, transaction, isolatedSql, cancellationToken).ConfigureAwait(false);
+            if (!string.IsNullOrEmpty(schemaSql))
+            {
+                var isolatedSql = schemaSql
+                    .Replace("public.", Quote(schema) + ".", StringComparison.Ordinal)
+                    .Replace("pg_catalog, public", "pg_catalog, " + Quote(schema), StringComparison.Ordinal);
+                await ExecuteNonQueryAsync(connection, transaction, isolatedSql, cancellationToken).ConfigureAwait(false);
+            }
+
             var expectedCanonical = await ReadSchemaCanonicalAsync(
                 connection,
                 transaction,
@@ -1091,6 +1132,31 @@ internal static partial class NpgsqlMigrationBackup
                 transaction,
                 $"ROLLBACK TO SAVEPOINT {Savepoint}; RELEASE SAVEPOINT {Savepoint}",
                 cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task ValidateNoUnrepresentedObjectsAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        const string Sql = """
+            SELECT
+              (SELECT count(*) FROM pg_catalog.pg_operator object JOIN pg_catalog.pg_namespace namespace ON namespace.oid = object.oprnamespace WHERE namespace.nspname = 'public')
+              + (SELECT count(*) FROM pg_catalog.pg_conversion object JOIN pg_catalog.pg_namespace namespace ON namespace.oid = object.connamespace WHERE namespace.nspname = 'public')
+              + (SELECT count(*) FROM pg_catalog.pg_opclass object JOIN pg_catalog.pg_namespace namespace ON namespace.oid = object.opcnamespace WHERE namespace.nspname = 'public')
+              + (SELECT count(*) FROM pg_catalog.pg_opfamily object JOIN pg_catalog.pg_namespace namespace ON namespace.oid = object.opfnamespace WHERE namespace.nspname = 'public')
+              + (SELECT count(*) FROM pg_catalog.pg_ts_config object JOIN pg_catalog.pg_namespace namespace ON namespace.oid = object.cfgnamespace WHERE namespace.nspname = 'public')
+              + (SELECT count(*) FROM pg_catalog.pg_ts_dict object JOIN pg_catalog.pg_namespace namespace ON namespace.oid = object.dictnamespace WHERE namespace.nspname = 'public')
+              + (SELECT count(*) FROM pg_catalog.pg_ts_parser object JOIN pg_catalog.pg_namespace namespace ON namespace.oid = object.prsnamespace WHERE namespace.nspname = 'public')
+              + (SELECT count(*) FROM pg_catalog.pg_ts_template object JOIN pg_catalog.pg_namespace namespace ON namespace.oid = object.tmplnamespace WHERE namespace.nspname = 'public')
+            """;
+        await using var command = new NpgsqlCommand(Sql, connection, transaction);
+        var unsupported = (long)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+        if (unsupported != 0)
+        {
+            throw new NotSupportedException(
+                "The PostgreSQL public schema contains object classes outside the provider's exhaustive migration-backup schema contract. Refusing migration before mutation.");
         }
     }
 
@@ -1253,7 +1319,12 @@ internal static partial class NpgsqlMigrationBackup
 #pragma warning disable CA2000 // Ownership is transferred to ValidatedBackup, or the finally block disposes the stream before propagating failure.
                     staged = CreatePrivateFile(stagedPath);
 #pragma warning restore CA2000
-                    await source.CopyToAsync(staged, cancellationToken).ConfigureAwait(false);
+                    await using (var guardedStage = NpgsqlBackupFileSystem.WrapWrites(staged, $"write-restore-stage-{table.File}"))
+                    {
+                        await source.CopyToAsync(guardedStage, cancellationToken).ConfigureAwait(false);
+                        await guardedStage.FlushAsync(cancellationToken).ConfigureAwait(false);
+                    }
+
                     await staged.FlushAsync(cancellationToken).ConfigureAwait(false);
                     if (staged.Length != table.Length)
                     {
@@ -1339,14 +1410,29 @@ internal static partial class NpgsqlMigrationBackup
 
     private static void PrepareRoot(string root)
     {
-        if (Directory.Exists(root))
+        var canonicalRoot = Path.GetFullPath(root);
+        var parent = Path.GetDirectoryName(canonicalRoot)
+            ?? throw new InvalidOperationException("The PostgreSQL migration backup root must have an application-data parent directory.");
+        if (!Directory.Exists(parent))
         {
-            RejectLinks(root, root);
+            throw new DirectoryNotFoundException(
+                "The PostgreSQL migration backup root parent does not exist; refusing a recursively created, non-durable backup location.");
         }
 
-        Directory.CreateDirectory(root);
-        RejectLinks(root, root);
-        SetDirectoryPermissions(root);
+        RejectLinks(parent, parent);
+        if (Directory.Exists(canonicalRoot))
+        {
+            RejectLinks(canonicalRoot, canonicalRoot);
+            SetDirectoryPermissions(canonicalRoot);
+            NpgsqlBackupFileSystem.FlushDirectory(canonicalRoot, "flush-existing-root");
+            return;
+        }
+
+        Directory.CreateDirectory(canonicalRoot);
+        RejectLinks(canonicalRoot, canonicalRoot);
+        SetDirectoryPermissions(canonicalRoot);
+        NpgsqlBackupFileSystem.FlushDirectory(canonicalRoot, "flush-new-root");
+        NpgsqlBackupFileSystem.FlushDirectory(parent, "flush-root-parent-after-create");
     }
 
     private static string ResolveKeyDirectory(string root, string key, bool allowPartial)

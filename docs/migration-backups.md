@@ -31,11 +31,16 @@ caller.
 
 The manifest is written only after every stream has completed. A completion
 file binds its hash. Every table, schema, manifest, and completion file is forced
-to stable storage; the partial directory and parent are synchronized, the
-directory is atomically renamed, and the parent is synchronized again before the key is returned. Any flush,
-rename, disk-exhaustion, cancellation, I/O, or PostgreSQL failure removes only
-the uniquely named provider-owned partial directory. A later creation also
-scavenges marker-shaped crash remnants. No incomplete key can be restored.
+to stable storage. On first use, the new backup root is synchronized and its
+already-existing application-data parent is synchronized to durably record the
+new directory entry. Recursively creating a missing parent is refused. For each
+key, the partial directory and root are synchronized, the directory is
+atomically renamed, and the root is synchronized again before the key is
+returned. Failure to synchronize a file or directory is fail-closed on every
+supported platform. Any flush, rename, partial-write disk exhaustion,
+cancellation, I/O, or PostgreSQL failure removes only the uniquely named
+provider-owned partial directory. A later creation also scavenges marker-shaped
+crash remnants. No incomplete key can be restored.
 
 The only compact backup is a migration-zero sentinel. It is accepted only when
 the public schema contains no table, relation, routine, collation, or type.
@@ -46,9 +51,17 @@ rejected. A populated application database must match the exact supported
 Jellyfin model tables, complete column types/facets, functions, triggers,
 constraints, indexes, owned identity sequences, policies/RLS, owners, grants,
 extensions, and schema properties and must contain the plugin baseline or
-successor migration. Extra views/materialized views/sequences and altered
-sequence definitions are rejected. Unknown or drifted populated layouts fail
-before migration rather than receiving a false backup key.
+successor migration. The canonical contract also includes schema, relation,
+index, sequence, function, type, constraint, trigger, rule, and extended-
+statistics ownership and ACLs; exact sequence-to-column dependency edges;
+replica identity; persistence, tablespace, access method, storage, reloptions;
+column defaults, identity/generated state, collation and precision facets; and
+comments. Public-schema object classes that the representation does not support
+are explicitly rejected. Extra views/materialized views/sequences and altered
+sequence definitions are rejected. The same exhaustive fingerprint is checked
+after every restore, including migration-zero and history-only restores.
+Unknown or drifted layouts fail before migration rather than receiving a false
+backup key.
 
 ## Restore and cleanup
 
@@ -79,6 +92,9 @@ generated columns, migration history, schema objects, exact identity reuse,
 wrong-database and corrupt-file rejection before mutation, corrupt binary COPY
 rollback after destructive work begins, symlink rejection, restrictive modes,
 pre-canceled cleanup, crash-remnant scavenging, concurrent serialization, and
-idempotent cleanup. The fixture login is the normal restricted database
-owner: it has no superuser, `CREATEDB`, `CREATEROLE`, replication, or bypass-RLS
-privilege.
+idempotent cleanup. Deterministic bounded-write tests fail after only a few
+bytes of table COPY, schema, manifest, and immutable restore-staging output;
+they prove that no key or staging remnant survives, the pre-restore database is
+untouched, and all file handles are released for an immediate retry. The
+fixture login is the normal restricted database owner: it has no superuser,
+`CREATEDB`, `CREATEROLE`, replication, or bypass-RLS privilege.
