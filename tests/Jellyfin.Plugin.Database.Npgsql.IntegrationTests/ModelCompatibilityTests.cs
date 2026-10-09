@@ -9,6 +9,7 @@ using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -209,6 +210,330 @@ public sealed class ModelCompatibilityTests
     }
 
     [Fact]
+    public async Task ChunkInterning_InverseOrderWholeTransactionsRetryForNewAndExistingNodes()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await CreateSchemaAsync(database.RuntimeConnectionString, cancellationToken);
+            var firstValue = "inverse-a-" + Guid.NewGuid().ToString("N");
+            var secondValue = "inverse-b-" + Guid.NewGuid().ToString("N");
+
+            var firstReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var secondReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var forward = InternPairWithRetryAsync(
+                database.RuntimeConnectionString,
+                firstValue,
+                secondValue,
+                firstReady,
+                secondReady,
+                cancellationToken);
+            var reverse = InternPairWithRetryAsync(
+                database.RuntimeConnectionString,
+                secondValue,
+                firstValue,
+                secondReady,
+                firstReady,
+                cancellationToken);
+            var newNodeResults = await Task.WhenAll(forward, reverse);
+            Assert.Equal(newNodeResults[0].First, newNodeResults[1].Second);
+            Assert.Equal(newNodeResults[0].Second, newNodeResults[1].First);
+
+            await using var countContext = CreateContext(database.RuntimeConnectionString);
+            var nodeCount = await ScalarAsync<long>(
+                countContext,
+                "SELECT count(*) FROM public.\"__JellyfinTextNodes\"",
+                cancellationToken);
+            Assert.Equal(4, nodeCount);
+
+            firstReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            secondReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            forward = InternPairWithRetryAsync(
+                database.RuntimeConnectionString,
+                firstValue,
+                secondValue,
+                firstReady,
+                secondReady,
+                cancellationToken);
+            reverse = InternPairWithRetryAsync(
+                database.RuntimeConnectionString,
+                secondValue,
+                firstValue,
+                secondReady,
+                firstReady,
+                cancellationToken);
+            var existingNodeResults = await Task.WhenAll(forward, reverse);
+            Assert.Equal(newNodeResults[0], existingNodeResults[0]);
+            Assert.Equal(newNodeResults[1], existingNodeResults[1]);
+            Assert.Equal(
+                nodeCount,
+                await ScalarAsync<long>(
+                    countContext,
+                    "SELECT count(*) FROM public.\"__JellyfinTextNodes\"",
+                    cancellationToken));
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Fact]
+    public async Task LikeExpressions_MatchSQLiteForWildcardsEscapesAsciiUnicodeAndNulls()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await CreateSchemaAsync(database.RuntimeConnectionString, cancellationToken);
+            await using var context = CreateContext(database.RuntimeConnectionString);
+            await using var sqlite = new SqliteConnection("Data Source=:memory:");
+            await sqlite.OpenAsync(cancellationToken);
+            var cases = new (string? Match, string? Pattern, string? Escape, bool ExplicitEscape)[]
+            {
+                ("100%_done", "100%_done", null, false),
+                ("axb", "a_b", null, false),
+                ("a\\b", "a\\b", null, false),
+                ("a%b", "aX%b", "X", true),
+                ("a_b", "a\\_b", "\\", true),
+                ("ASCII", "ascii", null, false),
+                ("CAFÉ", "café", null, false),
+                (null, "%", null, false),
+                ("value", null, null, false),
+                ("value", "value", string.Empty, true)
+            };
+
+            foreach (var testCase in cases)
+            {
+                var row = new ActivityLog("like-" + Guid.NewGuid().ToString("N"), "Test", Guid.Empty)
+                {
+                    Overview = testCase.Match
+                };
+                context.ActivityLogs.Add(row);
+                await context.SaveChangesAsync(cancellationToken);
+
+                var sqliteResult = await EvaluateSqliteLikeAsync(
+                    sqlite,
+                    testCase.Match,
+                    testCase.Pattern,
+                    testCase.Escape,
+                    testCase.ExplicitEscape,
+                    cancellationToken);
+                var postgreSqlResult = await Record.ExceptionAsync(async () =>
+                {
+                    var query = context.ActivityLogs.Where(entry => entry.Id == row.Id);
+                    query = testCase.ExplicitEscape
+                        ? query.Where(entry => EF.Functions.Like(
+                            entry.Overview!,
+                            testCase.Pattern!,
+                            testCase.Escape!))
+                        : query.Where(entry => EF.Functions.Like(entry.Overview!, testCase.Pattern!));
+                    var matched = await query.AnyAsync(cancellationToken);
+                    Assert.Equal(sqliteResult.Matched, matched);
+                });
+
+                if (sqliteResult.Exception is null)
+                {
+                    Assert.Null(postgreSqlResult);
+                }
+                else
+                {
+                    Assert.NotNull(postgreSqlResult);
+                }
+            }
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Fact]
+    public async Task InternedMappings_PreserveBoundariesNormalizationAndTriggerOwnedIdentityForEveryMapping()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await CreateSchemaAsync(database.RuntimeConnectionString, cancellationToken);
+            var values = new[]
+            {
+                string.Empty,
+                new string('a', 127),
+                new string('a', 128),
+                new string('a', 129),
+                new string('p', 128),
+                new string('p', 128) + "terminal",
+                "caf\u00E9",
+                "cafe\u0301"
+            };
+            var itemId = Guid.NewGuid();
+            var peopleId = Guid.NewGuid();
+            Guid userId;
+
+            await using (var context = CreateContext(database.RuntimeConnectionString))
+            {
+                var item = CreateBaseItem(itemId, "boundaries");
+                var person = new People { Id = peopleId, Name = "Boundary Person", PersonType = "Actor" };
+                var user = new User("boundary-user", "test-auth", "test-reset");
+                userId = user.Id;
+                context.AddRange(item, person, user);
+                foreach (var value in values)
+                {
+                    context.BaseItemProviders.Add(new BaseItemProvider
+                    {
+                        Item = item,
+                        ItemId = itemId,
+                        ProviderId = value,
+                        ProviderValue = "provider-value"
+                    });
+                    context.PeopleBaseItemMap.Add(new PeopleBaseItemMap
+                    {
+                        Item = item,
+                        ItemId = itemId,
+                        People = person,
+                        PeopleId = peopleId,
+                        Role = value
+                    });
+                    context.UserData.Add(new UserData
+                    {
+                        Item = item,
+                        ItemId = itemId,
+                        User = user,
+                        UserId = userId,
+                        CustomDataKey = value
+                    });
+                    context.ItemValues.Add(CreateItemValue(value));
+                    context.CustomItemDisplayPreferences.Add(
+                        new CustomItemDisplayPreferences(userId, itemId, "boundaries", value, "value"));
+                }
+
+                await context.SaveChangesAsync(cancellationToken);
+            }
+
+            await using (var context = CreateContext(database.RuntimeConnectionString))
+            {
+                Assert.Equal(values.Length, await context.BaseItemProviders.CountAsync(cancellationToken));
+                Assert.Equal(values.Length, await context.PeopleBaseItemMap.CountAsync(cancellationToken));
+                Assert.Equal(values.Length, await context.UserData.CountAsync(cancellationToken));
+                Assert.Equal(values.Length, await context.ItemValues.CountAsync(cancellationToken));
+                Assert.Equal(values.Length, await context.CustomItemDisplayPreferences.CountAsync(cancellationToken));
+                Assert.Equal(values.Length, await context.BaseItemProviders.Select(value => EF.Property<long>(value, "ProviderIdInternId")).Distinct().CountAsync(cancellationToken));
+                Assert.Equal(values.Length, await context.PeopleBaseItemMap.Select(value => EF.Property<long>(value, "RoleInternId")).Distinct().CountAsync(cancellationToken));
+                Assert.Equal(values.Length, await context.UserData.Select(value => EF.Property<long>(value, "CustomDataKeyInternId")).Distinct().CountAsync(cancellationToken));
+                Assert.Equal(values.Length, await context.ItemValues.Select(value => EF.Property<long>(value, "ValueInternId")).Distinct().CountAsync(cancellationToken));
+                Assert.Equal(values.Length, await context.CustomItemDisplayPreferences.Select(value => EF.Property<long>(value, "KeyInternId")).Distinct().CountAsync(cancellationToken));
+
+                await context.Database.ExecuteSqlRawAsync("UPDATE \"BaseItemProviders\" SET \"ProviderIdInternId\" = 0", cancellationToken);
+                await context.Database.ExecuteSqlRawAsync("UPDATE \"PeopleBaseItemMap\" SET \"RoleInternId\" = 0", cancellationToken);
+                await context.Database.ExecuteSqlRawAsync("UPDATE \"UserData\" SET \"CustomDataKeyInternId\" = 0", cancellationToken);
+                await context.Database.ExecuteSqlRawAsync("UPDATE \"ItemValues\" SET \"ValueInternId\" = 0", cancellationToken);
+                await context.Database.ExecuteSqlRawAsync("UPDATE \"CustomItemDisplayPreferences\" SET \"KeyInternId\" = 0", cancellationToken);
+                Assert.Equal(0, await CountZeroInternIdsAsync(context, cancellationToken));
+
+                var updated = "updated-" + new string('u', 129);
+                await context.Database.ExecuteSqlInterpolatedAsync($"UPDATE \"BaseItemProviders\" SET \"ProviderId\" = {updated} WHERE \"ProviderId\" = {values[0]}", cancellationToken);
+                await context.Database.ExecuteSqlInterpolatedAsync($"UPDATE \"PeopleBaseItemMap\" SET \"Role\" = {updated} WHERE \"Role\" = {values[0]}", cancellationToken);
+                await context.Database.ExecuteSqlInterpolatedAsync($"UPDATE \"UserData\" SET \"CustomDataKey\" = {updated} WHERE \"CustomDataKey\" = {values[0]}", cancellationToken);
+                await context.Database.ExecuteSqlInterpolatedAsync($"UPDATE \"ItemValues\" SET \"Value\" = {updated} WHERE \"Value\" = {values[0]}", cancellationToken);
+                await context.Database.ExecuteSqlInterpolatedAsync($"UPDATE \"CustomItemDisplayPreferences\" SET \"Key\" = {updated} WHERE \"Key\" = {values[0]}", cancellationToken);
+                Assert.Equal(5, await CountUpdatedInternedMappingsAsync(context, updated, cancellationToken));
+
+                var nodesBeforeDelete = await ScalarAsync<long>(
+                    context,
+                    "SELECT count(*) FROM public.\"__JellyfinTextNodes\"",
+                    cancellationToken);
+                await context.Database.ExecuteSqlRawAsync("DELETE FROM \"BaseItemProviders\"", cancellationToken);
+                await context.Database.ExecuteSqlRawAsync("DELETE FROM \"PeopleBaseItemMap\"", cancellationToken);
+                await context.Database.ExecuteSqlRawAsync("DELETE FROM \"UserData\"", cancellationToken);
+                await context.Database.ExecuteSqlRawAsync("DELETE FROM \"ItemValues\"", cancellationToken);
+                await context.Database.ExecuteSqlRawAsync("DELETE FROM \"CustomItemDisplayPreferences\"", cancellationToken);
+                Assert.Equal(
+                    nodesBeforeDelete,
+                    await ScalarAsync<long>(
+                        context,
+                        "SELECT count(*) FROM public.\"__JellyfinTextNodes\"",
+                        cancellationToken));
+
+                const string restored = "restored-caf\u00E9";
+                await context.Database.ExecuteSqlInterpolatedAsync($"INSERT INTO \"BaseItemProviders\" (\"ItemId\", \"ProviderId\", \"ProviderValue\") VALUES ({itemId}, {restored}, {"value"})", cancellationToken);
+                await context.Database.ExecuteSqlInterpolatedAsync($"INSERT INTO \"PeopleBaseItemMap\" (\"ItemId\", \"PeopleId\", \"Role\") VALUES ({itemId}, {peopleId}, {restored})", cancellationToken);
+                await context.Database.ExecuteSqlInterpolatedAsync($"INSERT INTO \"UserData\" (\"ItemId\", \"UserId\", \"CustomDataKey\", \"PlaybackPositionTicks\", \"PlayCount\", \"IsFavorite\", \"Played\") VALUES ({itemId}, {userId}, {restored}, {0L}, {0}, {false}, {false})", cancellationToken);
+                await context.Database.ExecuteSqlInterpolatedAsync($"INSERT INTO \"ItemValues\" (\"ItemValueId\", \"Type\", \"Value\", \"CleanValue\") VALUES ({Guid.NewGuid()}, {(int)ItemValueType.Genre}, {restored}, {restored})", cancellationToken);
+                await context.Database.ExecuteSqlInterpolatedAsync($"INSERT INTO \"CustomItemDisplayPreferences\" (\"UserId\", \"ItemId\", \"Client\", \"Key\", \"Value\") VALUES ({userId}, {itemId}, {"boundaries"}, {restored}, {"value"})", cancellationToken);
+                Assert.Equal(5, await CountUpdatedInternedMappingsAsync(context, restored, cancellationToken));
+            }
+
+            await using (var invalidContext = CreateContext(database.RuntimeConnectionString))
+            {
+                invalidContext.ItemValues.Add(CreateItemValue("nul\0rejected"));
+                await Assert.ThrowsAsync<DbUpdateException>(() => invalidContext.SaveChangesAsync(cancellationToken));
+            }
+
+            await using (var invalidContext = CreateContext(database.RuntimeConnectionString))
+            {
+                invalidContext.ItemValues.Add(CreateItemValue("surrogate-\uD800"));
+                await Assert.ThrowsAsync<DbUpdateException>(() => invalidContext.SaveChangesAsync(cancellationToken));
+            }
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Fact]
+    public async Task ChunkInterning_AppendOnlyGrowthHasExactDocumentedPerValueBound()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await CreateSchemaAsync(database.RuntimeConnectionString, cancellationToken);
+            await using var context = CreateContext(database.RuntimeConnectionString);
+            context.ItemValues.AddRange(
+                CreateItemValue(string.Empty),
+                CreateItemValue(new string('a', 127)),
+                CreateItemValue(new string('b', 128)),
+                CreateItemValue(new string('c', 129)));
+            await context.SaveChangesAsync(cancellationToken);
+
+            // One terminal node per distinct value plus ceil(UTF8-bytes / 128)
+            // data nodes: 1 + 2 + 2 + 3 = 8. Distinct first bytes avoid sharing.
+            Assert.Equal(
+                8,
+                await ScalarAsync<long>(
+                    context,
+                    "SELECT count(*) FROM public.\"__JellyfinTextNodes\"",
+                    cancellationToken));
+            await context.ItemValues.ExecuteDeleteAsync(cancellationToken);
+            Assert.Equal(
+                8,
+                await ScalarAsync<long>(
+                    context,
+                    "SELECT count(*) FROM public.\"__JellyfinTextNodes\"",
+                    cancellationToken));
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Fact]
     public async Task QueryInterceptor_ProvidesSqliteCompatibleActualExpressionSemantics()
     {
         var options = PostgreSqlTestOptions.FromEnvironment();
@@ -231,10 +556,13 @@ public sealed class ModelCompatibilityTests
             await context.SaveChangesAsync(cancellationToken);
 
             Assert.Single(await context.ActivityLogs
-                .Where(entry => EF.Functions.Like(entry.Name, "%scan 100\\%\\_done"))
+                .Where(entry => EF.Functions.Like(entry.Name, "%scan 100\\%\\_done", "\\"))
                 .ToArrayAsync(cancellationToken));
             Assert.Single(await context.ActivityLogs
-                .Where(entry => EF.Functions.Like(entry.Name, "%\\\\Root"))
+                .Where(entry => EF.Functions.Like(entry.Name, "%\\\\Root", "\\"))
+                .ToArrayAsync(cancellationToken));
+            Assert.Empty(await context.ActivityLogs
+                .Where(entry => EF.Functions.Like(entry.Name, "%scan 100\\%\\_done"))
                 .ToArrayAsync(cancellationToken));
             Assert.Empty(await context.ActivityLogs
                 .Where(entry => EF.Functions.Like(entry.Name, "%café%"))
@@ -272,34 +600,74 @@ public sealed class ModelCompatibilityTests
         {
             await CreateSchemaAsync(database.RuntimeConnectionString, cancellationToken);
             await using var context = CreateContext(database.RuntimeConnectionString);
-            var probes = new Dictionary<string, string>(StringComparer.Ordinal)
+            context.BaseItems.Add(CreateBaseItem(Guid.NewGuid(), "planner"));
+            context.Peoples.Add(new People { Id = Guid.NewGuid(), Name = "Mixed Planner Person", PersonType = "Actor" });
+            context.ItemValues.Add(CreateItemValue("planner-target"));
+            await context.SaveChangesAsync(cancellationToken);
+
+            var probes = new Dictionary<string, IQueryable<Guid>>(StringComparer.Ordinal)
             {
-                ["IX_BaseItems_Path"] = "SELECT \"Id\" FROM \"BaseItems\" WHERE \"Path\" = 'not-present'",
-                ["IX_BaseItems_Name"] = "SELECT \"Id\" FROM \"BaseItems\" WHERE \"Name\" = 'not-present'",
-                ["IX_BaseItems_CleanName"] = "SELECT \"Id\" FROM \"BaseItems\" WHERE \"CleanName\" = 'not-present'",
-                ["IX_BaseItems_PresentationUniqueKey"] = "SELECT \"Id\" FROM \"BaseItems\" WHERE \"PresentationUniqueKey\" = 'not-present'",
-                ["IX_BaseItems_SeriesPresentationUniqueKey"] = "SELECT \"Id\" FROM \"BaseItems\" WHERE \"SeriesPresentationUniqueKey\" = 'not-present'",
-                ["IX_BaseItems_SeriesName"] = "SELECT \"Id\" FROM \"BaseItems\" WHERE \"SeriesName\" = 'not-present'",
-                ["IX_BaseItems_SortName"] = "SELECT \"Id\" FROM \"BaseItems\" WHERE \"SortName\" = 'not-present'",
-                ["IX_BaseItems_Npgsql_Type"] = "SELECT \"Id\" FROM \"BaseItems\" ORDER BY \"Type\" LIMIT 1",
-                ["IX_BaseItems_Npgsql_Type_TopParentId"] = "SELECT \"Id\" FROM \"BaseItems\" ORDER BY \"Type\", \"TopParentId\" LIMIT 1",
-                ["IX_BaseItems_Npgsql_Type_IsFolder_IsVirtualItem"] = "SELECT \"Id\" FROM \"BaseItems\" ORDER BY \"Type\", \"IsFolder\", \"IsVirtualItem\" LIMIT 1",
-                ["IX_BaseItems_Npgsql_IsFolder_TopParentId_IsVirtualItem"] = "SELECT \"Id\" FROM \"BaseItems\" ORDER BY \"IsFolder\", \"TopParentId\", \"IsVirtualItem\" LIMIT 1",
-                ["IX_BaseItems_Npgsql_MediaType_TopParentId_IsVirtualItem"] = "SELECT \"Id\" FROM \"BaseItems\" ORDER BY \"MediaType\", \"TopParentId\", \"IsVirtualItem\" LIMIT 1",
-                ["IX_BaseItems_Npgsql_Type_ParentIndexNumber_IndexNumber"] = "SELECT \"Id\" FROM \"BaseItems\" ORDER BY \"Type\", \"ParentIndexNumber\", \"IndexNumber\" LIMIT 1",
-                ["IX_BaseItems_Npgsql_Type_TopParentId_IsVirtualItem_DateCreated"] = "SELECT \"Id\" FROM \"BaseItems\" ORDER BY \"Type\", \"TopParentId\", \"IsVirtualItem\", \"DateCreated\" LIMIT 1"
+                ["IX_BaseItems_Path"] = context.BaseItems.Where(item => item.Path == "not-present").Select(item => item.Id),
+                ["IX_BaseItems_Name"] = context.BaseItems.Where(item => item.Name == "not-present").Select(item => item.Id),
+                ["IX_BaseItems_CleanName"] = context.BaseItems.Where(item => item.CleanName == "not-present").Select(item => item.Id),
+                ["IX_BaseItems_PresentationUniqueKey"] = context.BaseItems.Where(item => item.PresentationUniqueKey == "not-present").Select(item => item.Id),
+                ["IX_BaseItems_SeriesPresentationUniqueKey"] = context.BaseItems.Where(item => item.SeriesPresentationUniqueKey == "not-present").Select(item => item.Id),
+                ["IX_BaseItems_SeriesName"] = context.BaseItems.Where(item => item.SeriesName == "not-present").Select(item => item.Id),
+                ["IX_BaseItems_SortName"] = context.BaseItems.Where(item => item.SortName == "not-present").Select(item => item.Id),
+                ["IX_BaseItems_Npgsql_Type"] = context.BaseItems.Where(item => item.Type == "Movie").Select(item => item.Id),
+                ["IX_BaseItems_Npgsql_Type_TopParentId"] = context.BaseItems.Where(item => item.Type == "Movie" && item.TopParentId == Guid.Empty).Select(item => item.Id),
+                ["IX_BaseItems_Npgsql_Type_IsFolder_IsVirtualItem"] = context.BaseItems.Where(item => item.Type == "Movie" && !item.IsFolder && !item.IsVirtualItem).Select(item => item.Id),
+                ["IX_BaseItems_Npgsql_IsFolder_TopParentId_IsVirtualItem"] = context.BaseItems.Where(item => !item.IsFolder && item.TopParentId == Guid.Empty && !item.IsVirtualItem).Select(item => item.Id),
+                ["IX_BaseItems_Npgsql_MediaType_TopParentId_IsVirtualItem"] = context.BaseItems.Where(item => item.MediaType == "Video" && item.TopParentId == Guid.Empty && !item.IsVirtualItem).Select(item => item.Id),
+                ["IX_BaseItems_Npgsql_Type_ParentIndexNumber_IndexNumber"] = context.BaseItems.Where(item => item.Type == "Movie" && item.ParentIndexNumber == 0 && item.IndexNumber == 0).Select(item => item.Id),
+                ["IX_BaseItems_Npgsql_Type_TopParentId_IsVirtualItem_DateCreated"] = context.BaseItems.Where(item => item.Type == "Movie" && item.TopParentId == Guid.Empty && !item.IsVirtualItem && item.DateCreated == new DateTime(2026, 10, 9, 1, 2, 3, DateTimeKind.Utc)).Select(item => item.Id)
             };
 
-            foreach (var (expectedIndexFragment, sql) in probes)
+            foreach (var (expectedIndexFragment, query) in probes)
             {
                 var plan = await ExplainWithOnlyIndexAsync(
                     context,
                     expectedIndexFragment,
-                    sql,
+                    query.ToQueryString(),
                     cancellationToken);
                 Assert.Contains("Index", plan, StringComparison.Ordinal);
                 Assert.Contains(expectedIndexFragment, plan, StringComparison.Ordinal);
             }
+
+            var peoplePlan = await ExplainQueryAsync(
+                context,
+                context.Peoples.Where(person => person.Name.StartsWith("MIXED")).Select(person => person.Id),
+                cancellationToken);
+            Assert.Contains("IX_Peoples_Npgsql_NameLowerPrefix", peoplePlan, StringComparison.Ordinal);
+            Assert.Contains("Index Cond", peoplePlan, StringComparison.Ordinal);
+
+            var itemValuePlan = await ExplainQueryAsync(
+                context,
+                context.ItemValues
+                    .Where(value => value.Type == ItemValueType.Genre && value.Value == "planner-target")
+                    .Select(value => value.ItemValueId),
+                cancellationToken);
+            Assert.Contains("IX_ItemValues_Value", itemValuePlan, StringComparison.Ordinal);
+            Assert.Contains("planner-target", itemValuePlan, StringComparison.Ordinal);
+
+            var ascendingPlan = await ExplainQueryAsync(
+                context,
+                context.BaseItems.OrderBy(item => item.SortName),
+                cancellationToken);
+            Assert.Contains("Sort", ascendingPlan, StringComparison.Ordinal);
+            Assert.Contains("IS NULL", ascendingPlan, StringComparison.Ordinal);
+            var descendingPlan = await ExplainQueryAsync(
+                context,
+                context.BaseItems.OrderByDescending(item => item.SortName),
+                cancellationToken);
+            Assert.Contains("DESC", descendingPlan, StringComparison.Ordinal);
+            Assert.Contains("IS NULL", descendingPlan, StringComparison.Ordinal);
+            var thenByPlan = await ExplainQueryAsync(
+                context,
+                context.BaseItems.OrderBy(item => item.Type).ThenBy(item => item.SortName),
+                cancellationToken);
+            Assert.Contains("IS NULL", thenByPlan, StringComparison.Ordinal);
+            Assert.Contains("Sort Key", thenByPlan, StringComparison.Ordinal);
 
             var extensionCount = await ScalarAsync<long>(
                 context,
@@ -531,6 +899,106 @@ public sealed class ModelCompatibilityTests
         }
     }
 
+    private static async Task<(long First, long Second)> InternPairWithRetryAsync(
+        string connectionString,
+        string firstValue,
+        string secondValue,
+        TaskCompletionSource ownFirstReady,
+        TaskCompletionSource otherFirstReady,
+        CancellationToken cancellationToken)
+    {
+        await using var context = CreateContext(connectionString);
+        var strategy = context.Database.CreateExecutionStrategy();
+        var attempt = 0;
+        return await strategy.ExecuteAsync(async () =>
+        {
+            var currentAttempt = Interlocked.Increment(ref attempt);
+            await using var transaction = await context.Database.BeginTransactionAsync(cancellationToken);
+            var first = await InternTextAsync(context, firstValue, cancellationToken);
+            if (currentAttempt == 1)
+            {
+                ownFirstReady.TrySetResult();
+                await otherFirstReady.Task.WaitAsync(cancellationToken);
+            }
+
+            var second = await InternTextAsync(context, secondValue, cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+            return (first, second);
+        });
+    }
+
+    private static Task<long> CountZeroInternIdsAsync(
+        JellyfinDbContext context,
+        CancellationToken cancellationToken)
+        => ScalarAsync<long>(
+            context,
+            "SELECT "
+            + "(SELECT count(*) FROM \"BaseItemProviders\" WHERE \"ProviderIdInternId\" = 0) + "
+            + "(SELECT count(*) FROM \"PeopleBaseItemMap\" WHERE \"RoleInternId\" = 0) + "
+            + "(SELECT count(*) FROM \"UserData\" WHERE \"CustomDataKeyInternId\" = 0) + "
+            + "(SELECT count(*) FROM \"ItemValues\" WHERE \"ValueInternId\" = 0) + "
+            + "(SELECT count(*) FROM \"CustomItemDisplayPreferences\" WHERE \"KeyInternId\" = 0)",
+            cancellationToken);
+
+    private static async Task<int> CountUpdatedInternedMappingsAsync(
+        JellyfinDbContext context,
+        string value,
+        CancellationToken cancellationToken)
+    {
+        var count = 0;
+        count += await context.BaseItemProviders.AnyAsync(entity => entity.ProviderId == value, cancellationToken) ? 1 : 0;
+        count += await context.PeopleBaseItemMap.AnyAsync(entity => entity.Role == value, cancellationToken) ? 1 : 0;
+        count += await context.UserData.AnyAsync(entity => entity.CustomDataKey == value, cancellationToken) ? 1 : 0;
+        count += await context.ItemValues.AnyAsync(entity => entity.Value == value, cancellationToken) ? 1 : 0;
+        count += await context.CustomItemDisplayPreferences.AnyAsync(entity => entity.Key == value, cancellationToken) ? 1 : 0;
+        return count;
+    }
+
+    private static async Task<long> InternTextAsync(
+        JellyfinDbContext context,
+        string value,
+        CancellationToken cancellationToken)
+    {
+        await using var command = context.Database.GetDbConnection().CreateCommand();
+        command.Transaction = context.Database.CurrentTransaction!.GetDbTransaction();
+        command.CommandText = "SELECT public.\"__jellyfin_intern_text\"(@value)";
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = "value";
+        parameter.Value = value;
+        command.Parameters.Add(parameter);
+        return (long)(await command.ExecuteScalarAsync(cancellationToken))!;
+    }
+
+    private static async Task<(bool Matched, Exception? Exception)> EvaluateSqliteLikeAsync(
+        SqliteConnection connection,
+        string? match,
+        string? pattern,
+        string? escape,
+        bool explicitEscape,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = explicitEscape
+                ? "SELECT CASE WHEN @match LIKE @pattern ESCAPE @escape THEN 1 ELSE 0 END"
+                : "SELECT CASE WHEN @match LIKE @pattern THEN 1 ELSE 0 END";
+            command.Parameters.AddWithValue("match", (object?)match ?? DBNull.Value);
+            command.Parameters.AddWithValue("pattern", (object?)pattern ?? DBNull.Value);
+            if (explicitEscape)
+            {
+                command.Parameters.AddWithValue("escape", (object?)escape ?? DBNull.Value);
+            }
+
+            var result = Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken), System.Globalization.CultureInfo.InvariantCulture);
+            return (result == 1, null);
+        }
+        catch (SqliteException exception)
+        {
+            return (false, exception);
+        }
+    }
+
     private static async Task CreateSchemaAsync(string connectionString, CancellationToken cancellationToken)
     {
         await using var context = CreateContext(connectionString);
@@ -602,6 +1070,39 @@ public sealed class ModelCompatibilityTests
             while (await planReader.ReadAsync(cancellationToken))
             {
                 lines.Add(planReader.GetString(0));
+            }
+        }
+
+        await transaction.RollbackAsync(cancellationToken);
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private static async Task<string> ExplainQueryAsync<TEntity>(
+        JellyfinDbContext context,
+        IQueryable<TEntity> query,
+        CancellationToken cancellationToken)
+    {
+        var sql = query.ToQueryString();
+        Assert.DoesNotContain("-- @", sql, StringComparison.Ordinal);
+        await context.Database.OpenConnectionAsync(cancellationToken);
+        await using var transaction = await context.Database.GetDbConnection()
+            .BeginTransactionAsync(cancellationToken);
+        await using (var disableScan = context.Database.GetDbConnection().CreateCommand())
+        {
+            disableScan.Transaction = transaction;
+            disableScan.CommandText = "SET LOCAL enable_seqscan = off";
+            await disableScan.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        var lines = new List<string>();
+        await using (var command = context.Database.GetDbConnection().CreateCommand())
+        {
+            command.Transaction = transaction;
+            command.CommandText = "EXPLAIN (COSTS OFF) " + sql;
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                lines.Add(reader.GetString(0));
             }
         }
 

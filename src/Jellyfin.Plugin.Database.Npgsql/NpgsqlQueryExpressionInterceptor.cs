@@ -20,8 +20,17 @@ public sealed class NpgsqlQueryExpressionInterceptor : IQueryExpressionIntercept
     private static readonly MethodInfo AsciiLowerMethod = typeof(NpgsqlQueryDbFunctions)
         .GetMethod(nameof(NpgsqlQueryDbFunctions.AsciiLower), BindingFlags.Public | BindingFlags.Static)!;
 
+    private static readonly MethodInfo AsciiPrefixMethod = typeof(NpgsqlQueryDbFunctions)
+        .GetMethod(nameof(NpgsqlQueryDbFunctions.AsciiPrefix), BindingFlags.Public | BindingFlags.Static)!;
+
     private static readonly MethodInfo SqliteLikeMethod = typeof(NpgsqlQueryDbFunctions)
-        .GetMethod(nameof(NpgsqlQueryDbFunctions.SqliteLike), BindingFlags.Public | BindingFlags.Static)!;
+        .GetMethod(
+            nameof(NpgsqlQueryDbFunctions.SqliteLike),
+            BindingFlags.Public | BindingFlags.Static,
+            [typeof(string), typeof(string)])!;
+
+    private static readonly MethodInfo SqliteLikeWithEscapeMethod = typeof(NpgsqlQueryDbFunctions)
+        .GetMethod(nameof(NpgsqlQueryDbFunctions.SqliteLikeWithEscape), BindingFlags.Public | BindingFlags.Static)!;
 
     /// <summary>Gets the stateless shared interceptor.</summary>
     public static NpgsqlQueryExpressionInterceptor Instance { get; } = new();
@@ -70,14 +79,16 @@ public sealed class NpgsqlQueryExpressionInterceptor : IQueryExpressionIntercept
 
         private static MethodCallExpression RewriteLike(MethodCallExpression node)
         {
-            var escape = node.Arguments.Count == 4
-                ? node.Arguments[3]
-                : Expression.Constant("\\");
-            return Expression.Call(
-                SqliteLikeMethod,
-                node.Arguments[1],
-                node.Arguments[2],
-                escape);
+            return node.Arguments.Count == 4
+                ? Expression.Call(
+                    SqliteLikeWithEscapeMethod,
+                    node.Arguments[1],
+                    node.Arguments[2],
+                    node.Arguments[3])
+                : Expression.Call(
+                    SqliteLikeMethod,
+                    node.Arguments[1],
+                    node.Arguments[2]);
         }
 
         private static bool IsPeopleNameStartsWith(MethodCallExpression node)
@@ -94,7 +105,7 @@ public sealed class NpgsqlQueryExpressionInterceptor : IQueryExpressionIntercept
                 && member.Expression?.Type == typeof(Jellyfin.Database.Implementations.Entities.People);
         }
 
-        private static MethodCallExpression RewritePeopleNameStartsWith(MethodCallExpression node)
+        private static BinaryExpression RewritePeopleNameStartsWith(MethodCallExpression node)
         {
             var member = (MemberExpression)node.Object!;
             var loweredName = Expression.Call(
@@ -102,7 +113,14 @@ public sealed class NpgsqlQueryExpressionInterceptor : IQueryExpressionIntercept
                 member.Expression!,
                 Expression.Constant("NameLower"));
             var loweredPrefix = Expression.Call(AsciiLowerMethod, node.Arguments[0]);
-            return Expression.Call(loweredName, node.Method, loweredPrefix);
+            var boundedName = Expression.Call(
+                EfPropertyMethod.MakeGenericMethod(typeof(string)),
+                member.Expression!,
+                Expression.Constant("NameLowerPrefix"));
+            var boundedPrefix = Expression.Call(AsciiPrefixMethod, node.Arguments[0]);
+            return Expression.AndAlso(
+                Expression.Call(boundedName, node.Method, boundedPrefix),
+                Expression.Call(loweredName, node.Method, loweredPrefix));
         }
 
         private static MethodCallExpression RewriteNullableOrdering(MethodCallExpression node)

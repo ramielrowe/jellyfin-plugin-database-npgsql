@@ -104,7 +104,16 @@ public sealed class NpgsqlModelCustomizer(ModelCustomizerDependencies dependenci
                 "translate(\"Name\", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')",
                 stored: true)
             .UseCollation("C");
-        people.HasIndex("NameLower").HasMethod("hash");
+        people.Property<string>("NameLowerPrefix")
+            .HasMaxLength(512)
+            .HasComputedColumnSql(
+                "left(translate(\"Name\", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 512)",
+                stored: true)
+            .UseCollation("C");
+        people.HasIndex("NameLowerPrefix")
+            .HasDatabaseName("IX_Peoples_Npgsql_NameLowerPrefix")
+            .HasMethod("btree")
+            .HasOperators("text_pattern_ops");
     }
 
     private static void ConfigureBoundedIdentifiers(ModelBuilder modelBuilder)
@@ -154,7 +163,9 @@ public sealed class NpgsqlModelCustomizer(ModelCustomizerDependencies dependenci
         var itemValues = modelBuilder.Entity<ItemValue>();
         RemoveIndex(itemValues.Metadata, nameof(ItemValue.Type), nameof(ItemValue.CleanValue));
         RemoveIndex(itemValues.Metadata, nameof(ItemValue.Type), nameof(ItemValue.Value));
-        itemValues.HasIndex(entity => entity.Type);
+        itemValues.HasIndex(entity => entity.Type)
+            .HasDatabaseName("IX_ItemValues_Npgsql_Type");
+        ConfigureHashIndex(itemValues, nameof(ItemValue.Value));
         ConfigureHashIndex(itemValues, nameof(ItemValue.CleanValue));
         ConfigureInternedIdentity(
             itemValues,
@@ -208,9 +219,22 @@ public sealed class NpgsqlModelCustomizer(ModelCustomizerDependencies dependenci
             .HasSchema("public");
         modelBuilder.HasDbFunction(
                 typeof(NpgsqlQueryDbFunctions).GetMethod(
-                    nameof(NpgsqlQueryDbFunctions.SqliteLike),
+                    nameof(NpgsqlQueryDbFunctions.AsciiPrefix),
                     BindingFlags.Public | BindingFlags.Static)!)
+            .HasName("__jellyfin_ascii_prefix")
+            .HasSchema("public");
+        modelBuilder.HasDbFunction(
+                typeof(NpgsqlQueryDbFunctions).GetMethod(
+                    nameof(NpgsqlQueryDbFunctions.SqliteLike),
+                    BindingFlags.Public | BindingFlags.Static,
+                    [typeof(string), typeof(string)])!)
             .HasName("__jellyfin_sqlite_like")
+            .HasSchema("public");
+        modelBuilder.HasDbFunction(
+                typeof(NpgsqlQueryDbFunctions).GetMethod(
+                    nameof(NpgsqlQueryDbFunctions.SqliteLikeWithEscape),
+                    BindingFlags.Public | BindingFlags.Static)!)
+            .HasName("__jellyfin_sqlite_like_escape")
             .HasSchema("public");
     }
 

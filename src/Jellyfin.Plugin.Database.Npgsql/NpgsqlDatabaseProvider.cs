@@ -111,6 +111,8 @@ public partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvider> logg
     {
         ArgumentNullException.ThrowIfNull(configurationBuilder);
 
+        configurationBuilder.Conventions.Add(_ => new NpgsqlFinalizedModelContract());
+
         // Jellyfin's persisted timestamps represent UTC instants. Npgsql maps
         // these to timestamp with time zone and rejects non-UTC DateTime values.
         configurationBuilder.Properties<DateTime>()

@@ -1,5 +1,3 @@
-using System.Security.Cryptography;
-using System.Text;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Locking;
@@ -14,8 +12,6 @@ namespace Jellyfin.Plugin.Database.Npgsql.UnitTests;
 public sealed class ModelCompatibilityTests
 {
     private const string ConnectionString = "Host=127.0.0.1;Database=model_only;Username=model_only;Password=model_only";
-    private const string GoldenDebugModelSha256 = "5253BCCAD1F7E190C991A9F9926917EBE3CBCD5F2413AD079DB07E9CF7393C6D";
-
     [Fact]
     public void LateModel_HasExactAuditedShapeAndNoUnboundedPhysicalTextBtree()
     {
@@ -30,6 +26,11 @@ public sealed class ModelCompatibilityTests
         Assert.Equal(
             "translate(\"Name\", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')",
             Property<People>(model, "NameLower").GetComputedColumnSql());
+        Assert.Equal(512, Property<People>(model, "NameLowerPrefix").GetMaxLength());
+        var peoplePrefix = Assert.Single(
+            Entity<People>(model).GetIndexes(),
+            index => index.GetDatabaseName() == "IX_Peoples_Npgsql_NameLowerPrefix");
+        Assert.Equal(["text_pattern_ops"], peoplePrefix.GetOperators());
 
         Assert.All(
             model.GetEntityTypes().SelectMany(entity => entity.GetIndexes()),
@@ -75,14 +76,37 @@ public sealed class ModelCompatibilityTests
     }
 
     [Fact]
-    public void DebugModel_MatchesReviewedGoldenFingerprint()
+    public void FinalizedModel_MatchesRuntimeEnforcedReviewedGoldenFingerprint()
     {
         using var context = CreateContext();
         var model = context.GetService<IDesignTimeModel>().Model;
-        var debugModel = model.ToDebugString(MetadataDebugStringOptions.LongDefault);
-        var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(debugModel)));
 
-        Assert.Equal(GoldenDebugModelSha256, fingerprint);
+        Assert.Equal(
+            "4736620EC6FA5188AC9361C9B28A84DBC45C17753F02828F13968D028EBE38AD",
+            NpgsqlFinalizedModelContract.ExpectedSha256);
+        Assert.Equal(NpgsqlModelCustomizer.ModelContract, model[NpgsqlModelCustomizer.ModelContractAnnotation]);
+    }
+
+    [Fact]
+    public void RuntimeModelGuard_RejectsAnyFinalizedModelDriftBeforeDatabaseUse()
+    {
+        using var context = CreateDriftedContext();
+
+        var exception = Assert.Throws<InvalidOperationException>(() => _ = context.Model);
+
+        Assert.Contains("complete finalized Jellyfin database model", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("before any schema operation", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ModelCache_ReusesTheValidatedCompleteModelWithoutLosingPluginMappings()
+    {
+        using var first = CreateContext();
+        using var second = CreateContext();
+
+        Assert.Same(first.Model, second.Model);
+        Assert.Equal(512, Property<People>(second.Model, "NameLowerPrefix").GetMaxLength());
+        Assert.NotNull(Entity<ItemValue>(second.Model).FindProperty("ValueInternId"));
     }
 
     [Fact]
@@ -92,6 +116,9 @@ public sealed class ModelCompatibilityTests
         Assert.Contains("octet_length(\"Chunk\") <= 128", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
         Assert.Contains("UNIQUE (\"ParentId\", \"Chunk\", \"IsTerminal\")", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
         Assert.Contains("ON CONFLICT (\"ParentId\", \"Chunk\", \"IsTerminal\")", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
+        Assert.Contains("DO NOTHING", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
+        Assert.DoesNotContain("DO UPDATE", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
+        Assert.Contains("BEFORE INSERT OR UPDATE ON", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
         Assert.DoesNotContain("digest(", NpgsqlTextInterning.InstallSql, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("pgcrypto", NpgsqlTextInterning.InstallSql, StringComparison.OrdinalIgnoreCase);
     }
@@ -105,12 +132,20 @@ public sealed class ModelCompatibilityTests
             .Where(entry => EF.Functions.Like(entry.Name, "%scan\\%%"))
             .ToQueryString();
         Assert.Contains("__jellyfin_sqlite_like", likeSql, StringComparison.Ordinal);
-        Assert.Contains("'\\'", likeSql, StringComparison.Ordinal);
+        Assert.DoesNotContain("__jellyfin_sqlite_like_escape", likeSql, StringComparison.Ordinal);
+
+        var explicitlyEscapedLikeSql = context.ActivityLogs
+            .Where(entry => EF.Functions.Like(entry.Name, "%scanX%%", "X"))
+            .ToQueryString();
+        Assert.Contains("__jellyfin_sqlite_like_escape", explicitlyEscapedLikeSql, StringComparison.Ordinal);
+        Assert.Contains("'X'", explicitlyEscapedLikeSql, StringComparison.Ordinal);
 
         var peopleSql = context.Peoples
             .Where(person => person.Name.StartsWith("MIXED"))
             .ToQueryString();
+        Assert.Contains("\"NameLowerPrefix\"", peopleSql, StringComparison.Ordinal);
         Assert.Contains("\"NameLower\"", peopleSql, StringComparison.Ordinal);
+        Assert.Contains("__jellyfin_ascii_prefix", peopleSql, StringComparison.Ordinal);
         Assert.Contains("__jellyfin_ascii_lower", peopleSql, StringComparison.Ordinal);
 
         var ascendingSql = context.BaseItems.OrderBy(item => item.SortName).ToQueryString();
@@ -119,6 +154,8 @@ public sealed class ModelCompatibilityTests
         var descendingSql = context.BaseItems.OrderByDescending(item => item.SortName).ToQueryString();
         Assert.Contains("CASE", descendingSql, StringComparison.Ordinal);
         Assert.Contains("DESC", descendingSql, StringComparison.Ordinal);
+
+        Assert.True(context.Database.CreateExecutionStrategy().RetriesOnFailure);
     }
 
     private static JellyfinDbContext CreateContext()
@@ -131,6 +168,16 @@ public sealed class ModelCompatibilityTests
             NullLogger<JellyfinDbContext>.Instance,
             provider,
             new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
+    }
+
+    private static JellyfinDbContext CreateDriftedContext()
+    {
+        var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
+        var builder = new DbContextOptionsBuilder<JellyfinDbContext>();
+        NpgsqlOptionsBootstrap.Configure(builder, ConnectionString, null);
+        return new DriftedJellyfinDbContext(
+            builder.Options,
+            provider);
     }
 
     private static IReadOnlyEntityType Entity<TEntity>(IReadOnlyModel model)
@@ -165,5 +212,21 @@ public sealed class ModelCompatibilityTests
                 && candidate.Properties.Select(property => property.Name).SequenceEqual(physicalMembers));
         Assert.Equal(sourceProperty, index[NpgsqlTextInterning.ExactIdentityAnnotation]);
         Assert.Equal(typeof(long), entity.FindProperty(sourceProperty + "InternId")!.ClrType);
+    }
+
+    private sealed class DriftedJellyfinDbContext(
+        DbContextOptions<JellyfinDbContext> options,
+        IJellyfinDatabaseProvider provider)
+        : JellyfinDbContext(
+            options,
+            NullLogger<JellyfinDbContext>.Instance,
+            provider,
+            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance))
+    {
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            base.OnModelCreating(modelBuilder);
+            modelBuilder.Model.SetAnnotation("ReviewTest:UnreviewedDrift", true);
+        }
     }
 }
