@@ -22,16 +22,13 @@ internal static class NpgsqlRestoreCoordinator
     /// <summary>Registers the transaction opened by the provider's stock restore purge.</summary>
     /// <param name="context">The stock restore context.</param>
     /// <param name="transaction">The transaction that owns purge and restored inserts.</param>
-    /// <param name="reseedSql">The exact model-derived identity reseed statements.</param>
     internal static void Register(
         JellyfinDbContext context,
-        IDbContextTransaction transaction,
-        string reseedSql)
+        IDbContextTransaction transaction)
     {
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(transaction);
-        ArgumentException.ThrowIfNullOrWhiteSpace(reseedSql);
-        if (!States.TryAdd(context, new RestoreState(transaction, reseedSql)))
+        if (!States.TryAdd(context, new RestoreState(transaction)))
         {
             throw new InvalidOperationException("A PostgreSQL restore transaction is already active for this context.");
         }
@@ -56,8 +53,8 @@ internal static class NpgsqlRestoreCoordinator
                 await RestoreHomeSectionsAsync(jellyfinContext, cancellationToken).ConfigureAwait(false);
             }
 
-            await jellyfinContext.Database.ExecuteSqlRawAsync(
-                state.ReseedSql,
+            await NpgsqlDatabaseOperations.ReseedIdentitiesAsync(
+                jellyfinContext,
                 cancellationToken).ConfigureAwait(false);
             await state.Transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         }
@@ -105,23 +102,25 @@ internal static class NpgsqlRestoreCoordinator
         var entry = archive.GetEntry(NpgsqlBackupArchive.HomeSectionsEntryName)
             ?? throw new InvalidDataException("The bound PostgreSQL archive has no HomeSection dataset.");
         var stream = await entry.OpenAsync(cancellationToken).ConfigureAwait(false);
-        HomeSectionRow[] rows;
         await using (stream.ConfigureAwait(false))
         {
-            rows = await JsonSerializer.DeserializeAsync<HomeSectionRow[]>(stream, cancellationToken: cancellationToken)
-                .ConfigureAwait(false)
-                ?? throw new InvalidDataException("The bound PostgreSQL HomeSection dataset is null.");
-        }
+            await foreach (var row in JsonSerializer.DeserializeAsyncEnumerable<HomeSectionRow>(
+                stream,
+                cancellationToken: cancellationToken).ConfigureAwait(false))
+            {
+                if (row is null)
+                {
+                    throw new InvalidDataException("The bound PostgreSQL HomeSection dataset contains a null row.");
+                }
 
-        foreach (var row in rows)
-        {
-            await context.Database.ExecuteSqlInterpolatedAsync(
-                $"INSERT INTO public.\"HomeSection\" (\"Id\", \"DisplayPreferencesId\", \"Order\", \"Type\") VALUES ({row.Id}, {row.DisplayPreferencesId}, {row.Order}, {row.Type})",
-                cancellationToken).ConfigureAwait(false);
+                await context.Database.ExecuteSqlInterpolatedAsync(
+                    $"INSERT INTO public.\"HomeSection\" (\"Id\", \"DisplayPreferencesId\", \"Order\", \"Type\") VALUES ({row.Id}, {row.DisplayPreferencesId}, {row.Order}, {row.Type})",
+                    cancellationToken).ConfigureAwait(false);
+            }
         }
     }
 
-    private sealed record RestoreState(IDbContextTransaction Transaction, string ReseedSql);
+    private sealed record RestoreState(IDbContextTransaction Transaction);
 
     private sealed record HomeSectionRow(int Id, int DisplayPreferencesId, int Order, int Type);
 }

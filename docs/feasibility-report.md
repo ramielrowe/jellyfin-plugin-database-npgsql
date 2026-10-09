@@ -50,12 +50,14 @@ the package. Runtime logging confirmed:
 - the installed package contained exactly three DLLs: the provider and the two
   Npgsql DLLs.
 
-The ordinary plugin manager runs later and would create a second collectible load
-context. The safe package contract is therefore a `meta.json` whose status is
-`Disabled` and whose assembly allowlist contains only the provider DLL. The normal
-plugin manager then skips it, while the early database loader still loads it. This
-also proves that normal plugin enabled/disabled state does **not** control a custom
-database provider; `database.xml` is the effective enablement switch.
+The ordinary plugin manager runs later and creates a second collectible load
+context. The release package deliberately permits that second load: its active
+`meta.json` allowlists only the provider DLL, whose service registrator decorates
+Jellyfin's full-system backup service. `database.xml` remains the database-provider
+selection switch, but the ordinary plugin must also be active so every restore is
+validated before Jellyfin copies Config, Data, or Root content. The early provider
+checks the manifest and the exact final backup-service registration and fails
+closed before database access when either half is absent or overridden.
 
 The loader selects the first sorted plugin folder whose name starts with
 `PluginName`. Installation must ensure there is only one matching folder. Also,
@@ -112,7 +114,8 @@ negative `CREATE DATABASE`/`CREATE ROLE` attempts prove it is `NOSUPERUSER`,
 
 1. Install one versioned plugin folder containing only `meta.json`, the provider
    DLL and deps file, `Npgsql.EntityFrameworkCore.PostgreSQL.dll`, and `Npgsql.dll`.
-2. Keep the manifest disabled. Do not place Jellyfin, EF Core, or Microsoft
+2. Keep the manifest active so the ordinary service registrator can install the
+   pre-mutation restore guard. Do not place Jellyfin, EF Core, or Microsoft
    Extensions assemblies in the plugin folder.
 3. Configure `DatabaseType` as `PLUGIN_PROVIDER`, use the exact unique folder
    prefix for `PluginName`, and set `PluginAssembly` to
@@ -121,9 +124,9 @@ negative `CREATE DATABASE`/`CREATE ROLE` attempts prove it is `NOSUPERUSER`,
    this provider does not convert or import an existing SQLite database.
 5. Install the plugin before changing `database.xml`. A missing or incompatible
    provider is startup-fatal by design.
-6. Do not use the current development package for a migration. Its deliberate
-   backup guard prevents startup before mutation. A future release must document
-   tested recovery behavior and still require an independent operator backup.
+6. Keep an independent operator backup. The current package provides tested
+   migration snapshots and full-system restore preflight, but that protection is
+   not a substitute for an external recovery copy.
 
 ## Reproduction
 

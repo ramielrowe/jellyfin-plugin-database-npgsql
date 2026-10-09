@@ -1,6 +1,8 @@
 using Jellyfin.Database.Implementations;
+using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Server.Implementations.SystemBackupService;
 using MediaBrowser.Controller;
+using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Plugins;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -24,13 +26,28 @@ public sealed class NpgsqlPluginServiceRegistrator : IPluginServiceRegistrator
             throw new NotSupportedException("The audited Jellyfin backup service lifetime is no longer singleton.");
         }
 
+        var configurationDescriptor = serviceCollection.LastOrDefault(
+            descriptor => descriptor.ServiceType == typeof(IServerConfigurationManager));
+        var configurationManager = configurationDescriptor?.ImplementationInstance as IServerConfigurationManager
+            ?? throw new InvalidOperationException(
+                "Jellyfin did not expose its configuration manager instance before plugin service registration.");
+        var databaseConfiguration = configurationManager.GetConfiguration("database") as DatabaseConfigurationOptions;
+        var isActiveProvider = string.Equals(
+            databaseConfiguration?.DatabaseType,
+            "PLUGIN_PROVIDER",
+            StringComparison.OrdinalIgnoreCase);
+
         serviceCollection.Remove(stockDescriptor);
         serviceCollection.AddSingleton(
             serviceProvider => new StockBackupService(CreateStockService(serviceProvider, stockDescriptor)));
-        serviceCollection.AddSingleton<IBackupService>(serviceProvider =>
+        var decoratorDescriptor = ServiceDescriptor.Singleton<IBackupService>(serviceProvider =>
             new NpgsqlBackupServiceDecorator(
                 serviceProvider.GetRequiredService<StockBackupService>().Value,
-                serviceProvider.GetRequiredService<IJellyfinDatabaseProvider>()));
+                isActiveProvider,
+                serviceProvider));
+        serviceCollection.Add(decoratorDescriptor);
+        serviceCollection.AddSingleton(
+            new NpgsqlBackupSafetyRegistration(serviceCollection, decoratorDescriptor));
     }
 
     private static IBackupService CreateStockService(

@@ -58,13 +58,12 @@ public sealed class MigrationContractTests
     {
         using var context = CreateRuntimeContext();
 
-        var sql = NpgsqlDatabaseOperations.BuildIdentityReseedSql(context.Model);
+        var identities = NpgsqlDatabaseOperations.GetIdentityColumns(context.Model);
 
-        Assert.Equal(13, sql.Split("SELECT pg_catalog.setval", StringSplitOptions.None).Length - 1);
-        Assert.Contains("\"public\".\"ActivityLogs\"", sql, StringComparison.Ordinal);
-        Assert.Contains("\"public\".\"Permissions\"", sql, StringComparison.Ordinal);
-        Assert.Contains("pg_catalog.pg_get_serial_sequence", sql, StringComparison.Ordinal);
-        Assert.Contains("\"public\".\"__JellyfinTextNodes\"", sql, StringComparison.Ordinal);
+        Assert.Equal(13, identities.Count);
+        Assert.Contains(identities, identity => identity is { Schema: "public", Table: "ActivityLogs", Column: "Id" });
+        Assert.Contains(identities, identity => identity is { Schema: "public", Table: "Permissions", Column: "Id" });
+        Assert.Contains(identities, identity => identity is { Schema: "public", Table: "__JellyfinTextNodes", Column: "Id" });
     }
 
     [Fact]

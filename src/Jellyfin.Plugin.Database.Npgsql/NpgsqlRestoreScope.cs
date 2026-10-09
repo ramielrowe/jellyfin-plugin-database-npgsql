@@ -10,6 +10,7 @@ internal static class NpgsqlRestoreScope
     private const string BaggageKey = "jellyfin.plugin.database.npgsql.restore";
     private const string BaggageValue = "v1";
     private const string ArchivePathBaggageKey = "jellyfin.plugin.database.npgsql.restore.archive";
+    private const string IdentityRestartCheckpointKey = "jellyfin.plugin.database.npgsql.restore.identity-checkpoint";
 
     /// <summary>Gets a value indicating whether a preflighted stock restore is active.</summary>
     internal static bool IsActive
@@ -33,6 +34,26 @@ internal static class NpgsqlRestoreScope
         activity.Start();
         return new Scope(activity);
     }
+
+    /// <summary>Installs a flow-local identity-restart checkpoint for failure-path verification.</summary>
+    /// <param name="checkpoint">The checkpoint called after each transactional sequence restart.</param>
+    internal static void SetIdentityRestartCheckpoint(Func<int, CancellationToken, Task> checkpoint)
+    {
+        ArgumentNullException.ThrowIfNull(checkpoint);
+        var activity = Activity.Current
+            ?? throw new InvalidOperationException("An active PostgreSQL restore scope is required.");
+        activity.SetCustomProperty(IdentityRestartCheckpointKey, checkpoint);
+    }
+
+    /// <summary>Invokes the flow-local identity-restart checkpoint, when one is installed.</summary>
+    /// <param name="ordinal">The one-based sequence restart ordinal.</param>
+    /// <param name="cancellationToken">The restore cancellation token.</param>
+    /// <returns>A task representing the checkpoint.</returns>
+    internal static Task ReachIdentityRestartCheckpointAsync(int ordinal, CancellationToken cancellationToken)
+        => Activity.Current?.GetCustomProperty(IdentityRestartCheckpointKey)
+            is Func<int, CancellationToken, Task> checkpoint
+                ? checkpoint(ordinal, cancellationToken)
+                : Task.CompletedTask;
 
     private sealed class Scope(Activity activity) : IDisposable
     {

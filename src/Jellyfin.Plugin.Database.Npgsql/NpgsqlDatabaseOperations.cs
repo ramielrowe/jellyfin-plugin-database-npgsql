@@ -7,6 +7,7 @@ using Jellyfin.Database.Implementations;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Storage;
 using Npgsql;
 
 namespace Jellyfin.Plugin.Database.Npgsql;
@@ -153,8 +154,7 @@ internal static class NpgsqlDatabaseOperations
                 $", {QuoteTableName("public", "__JellyfinTextNodes")} RESTART IDENTITY",
                 StringComparison.Ordinal);
             await dbContext.Database.ExecuteSqlRawAsync(purgeSql).ConfigureAwait(false);
-            var reseedSql = BuildIdentityReseedSql(dbContext.Model);
-            NpgsqlRestoreCoordinator.Register(dbContext, transaction, reseedSql);
+            NpgsqlRestoreCoordinator.Register(dbContext, transaction);
         }
         catch
         {
@@ -195,11 +195,11 @@ internal static class NpgsqlDatabaseOperations
             .ToArray();
 
     /// <summary>
-    /// Builds sequence repair statements for every identity column owned by the finalized model.
+    /// Gets every identity column owned by the finalized model.
     /// </summary>
     /// <param name="model">The finalized Jellyfin model.</param>
-    /// <returns>Exact-schema-qualified, model-derived reseed SQL.</returns>
-    internal static string BuildIdentityReseedSql(IReadOnlyModel model)
+    /// <returns>Exact-schema-qualified, model-derived identity columns.</returns>
+    internal static IReadOnlyList<IdentityColumn> GetIdentityColumns(IReadOnlyModel model)
     {
         ArgumentNullException.ThrowIfNull(model);
         var columns = new HashSet<(string Schema, string Table, string Column)>();
@@ -237,19 +237,164 @@ internal static class NpgsqlDatabaseOperations
         // source strings, so triggers rebuild the trie and its identity too.
         columns.Add(("public", "__JellyfinTextNodes", "Id"));
 
-        return string.Join(
-            ";\n",
-            columns.OrderBy(item => item.Schema, StringComparer.Ordinal)
-                .ThenBy(item => item.Table, StringComparer.Ordinal)
-                .ThenBy(item => item.Column, StringComparer.Ordinal)
-                .Select(item =>
-                {
-                    var qualifiedTable = $"{QuoteIdentifier(item.Schema)}.{QuoteIdentifier(item.Table)}";
-                    var column = QuoteIdentifier(item.Column);
-                    var tableLiteral = qualifiedTable.Replace("'", "''", StringComparison.Ordinal);
-                    var columnLiteral = item.Column.Replace("'", "''", StringComparison.Ordinal);
-                    return $"SELECT pg_catalog.setval(pg_catalog.pg_get_serial_sequence('{tableLiteral}', '{columnLiteral}')::pg_catalog.regclass, COALESCE(pg_catalog.max({column})::bigint, 1), pg_catalog.max({column}) IS NOT NULL) FROM {qualifiedTable}";
-                })) + ";";
+        return columns.OrderBy(item => item.Schema, StringComparer.Ordinal)
+            .ThenBy(item => item.Table, StringComparer.Ordinal)
+            .ThenBy(item => item.Column, StringComparer.Ordinal)
+            .Select(item => new IdentityColumn(item.Schema, item.Table, item.Column))
+            .ToArray();
+    }
+
+    /// <summary>
+    /// Transactionally positions every identity sequence after restored explicit values.
+    /// </summary>
+    /// <remarks>
+    /// PostgreSQL <c>setval</c> is deliberately forbidden here because its effects survive
+    /// transaction rollback. <c>ALTER SEQUENCE ... RESTART WITH</c> is transactional, so a
+    /// cancellation, broken connection, later reseed failure, or commit failure restores the
+    /// exact pre-restore <c>last_value</c>/<c>is_called</c> state together with the tables.
+    /// All target values are calculated and validated before the first sequence is changed.
+    /// </remarks>
+    /// <param name="context">The active stock restore context and transaction.</param>
+    /// <param name="cancellationToken">The operation cancellation token.</param>
+    /// <returns>A task representing validation and transactional reseeding.</returns>
+    internal static async Task ReseedIdentitiesAsync(
+        JellyfinDbContext context,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        var transaction = context.Database.CurrentTransaction?.GetDbTransaction()
+            ?? throw new InvalidOperationException("PostgreSQL restore identity repair requires the active restore transaction.");
+        var connection = context.Database.GetDbConnection();
+        var plans = new List<IdentityRestart>();
+        foreach (var identity in GetIdentityColumns(context.Model))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var table = $"{QuoteIdentifier(identity.Schema)}.{QuoteIdentifier(identity.Table)}";
+            var column = QuoteIdentifier(identity.Column);
+            var tableLiteral = table.Replace("'", "''", StringComparison.Ordinal);
+            var columnLiteral = identity.Column.Replace("'", "''", StringComparison.Ordinal);
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText = $"""
+                SELECT sequence_namespace.nspname,
+                       sequence_class.relname,
+                       sequence.seqmin,
+                       sequence.seqmax,
+                       sequence.seqincrement,
+                       sequence.seqstart,
+                       sequence.seqcycle,
+                       values.minimum_value,
+                       values.maximum_value
+                  FROM pg_catalog.pg_sequence AS sequence
+                  JOIN pg_catalog.pg_class AS sequence_class ON sequence_class.oid = sequence.seqrelid
+                  JOIN pg_catalog.pg_namespace AS sequence_namespace ON sequence_namespace.oid = sequence_class.relnamespace
+                 CROSS JOIN (
+                       SELECT pg_catalog.min({column})::bigint AS minimum_value,
+                              pg_catalog.max({column})::bigint AS maximum_value
+                         FROM {table}
+                 ) AS values
+                 WHERE sequence.seqrelid = pg_catalog.pg_get_serial_sequence('{tableLiteral}', '{columnLiteral}')::pg_catalog.regclass
+                """;
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                throw new InvalidOperationException(
+                    $"Identity column '{identity.Schema}.{identity.Table}.{identity.Column}' has no owned PostgreSQL sequence.");
+            }
+
+            var sequenceSchema = reader.GetString(0);
+            var sequenceName = reader.GetString(1);
+            var minimum = reader.GetInt64(2);
+            var maximum = reader.GetInt64(3);
+            var increment = reader.GetInt64(4);
+            var start = reader.GetInt64(5);
+            var cycle = reader.GetBoolean(6);
+            var tableMinimum = await reader.IsDBNullAsync(7, cancellationToken).ConfigureAwait(false)
+                ? (long?)null
+                : reader.GetInt64(7);
+            var tableMaximum = await reader.IsDBNullAsync(8, cancellationToken).ConfigureAwait(false)
+                ? (long?)null
+                : reader.GetInt64(8);
+            await reader.DisposeAsync().ConfigureAwait(false);
+
+            var target = CalculateIdentityRestart(
+                identity,
+                minimum,
+                maximum,
+                increment,
+                start,
+                cycle,
+                tableMinimum,
+                tableMaximum);
+            plans.Add(new IdentityRestart(sequenceSchema, sequenceName, target));
+        }
+
+        var restartOrdinal = 0;
+        foreach (var plan in plans)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await using var command = connection.CreateCommand();
+            command.Transaction = transaction;
+            command.CommandText =
+                $"ALTER SEQUENCE {QuoteIdentifier(plan.Schema)}.{QuoteIdentifier(plan.Name)} RESTART WITH {plan.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
+            _ = await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            restartOrdinal++;
+            await NpgsqlRestoreScope.ReachIdentityRestartCheckpointAsync(
+                restartOrdinal,
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static long CalculateIdentityRestart(
+        IdentityColumn identity,
+        long sequenceMinimum,
+        long sequenceMaximum,
+        long increment,
+        long start,
+        bool cycle,
+        long? tableMinimum,
+        long? tableMaximum)
+    {
+        if (increment == 0)
+        {
+            throw new InvalidOperationException($"Identity sequence for '{identity}' has an invalid zero increment.");
+        }
+
+        if (tableMinimum is null)
+        {
+            return start;
+        }
+
+        long target;
+        try
+        {
+            target = increment > 0
+                ? checked(tableMaximum!.Value + increment)
+                : checked(tableMinimum.Value + increment);
+        }
+        catch (OverflowException exception)
+        {
+            throw new InvalidOperationException($"Identity values for '{identity}' cannot be advanced without overflow.", exception);
+        }
+
+        target = increment > 0 ? Math.Max(start, target) : Math.Min(start, target);
+        if (target > sequenceMaximum || target < sequenceMinimum)
+        {
+            if (!cycle)
+            {
+                throw new InvalidOperationException(
+                    $"Restored identities for '{identity}' exhaust its non-cycling sequence range before any sequence was changed.");
+            }
+
+            target = increment > 0 ? sequenceMinimum : sequenceMaximum;
+            if (target >= tableMinimum.Value && target <= tableMaximum!.Value)
+            {
+                throw new InvalidOperationException(
+                    $"Restored identities for cycling sequence '{identity}' leave no provably collision-free next value.");
+            }
+        }
+
+        return target;
     }
 
     /// <summary>
@@ -347,4 +492,12 @@ internal static class NpgsqlDatabaseOperations
 
     private static string QuoteTableName(string? schema, string table)
         => $"{QuoteIdentifier(string.IsNullOrEmpty(schema) ? "public" : schema)}.{QuoteIdentifier(table)}";
+
+    /// <summary>Identifies one exact model-owned identity column.</summary>
+    /// <param name="Schema">The PostgreSQL schema.</param>
+    /// <param name="Table">The PostgreSQL table.</param>
+    /// <param name="Column">The PostgreSQL identity column.</param>
+    internal sealed record IdentityColumn(string Schema, string Table, string Column);
+
+    private sealed record IdentityRestart(string Schema, string Name, long Value);
 }

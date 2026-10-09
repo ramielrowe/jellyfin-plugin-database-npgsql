@@ -410,7 +410,7 @@ public sealed class StockBackupRestoreIntegrationTests
             {
                 Assert.Equal(System.Data.IsolationLevel.RepeatableRead, transaction.GetDbTransaction().IsolationLevel);
                 var before = await readerContext.ActivityLogs.CountAsync(cancellationToken);
-                Assert.NotNull(NpgsqlBackupScope.HomeSectionsJson);
+                Assert.True(File.Exists(NpgsqlBackupScope.HomeSectionsSnapshotPath));
 
                 await using (var writerContext = CreateContext(database.RuntimeConnectionString))
                 {
@@ -473,6 +473,131 @@ public sealed class StockBackupRestoreIntegrationTests
         }
     }
 
+    [Fact]
+    public async Task RestoreSupportsNegativeOnlyExplicitIdsAndRestartsAtLegalPositiveValues()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await using var context = CreateContext(database.RuntimeConnectionString);
+            await context.GetService<IMigrator>().MigrateAsync(cancellationToken: cancellationToken);
+            await SeedHostHistoryAsync(context, cancellationToken);
+            var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
+            using (NpgsqlRestoreScope.Enter())
+            {
+                await provider.PurgeDatabase(context, GetStockTableNames(context));
+            }
+
+            _ = SeedEveryIdentityWithExplicitIds(context, -900);
+            await context.SaveChangesAsync(cancellationToken);
+
+            await using var verification = CreateContext(database.RuntimeConnectionString);
+            var generatedIds = InsertEveryIdentity(verification);
+            await verification.SaveChangesAsync(cancellationToken);
+            Assert.All(generatedIds.Select(getId => getId()), id => Assert.True(id > 0));
+        }
+        finally
+        {
+            NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Theory]
+    [InlineData("failure")]
+    [InlineData("cancellation")]
+    [InlineData("connection")]
+    public async Task FailedMiddleReseedRollsBackTablesAndExactSequenceStates(string mode)
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await using (var seed = CreateContext(database.RuntimeConnectionString))
+            {
+                await seed.GetService<IMigrator>().MigrateAsync(cancellationToken: cancellationToken);
+                await SeedHostHistoryAsync(seed, cancellationToken);
+                seed.ActivityLogs.Add(new ActivityLog("must survive reseed failure", "BackupRestore", Guid.Empty));
+                await seed.SaveChangesAsync(cancellationToken);
+                await seed.Database.ExecuteSqlRawAsync(
+                    "SELECT pg_catalog.setval('public.\"AccessSchedules_Id_seq\"'::pg_catalog.regclass, 41, false)",
+                    cancellationToken);
+                await seed.Database.ExecuteSqlRawAsync(
+                    "SELECT pg_catalog.setval('public.\"ActivityLogs_Id_seq\"'::pg_catalog.regclass, 37, true)",
+                    cancellationToken);
+            }
+
+            var beforeAccess = await ReadSequenceStateAsync(
+                database.RuntimeConnectionString,
+                "AccessSchedules_Id_seq",
+                cancellationToken);
+            var beforeActivity = await ReadSequenceStateAsync(
+                database.RuntimeConnectionString,
+                "ActivityLogs_Id_seq",
+                cancellationToken);
+
+            await using (var restore = CreateContext(database.RuntimeConnectionString))
+            using (NpgsqlRestoreScope.Enter())
+            {
+                var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
+                await provider.PurgeDatabase(restore, GetStockTableNames(restore));
+                _ = SeedEveryIdentityWithExplicitIds(restore, 900);
+                NpgsqlRestoreScope.SetIdentityRestartCheckpoint(async (ordinal, _) =>
+                {
+                    if (ordinal != 2)
+                    {
+                        return;
+                    }
+
+                    if (mode == "connection")
+                    {
+                        await restore.Database.CloseConnectionAsync().ConfigureAwait(false);
+                    }
+                    else if (mode == "cancellation")
+                    {
+                        throw new OperationCanceledException("Injected reseed cancellation.");
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException("Injected reseed failure.");
+                    }
+                });
+                _ = await Assert.ThrowsAnyAsync<Exception>(
+                    () => restore.SaveChangesAsync(cancellationToken));
+            }
+
+            await using (var verification = CreateContext(database.RuntimeConnectionString))
+            {
+                Assert.Equal(
+                    ["must survive reseed failure"],
+                    await verification.ActivityLogs.Select(row => row.Name).ToArrayAsync(cancellationToken));
+            }
+
+            Assert.Equal(
+                beforeAccess,
+                await ReadSequenceStateAsync(
+                    database.RuntimeConnectionString,
+                    "AccessSchedules_Id_seq",
+                    cancellationToken));
+            Assert.Equal(
+                beforeActivity,
+                await ReadSequenceStateAsync(
+                    database.RuntimeConnectionString,
+                    "ActivityLogs_Id_seq",
+                    cancellationToken));
+        }
+        finally
+        {
+            NpgsqlConnection.ClearAllPools();
+        }
+    }
+
     private static JellyfinDbContext CreateContext(string connectionString)
     {
         var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
@@ -483,6 +608,21 @@ public sealed class StockBackupRestoreIntegrationTests
             NullLogger<JellyfinDbContext>.Instance,
             provider,
             new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
+    }
+
+    private static async Task<(long LastValue, bool IsCalled)> ReadSequenceStateAsync(
+        string connectionString,
+        string sequence,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = new NpgsqlCommand(
+            $"SELECT last_value, is_called FROM public.{NpgsqlDatabaseOperations.QuoteIdentifier(sequence)}",
+            connection);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        Assert.True(await reader.ReadAsync(cancellationToken));
+        return (reader.GetInt64(0), reader.GetBoolean(1));
     }
 
     private static ActivityLog SeedEveryIdentityWithExplicitIds(JellyfinDbContext context, int id)

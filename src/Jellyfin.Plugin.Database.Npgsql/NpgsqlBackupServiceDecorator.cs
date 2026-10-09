@@ -1,6 +1,8 @@
 using Jellyfin.Database.Implementations;
 using Jellyfin.Server.Implementations.SystemBackupService;
 using MediaBrowser.Controller.SystemBackupService;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Jellyfin.Plugin.Database.Npgsql;
 
@@ -11,20 +13,25 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
 {
     private readonly IBackupService inner;
     private readonly bool isActiveProvider;
+    private readonly IServiceProvider? services;
+
+    /// <summary>Initializes a new instance of the <see cref="NpgsqlBackupServiceDecorator"/> class without a runtime model.</summary>
+    /// <param name="inner">The exact stock Jellyfin service.</param>
+    /// <param name="isActiveProvider">Whether PostgreSQL behavior is active.</param>
+    internal NpgsqlBackupServiceDecorator(IBackupService inner, bool isActiveProvider)
+        : this(inner, isActiveProvider, null)
+    {
+    }
 
     /// <summary>Initializes a new instance of the <see cref="NpgsqlBackupServiceDecorator"/> class.</summary>
     /// <param name="inner">The exact stock Jellyfin service registered by the host.</param>
-    /// <param name="provider">The selected database provider.</param>
-    internal NpgsqlBackupServiceDecorator(IBackupService inner, IJellyfinDatabaseProvider provider)
+    /// <param name="isActiveProvider">Whether database.xml selected the custom PostgreSQL provider.</param>
+    /// <param name="services">The completed host service provider.</param>
+    internal NpgsqlBackupServiceDecorator(IBackupService inner, bool isActiveProvider, IServiceProvider? services)
     {
         this.inner = inner;
-        var providerType = provider.GetType();
-        this.isActiveProvider = string.Equals(
-                providerType.FullName,
-                typeof(NpgsqlDatabaseProvider).FullName,
-                StringComparison.Ordinal)
-            && providerType.Assembly.ManifestModule.ModuleVersionId
-                == typeof(NpgsqlDatabaseProvider).Assembly.ManifestModule.ModuleVersionId;
+        this.isActiveProvider = isActiveProvider;
+        this.services = services;
     }
 
     /// <inheritdoc />
@@ -38,15 +45,27 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
 
         using var scope = NpgsqlBackupScope.Enter();
         var manifest = await this.inner.CreateBackupAsync(backupOptions).ConfigureAwait(false);
-        var homeSectionsJson = backupOptions.Database
-            ? NpgsqlBackupScope.HomeSectionsJson
-                ?? throw new InvalidOperationException("The PostgreSQL backup transaction did not capture HomeSection rows.")
-            : "[]";
-        await NpgsqlBackupArchive.BindAsync(
-            manifest.Path,
-            backupOptions.Database,
-            homeSectionsJson,
-            CancellationToken.None).ConfigureAwait(false);
+        if (backupOptions.Database)
+        {
+            var homeSectionsPath = NpgsqlBackupScope.HomeSectionsSnapshotPath;
+            if (string.IsNullOrWhiteSpace(homeSectionsPath) || !File.Exists(homeSectionsPath))
+            {
+                throw new InvalidOperationException("The PostgreSQL backup transaction did not capture HomeSection rows.");
+            }
+
+            await NpgsqlBackupArchive.BindWithHomeSectionsAsync(
+                manifest.Path,
+                homeSectionsPath,
+                CancellationToken.None).ConfigureAwait(false);
+        }
+        else
+        {
+            await NpgsqlBackupArchive.BindAsync(
+                manifest.Path,
+                databaseIncluded: false,
+                CancellationToken.None).ConfigureAwait(false);
+        }
+
         return manifest;
     }
 
@@ -66,11 +85,16 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
             return;
         }
 
-        using var snapshot = await NpgsqlBackupArchive.CreateValidatedSnapshotAsync(
-            archivePath,
-            CancellationToken.None).ConfigureAwait(false);
-        using var scope = NpgsqlRestoreScope.Enter(snapshot.Path);
-        await this.inner.RestoreBackupAsync(snapshot.Path).ConfigureAwait(false);
+        if (this.services is null)
+        {
+            await this.RestoreValidatedAsync(archivePath, null).ConfigureAwait(false);
+            return;
+        }
+
+        var context = await this.services.GetRequiredService<IDbContextFactory<JellyfinDbContext>>()
+            .CreateDbContextAsync().ConfigureAwait(false);
+        await using var configuredContext = context.ConfigureAwait(false);
+        await this.RestoreValidatedAsync(archivePath, context.Model).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -78,9 +102,27 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
     {
         if (this.isActiveProvider)
         {
-            NpgsqlBackupArchive.ValidateAsync(archivePath, CancellationToken.None).GetAwaiter().GetResult();
+            using var context = this.services?
+                .GetRequiredService<IDbContextFactory<JellyfinDbContext>>()
+                .CreateDbContext();
+            NpgsqlBackupArchive.ValidateAsync(
+                archivePath,
+                context?.Model,
+                CancellationToken.None).GetAwaiter().GetResult();
         }
 
         this.inner.ScheduleRestoreAndRestartServer(archivePath);
+    }
+
+    private async Task RestoreValidatedAsync(
+        string archivePath,
+        Microsoft.EntityFrameworkCore.Metadata.IModel? model)
+    {
+        using var snapshot = await NpgsqlBackupArchive.CreateValidatedSnapshotAsync(
+            archivePath,
+            model,
+            CancellationToken.None).ConfigureAwait(false);
+        using var scope = NpgsqlRestoreScope.Enter(snapshot.Path);
+        await this.inner.RestoreBackupAsync(snapshot.Path).ConfigureAwait(false);
     }
 }

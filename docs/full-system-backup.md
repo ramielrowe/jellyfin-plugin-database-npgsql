@@ -32,10 +32,11 @@ After save, it restores `HomeSection`, reseeds every model identity and the
 provider trie sequence beyond their restored maxima, and commits. Failure or
 cancellation rolls the purge and inserts back together.
 
-If the ordinary plugin registration is disabled while the early provider is
-still selected, a stock full-table purge is refused. The provider repairs the
-audited migration history and leaves application tables intact, so the
-dashboard restore cannot silently continue through an unsafe PostgreSQL purge.
+If the ordinary plugin metadata is disabled, deleted, malformed, or mismatched
+while the early provider is selected, the provider refuses startup before a
+database connection or restore entry point exists. It also verifies the exact
+final `IBackupService` decoration in the full host. The later full-table purge
+refusal remains defense in depth, but it is not the primary restore boundary.
 
 The stock lifecycle test creates a database-inclusive archive through the
 public HTTP API, preserves explicit IDs in every identity-backed table,

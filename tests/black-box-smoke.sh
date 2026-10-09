@@ -967,6 +967,57 @@ identity_sequence_state() {
     psql_value "SELECT last_value::text || '|' || is_called::text FROM $sequence_name"
 }
 
+tree_bytes_hash() {
+    python3 - "$1" <<'PY'
+import hashlib, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+for path in sorted(item for item in root.rglob("*") if item.is_file()):
+    relative = path.relative_to(root).as_posix().encode("utf-8")
+    digest.update(len(relative).to_bytes(8, "little"))
+    digest.update(relative)
+    with path.open("rb") as stream:
+        while chunk := stream.read(65536):
+            digest.update(chunk)
+print(digest.hexdigest())
+PY
+}
+
+database_dump_hash() {
+    docker exec \
+        --env PGPASSFILE=/run/jellyfin-test-secrets/application.pgpass \
+        "$POSTGRES_CONTAINER_ID" \
+        pg_dump --username jellyfin --dbname jellyfin --schema public --no-owner --no-privileges \
+        | sed '/^\\\(un\)\?restrict /d' \
+        | sha256sum \
+        | cut -d' ' -f1
+}
+
+assert_manifest_failure_is_immutable() {
+    local test_name=$1
+    local log_file="$RUN_ROOT/$test_name.log"
+    local config_before data_before host_before database_before
+    config_before=$(tree_bytes_hash "$RUN_ROOT/runtime/config")
+    data_before=$(tree_bytes_hash "$RUN_ROOT/runtime/data")
+    host_before=$(hash_host_publish "$RUN_ROOT/host-publish")
+    database_before=$(database_dump_hash)
+
+    start_host "$log_file"
+    wait_for_host_exit || fail "$test_name did not fail closed before host startup"
+    grep -F 'normal plugin metadata is missing, disabled, malformed, or does not match this provider build' "$log_file" >/dev/null \
+        || fail "$test_name did not report the pre-mutation normal-plugin metadata guard"
+    grep -F 'No database connection was attempted' "$log_file" >/dev/null \
+        || fail "$test_name did not state its pre-connection boundary"
+    [ "$(tree_bytes_hash "$RUN_ROOT/runtime/config")" = "$config_before" ] \
+        || fail "$test_name changed Config bytes before rejection"
+    [ "$(tree_bytes_hash "$RUN_ROOT/runtime/data")" = "$data_before" ] \
+        || fail "$test_name changed Data bytes before rejection"
+    [ "$(hash_host_publish "$RUN_ROOT/host-publish")" = "$host_before" ] \
+        || fail "$test_name changed Root/host bytes before rejection"
+    [ "$(database_dump_hash)" = "$database_before" ] \
+        || fail "$test_name changed PostgreSQL schema, data, sequences, or migration history before rejection"
+}
+
 mkdir -p -m 700 \
     "$RUN_ROOT/host-publish" \
     "$RUN_ROOT/unsupported-host-publish" \
@@ -1015,17 +1066,9 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
         if destination not in target.parents and target != destination:
             raise SystemExit(f"unsafe ZIP path: {entry.filename}")
     archive.extractall(destination)' "$PACKAGE_ZIP" "$PLUGIN_FOLDER"
-# The provider must be available to Jellyfin's early database loader while its
-# ordinary plugin entry remains disabled for the prefix-selection failure
-# matrix below. The shipped manifest is active so vanilla installations get
-# the backup integration; stage an explicit disabled copy only for this phase.
-python3 - "$PLUGIN_FOLDER/meta.json" <<'PY'
-import json, pathlib, sys
-path = pathlib.Path(sys.argv[1])
-metadata = json.loads(path.read_text(encoding="utf-8"))
-metadata["status"] = "Disabled"
-path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-PY
+# The active ordinary plugin registration is a required half of the provider:
+# it installs the pre-mutation restore guard before the full host can serve a
+# dashboard, API, or scheduled restore.
 dotnet build \
     "$PLUGIN_PROJECT" \
     --configuration Release \
@@ -1122,6 +1165,8 @@ grep -F "requires the exact folder and PluginName '$PLUGIN_FOLDER_NAME'" "$RUN_R
 grep -F "No database connection was attempted" "$RUN_ROOT/ambiguous-folder.log" >/dev/null \
     || fail "ambiguous prefix selection did not state its pre-connection boundary"
 mv "$RUN_ROOT/canonical-package-hold" "$PLUGIN_FOLDER"
+mv "$OLD_PLUGIN_FOLDER" "$RUN_ROOT/old-package-hold"
+mv "$AMBIGUOUS_PLUGIN_FOLDER" "$RUN_ROOT/ambiguous-package-hold"
 
 if [ "$HOST_INPUT_MODE" = "legacy-repository" ] || [ -n "$UNSUPPORTED_HOST_PUBLISH" ]; then
     start_unsupported_host "$RUN_ROOT/unsupported-abi.log"
@@ -1370,8 +1415,8 @@ assert_log_origin "$RUN_ROOT/first-start.log" "Npgsql EF" "$PLUGIN_FOLDER/Npgsql
 assert_log_origin "$RUN_ROOT/first-start.log" "Npgsql" "$PLUGIN_FOLDER/Npgsql.dll"
 assert_log_origin "$RUN_ROOT/first-start.log" "host database" "$RUN_ROOT/host-publish/Jellyfin.Database.Implementations.dll"
 assert_log_origin "$RUN_ROOT/first-start.log" "EF Core" "$RUN_ROOT/host-publish/Microsoft.EntityFrameworkCore.dll"
-grep -q 'Skipping disabled plugin.*Npgsql Database' "$RUN_ROOT/first-start.log" \
-    || fail "normal plugin loading did not honor the disabled manifest"
+grep -F 'Registering whitelisted assemblies for plugin "Npgsql Database"' "$RUN_ROOT/first-start.log" >/dev/null \
+    || fail "normal plugin loading did not install the required backup guard"
 grep -q 'Deleted PostgreSQL migration snapshot' "$RUN_ROOT/first-start.log" \
     || fail "successful migration did not exercise DeleteBackup"
 
@@ -1402,13 +1447,6 @@ stop_host "$HTTP_PORT" "$FIRST_TOKEN" || fail "first host did not stop cleanly"
 FOREIGN_KEY_COUNT=$(psql_value "SELECT COUNT(*) FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class r ON r.oid=c.conrelid JOIN pg_catalog.pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname='public' AND c.contype='f'")
 [ "$FOREIGN_KEY_COUNT" -gt 0 ] || fail "baseline contains no foreign keys"
 
-python3 - "$PLUGIN_FOLDER/meta.json" <<'PY'
-import json, pathlib, sys
-path = pathlib.Path(sys.argv[1])
-metadata = json.loads(path.read_text(encoding="utf-8"))
-metadata["status"] = "Active"
-path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-PY
 start_host "$RUN_ROOT/active-scan.log"
 wait_for_health "$HTTP_PORT" || fail "vanilla Jellyfin did not survive the later active plugin scan"
 grep -F 'Registering whitelisted assemblies for plugin "Npgsql Database"' "$RUN_ROOT/active-scan.log" >/dev/null \
@@ -1424,14 +1462,28 @@ RESTART_TOKEN=$(authenticate "$HTTP_PORT" "npgsql-active-scan")
 stop_host "$HTTP_PORT" "$RESTART_TOKEN" || fail "active-scan host did not stop cleanly"
 
 printf '{ malformed plugin metadata\n' >"$PLUGIN_FOLDER/meta.json"
-start_host "$RUN_ROOT/malformed-metadata.log"
-wait_for_health "$HTTP_PORT" || fail "early provider did not survive malformed ordinary-plugin metadata"
-grep -F 'Error deserializing' "$RUN_ROOT/malformed-metadata.log" >/dev/null \
-    || fail "normal plugin scan did not report malformed metadata"
-MALFORMED_TOKEN=$(authenticate "$HTTP_PORT" "npgsql-malformed-metadata")
-[ -n "$MALFORMED_TOKEN" ] || fail "persisted user could not authenticate after malformed metadata recovery"
-stop_host "$HTTP_PORT" "$MALFORMED_TOKEN" || fail "malformed-metadata host did not stop cleanly"
+assert_manifest_failure_is_immutable "malformed-metadata"
 cp "$PLUGIN_ROOT/meta.json" "$PLUGIN_FOLDER/meta.json"
+
+python3 - "$PLUGIN_FOLDER/meta.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+metadata = json.loads(path.read_text(encoding="utf-8"))
+metadata["status"] = "Disabled"
+path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+PY
+assert_manifest_failure_is_immutable "disabled-metadata"
+cp "$PLUGIN_ROOT/meta.json" "$PLUGIN_FOLDER/meta.json"
+
+mv "$PLUGIN_FOLDER/meta.json" "$RUN_ROOT/meta.json.deleted-test"
+assert_manifest_failure_is_immutable "deleted-metadata"
+mv "$RUN_ROOT/meta.json.deleted-test" "$PLUGIN_FOLDER/meta.json"
+
+start_host "$RUN_ROOT/metadata-recovery.log"
+wait_for_health "$HTTP_PORT" || fail "complete active package did not recover after metadata failure proofs"
+MALFORMED_TOKEN=$(authenticate "$HTTP_PORT" "npgsql-metadata-recovery")
+[ -n "$MALFORMED_TOKEN" ] || fail "persisted user could not authenticate after metadata recovery"
+stop_host "$HTTP_PORT" "$MALFORMED_TOKEN" || fail "metadata-recovery host did not stop cleanly"
 
 mapfile -t SEQUENCE_PROBES < <(psql_value "SELECT format('%I.%I', schemaname, sequencename) FROM pg_catalog.pg_sequences WHERE schemaname = 'public' ORDER BY sequencename LIMIT 4")
 [ "${#SEQUENCE_PROBES[@]}" -eq 4 ] || fail "supported schema did not expose four identity sequences for rollback state probes"
@@ -1518,7 +1570,7 @@ assert_pristine_host_unchanged
     echo "package_dlls=${package_dlls[*]}"
     echo "canonical_plugin_folder=$PLUGIN_FOLDER_NAME"
     echo "early_failure_guards=missing-npgsql-driver,missing-npgsql-ef-provider,ambiguous-prefix,unsupported-abi"
-    echo "normal_plugin_scans=disabled,active,malformed-metadata"
+    echo "normal_plugin_scans=active,malformed-fail-closed,disabled-fail-closed,deleted-fail-closed"
     echo "passfile_multi_host_failover=true"
     echo "credential_file_modes=0600-accepted,0640-0644-0666-rejected"
 } | tee "$RUN_ROOT/evidence.txt"

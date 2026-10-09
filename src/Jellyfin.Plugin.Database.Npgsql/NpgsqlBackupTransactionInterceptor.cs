@@ -29,7 +29,7 @@ internal sealed class NpgsqlBackupTransactionInterceptor : DbTransactionIntercep
         }
 
         var transaction = connection.BeginTransaction(IsolationLevel.RepeatableRead);
-        NpgsqlBackupScope.SetHomeSectionsJson(CaptureHomeSections(connection, transaction));
+        CaptureHomeSections(connection, transaction, NpgsqlBackupScope.RequireHomeSectionsSnapshotPath());
         return InterceptionResult<DbTransaction>.SuppressWithResult(transaction);
     }
 
@@ -48,51 +48,134 @@ internal sealed class NpgsqlBackupTransactionInterceptor : DbTransactionIntercep
         var transaction = await connection.BeginTransactionAsync(
             IsolationLevel.RepeatableRead,
             cancellationToken).ConfigureAwait(false);
-        NpgsqlBackupScope.SetHomeSectionsJson(
-            await CaptureHomeSectionsAsync(connection, transaction, cancellationToken).ConfigureAwait(false));
+        await CaptureHomeSectionsAsync(
+            connection,
+            transaction,
+            NpgsqlBackupScope.RequireHomeSectionsSnapshotPath(),
+            cancellationToken).ConfigureAwait(false);
         return InterceptionResult<DbTransaction>.SuppressWithResult(transaction);
     }
 
-    private static string CaptureHomeSections(DbConnection connection, DbTransaction transaction)
-    {
-        using var command = connection.CreateCommand();
-        command.Transaction = transaction;
-        command.CommandText =
-            "SELECT \"Id\", \"DisplayPreferencesId\", \"Order\", \"Type\" FROM public.\"HomeSection\" ORDER BY \"Id\"";
-        using var reader = command.ExecuteReader();
-        var rows = new List<HomeSectionRow>();
-        while (reader.Read())
-        {
-            rows.Add(new HomeSectionRow(reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetInt32(3)));
-        }
-
-        return JsonSerializer.Serialize(rows);
-    }
-
-    private static async Task<string> CaptureHomeSectionsAsync(
+    private static void CaptureHomeSections(
         DbConnection connection,
         DbTransaction transaction,
-        CancellationToken cancellationToken)
+        string snapshotPath)
     {
-        var command = connection.CreateCommand();
-        await using (command.ConfigureAwait(false))
+        try
         {
+            using var output = CreateSnapshotFile(snapshotPath, asynchronous: false);
+            using var writer = new Utf8JsonWriter(output);
+            using var command = connection.CreateCommand();
             command.Transaction = transaction;
             command.CommandText =
                 "SELECT \"Id\", \"DisplayPreferencesId\", \"Order\", \"Type\" FROM public.\"HomeSection\" ORDER BY \"Id\"";
-            var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            await using (reader.ConfigureAwait(false))
+            using var reader = command.ExecuteReader();
+            writer.WriteStartArray();
+            long rows = 0;
+            while (reader.Read())
             {
-                var rows = new List<HomeSectionRow>();
-                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
-                {
-                    rows.Add(new HomeSectionRow(reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetInt32(3)));
-                }
-
-                return JsonSerializer.Serialize(rows);
+                WriteRow(writer, reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetInt32(3));
+                CheckCaptureBounds(writer, output, ++rows);
             }
+
+            writer.WriteEndArray();
+            writer.Flush();
+            CheckCaptureBounds(writer, output, rows);
+        }
+        catch
+        {
+            File.Delete(snapshotPath);
+            throw;
         }
     }
 
-    private sealed record HomeSectionRow(int Id, int DisplayPreferencesId, int Order, int Type);
+    private static async Task CaptureHomeSectionsAsync(
+        DbConnection connection,
+        DbTransaction transaction,
+        string snapshotPath,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var output = CreateSnapshotFile(snapshotPath, asynchronous: true);
+            await using (output.ConfigureAwait(false))
+            using (var writer = new Utf8JsonWriter(output))
+            {
+                var command = connection.CreateCommand();
+                await using (command.ConfigureAwait(false))
+                {
+                    command.Transaction = transaction;
+                    command.CommandText =
+                        "SELECT \"Id\", \"DisplayPreferencesId\", \"Order\", \"Type\" FROM public.\"HomeSection\" ORDER BY \"Id\"";
+                    var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+                    await using (reader.ConfigureAwait(false))
+                    {
+                        writer.WriteStartArray();
+                        long rows = 0;
+                        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                        {
+                            WriteRow(writer, reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2), reader.GetInt32(3));
+                            if (++rows % 1024 == 0)
+                            {
+                                await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+                            }
+
+                            CheckCaptureBounds(writer, output, rows);
+                        }
+
+                        writer.WriteEndArray();
+                        await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+                        CheckCaptureBounds(writer, output, rows);
+                    }
+                }
+            }
+        }
+        catch
+        {
+            File.Delete(snapshotPath);
+            throw;
+        }
+    }
+
+    private static void WriteRow(
+        Utf8JsonWriter writer,
+        int id,
+        int displayPreferencesId,
+        int order,
+        int type)
+    {
+        writer.WriteStartObject();
+        writer.WriteNumber("Id", id);
+        writer.WriteNumber("DisplayPreferencesId", displayPreferencesId);
+        writer.WriteNumber("Order", order);
+        writer.WriteNumber("Type", type);
+        writer.WriteEndObject();
+    }
+
+    private static FileStream CreateSnapshotFile(string path, bool asynchronous)
+    {
+        var options = new FileStreamOptions
+        {
+            Mode = FileMode.CreateNew,
+            Access = FileAccess.Write,
+            Share = FileShare.None,
+            BufferSize = 65536,
+            Options = FileOptions.SequentialScan | (asynchronous ? FileOptions.Asynchronous : FileOptions.None),
+        };
+        if (!OperatingSystem.IsWindows())
+        {
+            options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        }
+
+        return new FileStream(path, options);
+    }
+
+    private static void CheckCaptureBounds(Utf8JsonWriter writer, FileStream output, long rows)
+    {
+        if (rows > NpgsqlBackupArchive.MaximumDatabaseRows
+            || output.Position + writer.BytesPending > NpgsqlBackupArchive.MaximumEntryBytes)
+        {
+            throw new InvalidDataException("The HomeSection backup exceeds the supported bounded dataset limits.");
+        }
+    }
 }

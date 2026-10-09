@@ -18,8 +18,10 @@ assemblies are host-owned compile contracts; only the provider and Npgsql runtim
 assemblies belong in the plugin package.
 
 The provider is loaded before Jellyfin's ordinary plugin initialization. Its
-constructor consequently depends only on the early `ILogger<T>` service and it
-does not use `IPluginServiceRegistrator`.
+constructor consequently depends only on services available in the early
+container. The same assembly is also loaded by the ordinary plugin manager so
+its `IPluginServiceRegistrator` can install the pre-mutation full-system backup
+guard.
 
 ## Installation and version selection
 
@@ -37,10 +39,13 @@ If startup reports a missing dependency or unsupported database ABI, restore the
 prior `PluginName` (or the prior Jellyfin version) and restart. Do not partially
 overwrite a live version directory.
 
-The packaged `meta.json` is disabled deliberately. `database.xml`, not normal
-plugin enablement, activates an early database provider. Keeping the ordinary
-plugin entry disabled avoids loading a redundant collectible copy later in the
-same process. No ordinary `IPlugin` descriptor or service registrator is needed.
+The packaged `meta.json` must remain `Active`. `database.xml` selects the early
+database provider, while ordinary plugin registration installs the only
+supported `IBackupService` decoration. The early provider validates the exact
+manifest and the final service registration before it permits PostgreSQL startup.
+Deleting or disabling `meta.json`, removing the registrator, or replacing the
+decorator therefore fails closed before a database connection or restore can
+mutate application files or migration history.
 
 ## Database configuration
 

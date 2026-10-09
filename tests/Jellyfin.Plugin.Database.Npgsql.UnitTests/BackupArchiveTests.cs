@@ -1,11 +1,16 @@
 using System.IO.Compression;
 using System.Security.Cryptography;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Database.Implementations.Entities.Security;
+using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Database.Implementations.Locking;
 using Jellyfin.Server.Implementations.SystemBackupService;
 using MediaBrowser.Controller.SystemBackupService;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -89,8 +94,7 @@ public sealed class BackupArchiveTests : IDisposable
     {
         var cancellationToken = TestContext.Current.CancellationToken;
         var inner = new RecordingBackupService(this.CreateStockArchive());
-        var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
-        var decorator = new NpgsqlBackupServiceDecorator(inner, provider);
+        var decorator = new NpgsqlBackupServiceDecorator(inner, true);
 
         var unknown = await Assert.ThrowsAsync<NotSupportedException>(
             () => decorator.RestoreBackupAsync(inner.ArchivePath));
@@ -110,8 +114,7 @@ public sealed class BackupArchiveTests : IDisposable
     public async Task CreateDecorator_UsesStockServiceThenAddsExactProviderBinding()
     {
         var inner = new RecordingBackupService(this.CreateStockArchive());
-        var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
-        var decorator = new NpgsqlBackupServiceDecorator(inner, provider);
+        var decorator = new NpgsqlBackupServiceDecorator(inner, true);
 
         var manifest = await decorator.CreateBackupAsync(new BackupOptionsDto { Database = true });
 
@@ -203,21 +206,217 @@ public sealed class BackupArchiveTests : IDisposable
         Assert.Contains("duplicate 'Id' value '42'", exception.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task ModelPreflight_AcceptsExactEmptyModelAndHistory()
+    {
+        var path = this.CreateStockArchive(historyJson: CreateExactHistoryJson());
+        await NpgsqlBackupArchive.BindAsync(path, true, TestContext.Current.CancellationToken);
+        using var context = CreateContext();
+
+        await NpgsqlBackupArchive.ValidateAsync(
+            path,
+            context.Model,
+            TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public void EarlyProvider_RequiresExactBackupDecoratorBeforeDatabaseAccess()
+    {
+        var stock = new RecordingBackupService(this.CreateStockArchive());
+        var unsafeServices = new ServiceCollection()
+            .AddSingleton<IBackupService>(stock)
+            .BuildServiceProvider();
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => NpgsqlDatabaseProvider.ValidateBackupSafetyDecorator(unsafeServices));
+        Assert.Contains("refusing to start", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("No restore or database connection was attempted", exception.Message, StringComparison.Ordinal);
+
+        var safeCollection = new ServiceCollection();
+        var safeDescriptor = ServiceDescriptor.Singleton<IBackupService>(
+            new NpgsqlBackupServiceDecorator(stock, true));
+        ((ICollection<ServiceDescriptor>)safeCollection).Add(safeDescriptor);
+        safeCollection.AddSingleton(new NpgsqlBackupSafetyRegistration(safeCollection, safeDescriptor));
+        var safeServices = safeCollection.BuildServiceProvider();
+        NpgsqlDatabaseProvider.ValidateBackupSafetyDecorator(safeServices);
+    }
+
+    [Theory]
+    [InlineData("missing")]
+    [InlineData("wrong-type")]
+    [InlineData("duplicate-identity")]
+    public async Task ModelPreflight_RejectsMalformedIdentityRowsBeforeRestore(string corruption)
+    {
+        var activity = new ActivityLog("preflight", "BackupRestore", Guid.Empty);
+        using var context = CreateContext();
+        context.Entry(activity).Property(nameof(ActivityLog.Id)).CurrentValue = 42;
+        var validJson = JsonSerializer.Serialize(new[] { activity });
+        var wrongType = JsonNode.Parse(validJson)!;
+        wrongType.AsArray()[0]![nameof(ActivityLog.Id)] = "wrong";
+        var activityJson = corruption switch
+        {
+            "missing" => "[{}]",
+            "wrong-type" => wrongType.ToJsonString(),
+            "duplicate-identity" => "[" + validJson[1..^1] + "," + validJson[1..^1] + "]",
+            _ => throw new InvalidOperationException(),
+        };
+        var path = this.CreateStockArchive(
+            activityLogsJson: activityJson,
+            historyJson: CreateExactHistoryJson());
+        await NpgsqlBackupArchive.BindAsync(path, true, TestContext.Current.CancellationToken);
+
+        await Assert.ThrowsAnyAsync<InvalidDataException>(
+            () => NpgsqlBackupArchive.ValidateAsync(
+                path,
+                context.Model,
+                TestContext.Current.CancellationToken));
+    }
+
+    [Fact]
+    public async Task ModelPreflight_RejectsDuplicateNonIdentityKeyBeforeRestore()
+    {
+        var user = new User("duplicate-user", "auth", "reset");
+        var serialized = JsonSerializer.Serialize(user);
+        var path = this.CreateStockArchive(
+            usersJson: $"[{serialized},{serialized}]",
+            historyJson: CreateExactHistoryJson());
+        await NpgsqlBackupArchive.BindAsync(path, true, TestContext.Current.CancellationToken);
+        using var context = CreateContext();
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlBackupArchive.ValidateAsync(
+                path,
+                context.Model,
+                TestContext.Current.CancellationToken));
+        Assert.Contains("duplicate key", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ModelPreflight_RejectsDuplicateUniqueValueBeforeRestore()
+    {
+        var first = new User("duplicate-unique-user", "auth", "reset");
+        var second = new User("duplicate-unique-user", "auth", "reset");
+        var path = this.CreateStockArchive(
+            usersJson: JsonSerializer.Serialize(new[] { first, second }),
+            historyJson: CreateExactHistoryJson());
+        await NpgsqlBackupArchive.BindAsync(path, true, TestContext.Current.CancellationToken);
+        using var context = CreateContext();
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlBackupArchive.ValidateAsync(
+                path,
+                context.Model,
+                TestContext.Current.CancellationToken));
+        Assert.Contains("duplicate unique value", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ModelPreflight_RejectsUnresolvedForeignKeyBeforeRestore()
+    {
+        var permission = new Permission(PermissionKind.EnableMediaPlayback, true)
+        {
+            UserId = Guid.NewGuid(),
+        };
+        using var context = CreateContext();
+        context.Entry(permission).Property(nameof(Permission.Id)).CurrentValue = 73;
+        var path = this.CreateStockArchive(
+            historyJson: CreateExactHistoryJson(),
+            permissionsJson: JsonSerializer.Serialize(new[] { permission }));
+        await NpgsqlBackupArchive.BindAsync(path, true, TestContext.Current.CancellationToken);
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlBackupArchive.ValidateAsync(
+                path,
+                context.Model,
+                TestContext.Current.CancellationToken));
+        Assert.Contains("unresolved relationship", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Validation_RejectsCompressionBombAndEntryCountBeforeReadingPayloads()
+    {
+        var compressedBomb = this.CreateStockArchive(
+            usersJson: "[" + new string(' ', 2 * 1024 * 1024) + "]");
+        var ratioFailure = await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlBackupArchive.BindAsync(compressedBomb, true, TestContext.Current.CancellationToken));
+        Assert.Contains("compression ratio", ratioFailure.Message, StringComparison.Ordinal);
+
+        var tooManyEntries = Path.Combine(this.testRoot, "too-many-entries.zip");
+        using (var archive = ZipFile.Open(tooManyEntries, ZipArchiveMode.Create))
+        {
+            for (var index = 0; index <= NpgsqlBackupArchive.MaximumEntryCount; index++)
+            {
+                _ = archive.CreateEntry($"empty/{index}.txt");
+            }
+        }
+
+        var countFailure = await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlBackupArchive.ValidateAsync(tooManyEntries, TestContext.Current.CancellationToken));
+        Assert.Contains("entry-count", countFailure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Validation_RejectsOversizedMarkerBeforeDeserialization()
+    {
+        var path = this.CreateStockArchive();
+        await NpgsqlBackupArchive.BindAsync(path, true, TestContext.Current.CancellationToken);
+        using (var archive = ZipFile.Open(path, ZipArchiveMode.Update))
+        {
+            archive.GetEntry(NpgsqlBackupArchive.MarkerEntryName)!.Delete();
+            var marker = archive.CreateEntry(NpgsqlBackupArchive.MarkerEntryName, CompressionLevel.NoCompression);
+            using var stream = marker.Open();
+            var buffer = new byte[65536];
+            var remaining = NpgsqlBackupArchive.MaximumMarkerBytes + 1;
+            while (remaining > 0)
+            {
+                var count = (int)Math.Min(buffer.Length, remaining);
+                stream.Write(buffer, 0, count);
+                remaining -= count;
+            }
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlBackupArchive.ValidateAsync(path, TestContext.Current.CancellationToken));
+        Assert.Contains("marker exceeds", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Binding_RejectsExcessiveJsonDepthAndStringLength()
+    {
+        var depth = this.CreateStockArchive(
+            usersJson: "[{\"Unknown\":" + new string('[', 65) + "0" + new string(']', 65) + "}]",
+            databaseCompression: CompressionLevel.NoCompression);
+        var depthFailure = await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlBackupArchive.BindAsync(depth, true, TestContext.Current.CancellationToken));
+        Assert.Contains("malformed", depthFailure.Message, StringComparison.Ordinal);
+
+        var oversizedString = this.CreateStockArchive(
+            usersJson: "[{\"Unknown\":\"" + new string('x', NpgsqlBackupArchive.MaximumJsonStringLength + 1) + "\"}]",
+            databaseCompression: CompressionLevel.NoCompression);
+        var stringFailure = await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlBackupArchive.BindAsync(oversizedString, true, TestContext.Current.CancellationToken));
+        Assert.Contains("oversized string", stringFailure.Message, StringComparison.Ordinal);
+    }
+
     private string CreateStockArchive(
         string? omit = null,
         string usersJson = "[]",
-        string activityLogsJson = "[]")
+        string activityLogsJson = "[]",
+        string historyJson = "[]",
+        string permissionsJson = "[]",
+        CompressionLevel databaseCompression = CompressionLevel.Optimal)
     {
         var path = Path.Combine(this.testRoot, Guid.NewGuid().ToString("N") + ".zip");
         using var archive = ZipFile.Open(path, ZipArchiveMode.Create);
         foreach (var name in DatabaseEntries.Where(name => !string.Equals(name, omit, StringComparison.Ordinal)))
         {
-            var entry = archive.CreateEntry("Database/" + name + ".json");
+            var entry = archive.CreateEntry("Database/" + name + ".json", databaseCompression);
             using var writer = new StreamWriter(entry.Open());
             writer.Write(name switch
             {
                 "Users" => usersJson,
                 "ActivityLogs" => activityLogsJson,
+                "HistoryRow" => historyJson,
+                "Permissions" => permissionsJson,
                 _ => "[]",
             });
         }
@@ -230,6 +429,17 @@ public sealed class BackupArchiveTests : IDisposable
 
         return path;
     }
+
+    private static string CreateExactHistoryJson()
+        => JsonSerializer.Serialize(
+            NpgsqlHostMigrationAudit.AuditedMigrationIds
+                .Concat(
+                [
+                    "20261009061101_InitialPostgreSqlBaseline",
+                    "20261009061446_AddActivityLogTypeDateIndex",
+                    "20261009113458_AddUuidMinMaxAggregates",
+                ])
+                .Select(id => new { MigrationId = id, ProductVersion = PluginMetadata.SupportedDatabaseAbi }));
 
     private static JellyfinDbContext CreateContext()
     {
@@ -284,7 +494,8 @@ public sealed class BackupArchiveTests : IDisposable
             this.CreateCalls++;
             if (NpgsqlBackupScope.IsActive)
             {
-                NpgsqlBackupScope.SetHomeSectionsJson("[]");
+                var snapshotPath = NpgsqlBackupScope.RequireHomeSectionsSnapshotPath();
+                File.WriteAllText(snapshotPath, "[]");
             }
 
             return Task.FromResult(new BackupManifestDto
