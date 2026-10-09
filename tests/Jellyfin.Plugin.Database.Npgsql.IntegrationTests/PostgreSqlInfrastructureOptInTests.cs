@@ -250,6 +250,48 @@ public sealed class PostgreSqlInfrastructureOptInTests
             {
                 child.EnsureSuccess("Running a true parallel container-backed worker", new SensitiveDataRedactor());
             }
+
+            await using var sharedCluster = await PostgreSqlTestContainer.StartAsync(
+                options with { WorkerId = "same-cluster" },
+                cancellationToken);
+            var readyFile = Path.Combine(
+                root,
+                ".artifacts",
+                "same-cluster-ready-" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                var sharedEnvironment = new System.Collections.Generic.Dictionary<string, string?>
+                {
+                    [PostgreSqlTestOptions.AdministratorConnectionEnvironmentVariable] = sharedCluster.AdministratorConnectionString,
+                    [PostgreSqlTestOptions.UseContainerEnvironmentVariable] = null,
+                    [PostgreSqlTestOptions.ExternalExclusiveEnvironmentVariable] = null
+                };
+                var holder = ExternalCommand.RunAsync(
+                    "dotnet",
+                    new[] { helper, "cluster-lease-hold", readyFile, "3" },
+                    TimeSpan.FromSeconds(30),
+                    cancellationToken,
+                    sharedEnvironment);
+                var readyDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+                while (!File.Exists(readyFile) && DateTime.UtcNow < readyDeadline && !holder.IsCompleted)
+                {
+                    await Task.Delay(25, cancellationToken);
+                }
+
+                Assert.True(File.Exists(readyFile), "The first dotnet process did not publish its same-cluster lease handoff.");
+                var contender = await ExternalCommand.RunAsync(
+                    "dotnet",
+                    new[] { helper, "cluster-lease-expect-blocked" },
+                    TimeSpan.FromSeconds(30),
+                    cancellationToken,
+                    sharedEnvironment);
+                contender.EnsureSuccess("Proving cross-process same-cluster lease exclusion", new SensitiveDataRedactor());
+                (await holder).EnsureSuccess("Holding a cluster lease in a separate dotnet process", new SensitiveDataRedactor());
+            }
+            finally
+            {
+                File.Delete(readyFile);
+            }
         }
 
         var databases = await environment.CreateDatabasesAsync(

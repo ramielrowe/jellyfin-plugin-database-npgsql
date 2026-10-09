@@ -9,40 +9,75 @@ using System.Threading;
 
 namespace Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
 
-internal sealed record LinuxProcessIdentity(int ProcessId, int ParentProcessId, int ProcessGroupId, ulong StartTime)
+internal sealed class LinuxProcessIdentity : IDisposable
 {
+    private int _pidFileDescriptor;
+
+    private LinuxProcessIdentity(int processId, int parentProcessId, int processGroupId, ulong startTime, int pidFileDescriptor)
+    {
+        ProcessId = processId;
+        ParentProcessId = parentProcessId;
+        ProcessGroupId = processGroupId;
+        StartTime = startTime;
+        _pidFileDescriptor = pidFileDescriptor;
+    }
+
+    public int ProcessId { get; }
+
+    public int ParentProcessId { get; }
+
+    public int ProcessGroupId { get; }
+
+    public ulong StartTime { get; }
+
     public static LinuxProcessIdentity Capture(int processId)
     {
         if (!OperatingSystem.IsLinux())
         {
-            throw new PlatformNotSupportedException("Safe test-process identity checks require Linux /proc.");
+            throw new PlatformNotSupportedException("Safe test-process control requires Linux pidfds and /proc.");
         }
 
-        var stat = File.ReadAllText($"/proc/{processId}/stat");
-        var closeParenthesis = stat.LastIndexOf(')');
-        if (closeParenthesis < 0)
+        var descriptor = pidfd_open(processId, 0);
+        if (descriptor < 0)
         {
-            throw new InvalidOperationException("Could not parse the launched process identity.");
+            throw new IOException("Could not open a pidfd for the launched process.");
         }
 
-        var fields = stat[(closeParenthesis + 2)..].Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (fields.Length < 20
-            || !int.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out var parentProcessId)
-            || !int.TryParse(fields[2], NumberStyles.None, CultureInfo.InvariantCulture, out var processGroupId)
-            || !ulong.TryParse(fields[19], NumberStyles.None, CultureInfo.InvariantCulture, out var startTime))
+        try
         {
-            throw new InvalidOperationException("Could not parse the launched process identity.");
-        }
+            if (HasExited(descriptor))
+            {
+                throw new IOException("The launched process exited before its pidfd identity was captured.");
+            }
 
-        return new LinuxProcessIdentity(processId, parentProcessId, processGroupId, startTime);
+            var (parentProcessId, processGroupId, startTime) = ReadIdentity(processId);
+            if (HasExited(descriptor))
+            {
+                throw new IOException("The launched process exited while its pidfd identity was captured.");
+            }
+
+            var result = new LinuxProcessIdentity(processId, parentProcessId, processGroupId, startTime, descriptor);
+            descriptor = -1;
+            return result;
+        }
+        finally
+        {
+            if (descriptor >= 0)
+            {
+                _ = close(descriptor);
+            }
+        }
     }
+
+    public static LinuxProcessIdentity ReportedExited(int processId, int parentProcessId, int processGroupId, ulong startTime)
+        => new(processId, parentProcessId, processGroupId, startTime, -1);
 
     public static IReadOnlyList<LinuxProcessIdentity> CaptureDescendants(int rootProcessId)
     {
         var all = new List<LinuxProcessIdentity>();
         foreach (var directory in Directory.EnumerateDirectories("/proc"))
         {
-            if (!int.TryParse(Path.GetFileName(directory), out var processId))
+            if (!int.TryParse(Path.GetFileName(directory), out var processId) || processId == rootProcessId)
             {
                 continue;
             }
@@ -53,7 +88,7 @@ internal sealed record LinuxProcessIdentity(int ProcessId, int ParentProcessId, 
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
             {
-                // A process exited during enumeration.
+                // A process exited while its pidfd was opened and identified.
             }
         }
 
@@ -73,25 +108,33 @@ internal sealed record LinuxProcessIdentity(int ProcessId, int ParentProcessId, 
             }
         }
 
+        foreach (var unrelated in all.Except(descendants))
+        {
+            unrelated.Dispose();
+        }
+
         return descendants;
     }
 
     public static LinuxProcessIdentity? AwaitDedicatedGroup(Process process, TimeSpan timeout)
     {
-        var deadline = DateTime.UtcNow + timeout;
-        while (DateTime.UtcNow < deadline)
+        var deadline = Stopwatch.StartNew();
+        while (deadline.Elapsed < timeout)
         {
             if (process.HasExited)
             {
                 return null;
             }
 
+            LinuxProcessIdentity? identity = null;
             try
             {
-                var identity = Capture(process.Id);
+                identity = Capture(process.Id);
                 if (identity.ProcessGroupId == identity.ProcessId)
                 {
-                    return identity;
+                    var result = identity;
+                    identity = null;
+                    return result;
                 }
             }
             catch (IOException)
@@ -101,6 +144,10 @@ internal sealed record LinuxProcessIdentity(int ProcessId, int ParentProcessId, 
                     return null;
                 }
             }
+            finally
+            {
+                identity?.Dispose();
+            }
 
             Thread.Sleep(1);
         }
@@ -108,141 +155,85 @@ internal sealed record LinuxProcessIdentity(int ProcessId, int ParentProcessId, 
         throw new InvalidOperationException("The launched process did not enter its dedicated process group in time.");
     }
 
-    public bool IsCurrent()
-    {
-        try
-        {
-            var current = Capture(ProcessId);
-            return current.ProcessId == ProcessId
-                && current.ProcessGroupId == ProcessGroupId
-                && current.StartTime == StartTime;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
-        {
-            return false;
-        }
-    }
+    public bool IsCurrent() => _pidFileDescriptor >= 0 && !HasExited(_pidFileDescriptor);
 
     public void Signal(int signal)
     {
-        if (!IsCurrent())
+        ObjectDisposedException.ThrowIf(_pidFileDescriptor < 0, this);
+        if (pidfd_send_signal(_pidFileDescriptor, signal, IntPtr.Zero, 0) != 0)
         {
-            throw new InvalidOperationException("Refusing to signal a process whose PID identity changed.");
-        }
-
-        if (kill(ProcessId, signal) != 0 && Marshal.GetLastPInvokeError() != 3)
-        {
-            throw new InvalidOperationException($"Could not send signal {signal} to verified test-process PID {ProcessId}.");
+            var error = Marshal.GetLastPInvokeError();
+            if (error != 3)
+            {
+                throw new InvalidOperationException($"Could not send signal {signal} through the test-process pidfd.");
+            }
         }
     }
 
     public void TerminateGroup(TimeSpan gracePeriod)
-    {
-        if (!IsCurrent() || ProcessGroupId != ProcessId)
-        {
-            throw new InvalidOperationException("Refusing to signal a process group whose leader identity changed.");
-        }
-
-        if (kill(-ProcessGroupId, 15) != 0 && Marshal.GetLastPInvokeError() != 3)
-        {
-            throw new InvalidOperationException("Could not send TERM to the verified test process group.");
-        }
-
-        var deadline = DateTime.UtcNow + gracePeriod;
-        while (DateTime.UtcNow < deadline && IsCurrent())
-        {
-            System.Threading.Thread.Sleep(50);
-        }
-
-        if (IsCurrent())
-        {
-            if (kill(-ProcessGroupId, 9) != 0 && Marshal.GetLastPInvokeError() != 3)
-            {
-                throw new InvalidOperationException("Could not send KILL to the verified test process group.");
-            }
-        }
-    }
+        => TerminateMatchingProcesses(
+            candidate => candidate.ProcessGroupId == ProcessGroupId,
+            gracePeriod,
+            "process-group");
 
     public void TerminateTree(TimeSpan gracePeriod)
     {
-        if (!IsCurrent() || ProcessGroupId != ProcessId)
-        {
-            throw new InvalidOperationException("Refusing to terminate a process tree whose root identity changed.");
-        }
-
-        var identities = new List<LinuxProcessIdentity> { this };
-        identities.AddRange(CaptureDescendants(ProcessId));
-        var groups = identities.GroupBy(identity => identity.ProcessGroupId).ToArray();
-        foreach (var group in groups)
-        {
-            var leader = group.FirstOrDefault(identity => identity.ProcessId == group.Key);
-            if (leader is not null && leader.IsCurrent())
-            {
-                SignalVerifiedGroup(leader, 15);
-            }
-            else
-            {
-                foreach (var identity in group.Where(identity => identity.IsCurrent()))
-                {
-                    SignalVerifiedProcess(identity, 15);
-                }
-            }
-        }
-
-        var deadline = DateTime.UtcNow + gracePeriod;
-        while (DateTime.UtcNow < deadline && identities.Exists(identity => identity.IsCurrent()))
-        {
-            Thread.Sleep(50);
-        }
-
-        foreach (var identity in identities.Where(identity => identity.IsCurrent()))
-        {
-            SignalVerifiedProcess(identity, 9);
-        }
-
-        deadline = DateTime.UtcNow + gracePeriod;
-        while (DateTime.UtcNow < deadline && identities.Exists(identity => identity.IsCurrent()))
-        {
-            Thread.Sleep(50);
-        }
-
-        var survivor = identities.FirstOrDefault(identity => identity.IsCurrent());
-        if (survivor is not null)
-        {
-            throw new InvalidOperationException(
-                $"Could not confirm termination of external-command descendant PID {survivor.ProcessId} with start time {survivor.StartTime}.");
-        }
-    }
-
-    private static void SignalVerifiedGroup(LinuxProcessIdentity leader, int signal)
-    {
-        if (!leader.IsCurrent() || leader.ProcessId != leader.ProcessGroupId)
-        {
-            throw new InvalidOperationException("Refusing to signal a process group whose leader identity changed.");
-        }
-
-        if (kill(-leader.ProcessGroupId, signal) != 0 && Marshal.GetLastPInvokeError() != 3)
-        {
-            throw new InvalidOperationException($"Could not send signal {signal} to a verified test process group.");
-        }
-    }
-
-    private static void SignalVerifiedProcess(LinuxProcessIdentity identity, int signal)
-    {
-        if (!identity.IsCurrent())
+        if (!IsCurrent())
         {
             return;
         }
 
-        if (kill(identity.ProcessId, signal) != 0 && Marshal.GetLastPInvokeError() != 3)
+        var identities = new List<LinuxProcessIdentity> { this };
+        identities.AddRange(CaptureDescendants(ProcessId));
+        try
         {
-            throw new InvalidOperationException($"Could not send signal {signal} to verified test-process PID {identity.ProcessId}.");
+            TerminateOpened(identities, gracePeriod, "process-tree");
+        }
+        finally
+        {
+            foreach (var identity in identities.Where(identity => !ReferenceEquals(identity, this)))
+            {
+                identity.Dispose();
+            }
         }
     }
 
     public void TerminateRemainingGroup()
+        => TerminateMatchingProcesses(candidate => candidate.ProcessGroupId == ProcessGroupId, TimeSpan.FromSeconds(5), "remaining process-group");
+
+    public void Dispose()
     {
-        var members = new List<LinuxProcessIdentity>();
+        var descriptor = Interlocked.Exchange(ref _pidFileDescriptor, -1);
+        if (descriptor >= 0)
+        {
+            _ = close(descriptor);
+        }
+    }
+
+    private static (int ParentProcessId, int ProcessGroupId, ulong StartTime) ReadIdentity(int processId)
+    {
+        var stat = File.ReadAllText($"/proc/{processId}/stat");
+        var closeParenthesis = stat.LastIndexOf(')');
+        if (closeParenthesis < 0)
+        {
+            throw new InvalidOperationException("Could not parse the launched process identity.");
+        }
+
+        var fields = stat[(closeParenthesis + 2)..].Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (fields.Length < 20
+            || !int.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out var parentProcessId)
+            || !int.TryParse(fields[2], NumberStyles.None, CultureInfo.InvariantCulture, out var processGroupId)
+            || !ulong.TryParse(fields[19], NumberStyles.None, CultureInfo.InvariantCulture, out var startTime))
+        {
+            throw new InvalidOperationException("Could not parse the launched process identity.");
+        }
+
+        return (parentProcessId, processGroupId, startTime);
+    }
+
+    private void TerminateMatchingProcesses(Func<LinuxProcessIdentity, bool> predicate, TimeSpan gracePeriod, string description)
+    {
+        var identities = new List<LinuxProcessIdentity>();
         foreach (var directory in Directory.EnumerateDirectories("/proc"))
         {
             if (!int.TryParse(Path.GetFileName(directory), out var processId))
@@ -252,34 +243,94 @@ internal sealed record LinuxProcessIdentity(int ProcessId, int ParentProcessId, 
 
             try
             {
-                var candidate = Capture(processId);
-                if (candidate.ProcessGroupId == ProcessGroupId)
+                var candidate = processId == ProcessId ? this : Capture(processId);
+                if (predicate(candidate))
                 {
-                    members.Add(candidate);
+                    identities.Add(candidate);
+                }
+                else if (!ReferenceEquals(candidate, this))
+                {
+                    candidate.Dispose();
                 }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
             {
-                // A process exited during enumeration.
+                // The pidfd could not be atomically opened and identified.
             }
         }
 
-        if (members.Count == 0)
+        try
         {
-            return;
+            TerminateOpened(identities, gracePeriod, description);
         }
-
-        if (members.Exists(member => member.ProcessId == ProcessGroupId && member.StartTime != StartTime))
+        finally
         {
-            throw new InvalidOperationException("Refusing to signal a process group whose numeric ID was reused.");
-        }
-
-        if (kill(-ProcessGroupId, 9) != 0 && Marshal.GetLastPInvokeError() != 3)
-        {
-            throw new InvalidOperationException("Could not terminate remaining verified test-process descendants.");
+            foreach (var identity in identities.Where(identity => !ReferenceEquals(identity, this)))
+            {
+                identity.Dispose();
+            }
         }
     }
 
+    private static void TerminateOpened(IReadOnlyList<LinuxProcessIdentity> identities, TimeSpan gracePeriod, string description)
+    {
+        foreach (var identity in identities)
+        {
+            identity.Signal(15);
+        }
+
+        var timer = Stopwatch.StartNew();
+        while (timer.Elapsed < gracePeriod && identities.Any(identity => identity.IsCurrent()))
+        {
+            Thread.Sleep(25);
+        }
+
+        foreach (var identity in identities.Where(identity => identity.IsCurrent()))
+        {
+            identity.Signal(9);
+        }
+
+        timer.Restart();
+        while (timer.Elapsed < gracePeriod && identities.Any(identity => identity.IsCurrent()))
+        {
+            Thread.Sleep(25);
+        }
+
+        if (identities.Any(identity => identity.IsCurrent()))
+        {
+            throw new InvalidOperationException($"Could not confirm bounded pidfd termination of the {description}.");
+        }
+    }
+
+    private static bool HasExited(int descriptor)
+    {
+        var item = new PollDescriptor { FileDescriptor = descriptor, Events = 1 };
+        var result = poll(ref item, 1, 0);
+        if (result < 0)
+        {
+            throw new IOException("Could not poll a test-process pidfd.");
+        }
+
+        return result != 0;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PollDescriptor
+    {
+        public int FileDescriptor;
+        public short Events;
+        public short ReturnedEvents;
+    }
+
     [DllImport("libc", SetLastError = true)]
-    private static extern int kill(int pid, int signal);
+    private static extern int pidfd_open(int pid, uint flags);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int pidfd_send_signal(int pidfd, int signal, IntPtr information, uint flags);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int poll(ref PollDescriptor descriptors, nuint count, int timeout);
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int close(int descriptor);
 }

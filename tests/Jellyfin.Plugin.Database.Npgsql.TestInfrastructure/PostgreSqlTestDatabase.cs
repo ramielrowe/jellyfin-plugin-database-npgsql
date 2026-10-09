@@ -69,7 +69,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
         var identity = TestResourceNames.Create(workerId);
         var runtimePassword = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
         var leaseId = Guid.NewGuid().ToString("N");
-        var ownerLease = AcquireOwnerLease(leaseId);
+        var ownerLease = AcquireOwnerLease(clusterLease.ClusterIdentity, leaseId);
         var ownershipTransferred = false;
         var roleCreated = false;
         var databaseCreated = false;
@@ -351,7 +351,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
                             && TestResourceNames.IsOwnedRole(role)
                             && string.Equals(role, TestResourceNames.RolePrefix + suffix, StringComparison.Ordinal)
                             && string.Equals(databaseMarker, roleMarker, StringComparison.Ordinal)
-                            && IsStaleOwnershipMarker(databaseMarker, out var leaseId))
+                            && IsStaleOwnershipMarker(databaseMarker, clusterLease.ClusterIdentity, out var leaseId))
                         {
                             staleResources.Add((
                                 new TestResourceIdentity(name, role, TestResourceNames.ContainerPrefix + Guid.NewGuid().ToString("N")),
@@ -370,7 +370,8 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
                 {
                     var roleName = roleReader.GetString(0);
                     var marker = roleReader.IsDBNull(1) ? null : roleReader.GetString(1);
-                    if (TestResourceNames.IsOwnedRole(roleName) && IsStaleOwnershipMarker(marker, out var leaseId))
+                    if (TestResourceNames.IsOwnedRole(roleName)
+                        && IsStaleOwnershipMarker(marker, clusterLease.ClusterIdentity, out var leaseId))
                     {
                         staleRoles.Add((roleName, leaseId, roleReader.GetFieldValue<uint>(2)));
                     }
@@ -379,7 +380,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
 
             foreach (var stale in staleResources)
             {
-                using var staleLease = AcquireOwnerLease(stale.LeaseId);
+                using var staleLease = AcquireOwnerLease(clusterLease.ClusterIdentity, stale.LeaseId);
                 await DropResourcesUnderLeaseAsync(
                     connection,
                     stale.Identity,
@@ -392,7 +393,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
 
             foreach (var staleRole in staleRoles)
             {
-                using var staleLease = AcquireOwnerLease(staleRole.LeaseId);
+                using var staleLease = AcquireOwnerLease(clusterLease.ClusterIdentity, staleRole.LeaseId);
                 await DropResourcesUnderLeaseAsync(
                     connection,
                     new TestResourceIdentity(
@@ -470,7 +471,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
     private static string CurrentOwnershipMarker(string leaseId)
         => OwnershipMarkerPrefix + GetScope() + "|" + leaseId;
 
-    private static bool IsStaleOwnershipMarker(string? marker, out string leaseId)
+    private static bool IsStaleOwnershipMarker(string? marker, string clusterIdentity, out string leaseId)
     {
         leaseId = string.Empty;
         if (marker is null || !marker.StartsWith(OwnershipMarkerPrefix, StringComparison.Ordinal))
@@ -490,7 +491,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
         leaseId = fields[2];
         try
         {
-            using var lease = AcquireOwnerLease(leaseId);
+            using var lease = AcquireOwnerLease(clusterIdentity, leaseId);
             return true;
         }
         catch (IOException)
@@ -499,14 +500,19 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
         }
     }
 
-    private static FileStream AcquireOwnerLease(string leaseId)
+    private static FileStream AcquireOwnerLease(string clusterIdentity, string leaseId)
     {
-        var path = GetLeasePath("database-owners", leaseId + ".lock");
+        if (clusterIdentity.Length is < 10 or > 32 || !clusterIdentity.All(char.IsAsciiDigit))
+        {
+            throw new InvalidOperationException("The PostgreSQL cluster lease namespace is malformed.");
+        }
+
+        var path = GetLeasePath("database-owners", clusterIdentity, leaseId + ".lock");
         return SecureFileSystem.OpenLease(path);
     }
 
-    private static string GetLeasePath(string category, string name)
-        => Path.Combine(PluginRepository.FindRoot(AppContext.BaseDirectory), ".artifacts", category, name);
+    private static string GetLeasePath(string category, string clusterIdentity, string name)
+        => Path.Combine(PluginRepository.FindRoot(AppContext.BaseDirectory), ".artifacts", category, clusterIdentity, name);
 
     private static string GetScope()
     {

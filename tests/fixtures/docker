@@ -41,7 +41,12 @@ with state_path.open("r+") as state:
         if requested != container_id or scenario == "disappeared" or removed:
             print(f"Error: No such object: {requested}", file=sys.stderr)
             raise SystemExit(1)
-        print(f"{container_id}|/{name}|true|{scope}|{lease}|123|456")
+        if scenario == "decoy":
+            # A row genuinely returned inside the requested scope changes immutable
+            # ownership metadata before mutation. Revalidation must fail closed.
+            print(f"{container_id}|/{name}|true|{scope}|{lease}|999|456")
+        else:
+            print(f"{container_id}|/{name}|true|{scope}|{lease}|123|456")
         raise SystemExit(0)
 
     if arguments[:2] == ["rm", "--force"]:

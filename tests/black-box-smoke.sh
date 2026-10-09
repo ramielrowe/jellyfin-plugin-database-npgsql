@@ -134,7 +134,7 @@ if [ "${1:-}" = "--test-container-reaper" ]; then
     export FAKE_DOCKER_LOCK="$test_root/scope.lock"
     export FAKE_DOCKER_STATE="$test_root/state"
     export FAKE_DOCKER_LOG="$test_root/removals"
-    for rejected in malformed duplicate; do
+    for rejected in malformed duplicate decoy; do
         : >"$FAKE_DOCKER_STATE"
         : >"$FAKE_DOCKER_LOG"
         export FAKE_DOCKER_SCENARIO=$rejected
@@ -144,18 +144,12 @@ if [ "${1:-}" = "--test-container-reaper" ]; then
         fi
         [ ! -s "$FAKE_DOCKER_LOG" ] || { echo "FAIL: $rejected discovery mutated a container" >&2; exit 1; }
     done
-    for accepted in disappeared decoy; do
+    for accepted in disappeared; do
         : >"$FAKE_DOCKER_STATE"
         : >"$FAKE_DOCKER_LOG"
         export FAKE_DOCKER_SCENARIO=$accepted
         "$0" --test-container-reaper-worker "$accepted"
-        if [ "$accepted" = decoy ]; then
-            [ "$(wc -l <"$FAKE_DOCKER_LOG")" -eq 1 ] \
-                && grep -qx "$(printf 'a%.0s' $(seq 1 64))" "$FAKE_DOCKER_LOG" \
-                || { echo "FAIL: decoy isolation did not remove exactly the validated scoped ID" >&2; exit 1; }
-        else
-            [ ! -s "$FAKE_DOCKER_LOG" ] || { echo "FAIL: an already-disappeared ID was removed" >&2; exit 1; }
-        fi
+        [ ! -s "$FAKE_DOCKER_LOG" ] || { echo "FAIL: an already-disappeared ID was removed" >&2; exit 1; }
     done
     : >"$FAKE_DOCKER_STATE"
     : >"$FAKE_DOCKER_LOG"
@@ -195,15 +189,25 @@ if [ "${1:-}" = "--test-detached-cleanup" ]; then
         sleep 0.01
     done
     [ -s "$pid_file" ] && [ -s "$identity_file" ] || { echo "FAIL: subreaper regression did not initialize" >&2; exit 1; }
-    read -r _version recorded_supervisor recorded_start _host_pid _host_start _host_group <"$identity_file"
-    [ "$recorded_supervisor" = "$supervisor_pid" ] || { echo "FAIL: supervisor PID handoff mismatch" >&2; exit 1; }
+    read -r _version recorded_watchdog recorded_start recorded_supervisor recorded_supervisor_start recorded_supervisor_group _host_pid _host_start _host_group <"$identity_file"
+    [ "$recorded_watchdog" = "$supervisor_pid" ] || { echo "FAIL: watchdog PID handoff mismatch" >&2; exit 1; }
     actual_start=$(awk '{print $22}' "/proc/$supervisor_pid/stat")
     [ "$actual_start" = "$recorded_start" ] || { echo "FAIL: supervisor start identity mismatch" >&2; exit 1; }
     if process_start_matches "$supervisor_pid" "$((recorded_start + 1))"; then
         echo "FAIL: PID-reuse guard accepted the wrong start identity" >&2
         exit 1
     fi
-    kill -TERM "$supervisor_pid"
+    supervisor_group=$(awk '{print $5}' "/proc/$supervisor_pid/stat")
+    if pidfd_signal_verified "$supervisor_pid" "$supervisor_group" "$((recorded_start + 1))" 15; then
+        echo "FAIL: pidfd signal guard accepted a wrong/reused process identity" >&2
+        exit 1
+    fi
+    process_identity_matches "$supervisor_pid" "$supervisor_group" "$recorded_start" \
+        || { echo "FAIL: wrong-identity probe disturbed the live watchdog" >&2; exit 1; }
+    pidfd_signal_verified "$supervisor_pid" "$supervisor_group" "$recorded_start" 15 \
+        || { echo "FAIL: could not terminate the containment watchdog through its pidfd" >&2; exit 1; }
+    pidfd_wait_verified "$supervisor_pid" "$supervisor_group" "$recorded_start" 10000 \
+        || { echo "FAIL: containment watchdog did not stop within ten seconds" >&2; exit 1; }
     wait "$supervisor_pid" 2>/dev/null || true
     detached_pid=$(cat "$pid_file")
     if [ -r "/proc/$detached_pid/stat" ]; then
@@ -213,7 +217,67 @@ if [ "${1:-}" = "--test-detached-cleanup" ]; then
     grep -q '<redacted>-inherited-output' "$log_file" \
         && ! grep -q 'detached-secret' "$log_file" \
         || { echo "FAIL: inherited output was not continuously drained and redacted" >&2; exit 1; }
+
+    crash_pid_file="$test_root/crash-detached.pid"
+    crash_identity_file="$test_root/crash-identity"
+    crash_log_file="$test_root/crash-output"
+    python3 "$PLUGIN_ROOT/tests/process-supervisor.py" \
+        --identity-file "$crash_identity_file" \
+        --log-file "$crash_log_file" \
+        --grace-seconds 0.25 \
+        -- sh -c "setsid sh -c 'trap \"\" TERM; echo \$\$ > \"$crash_pid_file\"; sleep 30' & sleep 30" &
+    crash_watchdog=$!
+    for _ in $(seq 1 100); do
+        [ -s "$crash_pid_file" ] && [ -s "$crash_identity_file" ] && break
+        sleep 0.01
+    done
+    [ -s "$crash_pid_file" ] && [ -s "$crash_identity_file" ] \
+        || { echo "FAIL: supervisor-crash regression did not initialize" >&2; exit 1; }
+    crash_detached_pid=$(cat "$crash_pid_file")
+    crash_detached_start=$(awk '{print $22}' "/proc/$crash_detached_pid/stat") \
+        || { echo "FAIL: could not capture detached descendant identity" >&2; exit 1; }
+    read -r _version _watchdog _watchdog_start crash_supervisor crash_supervisor_start crash_supervisor_group _target _target_start _target_group <"$crash_identity_file"
+    crash_watchdog_group=$(awk '{print $5}' "/proc/$crash_watchdog/stat") \
+        || { echo "FAIL: could not capture containment-watchdog group identity" >&2; exit 1; }
+    pidfd_signal_verified "$crash_supervisor" "$crash_supervisor_group" "$crash_supervisor_start" 9 \
+        || { echo "FAIL: could not inject launch-supervisor SIGKILL through its pidfd" >&2; exit 1; }
+    pidfd_wait_verified "$crash_watchdog" "$crash_watchdog_group" "$_watchdog_start" 10000 \
+        || { echo "FAIL: containment watchdog did not recover from supervisor SIGKILL within ten seconds" >&2; exit 1; }
+    wait "$crash_watchdog" 2>/dev/null || true
+    if process_start_matches "$crash_detached_pid" "$crash_detached_start"; then
+        echo "FAIL: containment watchdog left a detached descendant after supervisor SIGKILL" >&2
+        exit 1
+    fi
     rm -rf "$test_root"
+    exit 0
+fi
+
+if [ "${1:-}" = "--test-supervisor-publication-failure" ]; then
+    test_root=$(mktemp -d)
+    identity_file="$test_root/identity"
+    log_file="$test_root/output"
+    error_file="$test_root/errors"
+    target_file="$test_root/target-ran"
+    secrets_file="$test_root/secrets"
+    printf 'publication-secret\0%s\0' "$test_root" >"$secrets_file"
+    chmod 600 "$secrets_file"
+    set +e
+    timeout --foreground 10s python3 "$PLUGIN_ROOT/tests/process-supervisor.py" \
+        --identity-file "$identity_file" \
+        --log-file "$log_file" \
+        --secrets-file "$secrets_file" \
+        --grace-seconds 0.25 \
+        --test-fail-publication \
+        -- sh -c "echo \$\$ > \"$target_file\"; sleep 30" 2>"$error_file"
+    publication_status=$?
+    set -e
+    [ "$publication_status" -eq 125 ] \
+        || { echo "FAIL: identity-publication failure did not fail closed with status 125" >&2; exit 1; }
+    [ ! -e "$identity_file" ] && [ ! -e "$target_file" ] \
+        || { echo "FAIL: publication failure released or published the target" >&2; exit 1; }
+    ! grep -F 'publication-secret' "$error_file" >/dev/null \
+        && ! grep -F "$test_root" "$error_file" >/dev/null \
+        || { echo "FAIL: supervisor failure diagnostics were not redacted" >&2; exit 1; }
     exit 0
 fi
 
@@ -573,12 +637,13 @@ launch_host_process() {
         sleep 0.01
     done
     [ -s "$identity_file" ] || { sed -n '1,20p' "$log_file.supervisor-errors" >&2; fail "the process supervisor failed closed during initialization"; }
-    local version reported_supervisor reported_supervisor_start
-    read -r version reported_supervisor reported_supervisor_start HOST_PID HOST_START HOST_PGID <"$identity_file" \
+    local version reported_watchdog reported_watchdog_start launch_supervisor launch_supervisor_start launch_supervisor_group
+    read -r version reported_watchdog reported_watchdog_start launch_supervisor launch_supervisor_start launch_supervisor_group HOST_PID HOST_START HOST_PGID <"$identity_file" \
         || fail "could not parse the process-supervisor identity handoff"
-    [ "$version" = v1 ] \
-        && [ "$reported_supervisor" = "$HOST_SUPERVISOR_PID" ] \
-        && [ "$reported_supervisor_start" = "$HOST_SUPERVISOR_START" ] \
+    [ "$version" = v2 ] \
+        && [ "$reported_watchdog" = "$HOST_SUPERVISOR_PID" ] \
+        && [ "$reported_watchdog_start" = "$HOST_SUPERVISOR_START" ] \
+        && process_identity_matches "$launch_supervisor" "$launch_supervisor_group" "$launch_supervisor_start" \
         && [ "$HOST_PGID" = "$HOST_PID" ] \
         && process_start_matches "$HOST_PID" "$HOST_START" \
         || fail "the process-supervisor identity handoff was malformed or stale"
@@ -588,10 +653,15 @@ terminate_host_group() {
     [ -n "$HOST_SUPERVISOR_PID" ] || return 0
     local supervisor_status
     if process_identity_matches "$HOST_SUPERVISOR_PID" "$HOST_SUPERVISOR_PGID" "$HOST_SUPERVISOR_START"; then
-        kill -TERM "$HOST_SUPERVISOR_PID" || return 1
+        pidfd_signal_verified "$HOST_SUPERVISOR_PID" "$HOST_SUPERVISOR_PGID" "$HOST_SUPERVISOR_START" 15 || return 1
     elif kill -0 "$HOST_SUPERVISOR_PID" 2>/dev/null; then
         echo "FAIL: refusing to signal a process supervisor whose PID identity changed" >&2
         return 1
+    fi
+    if ! pidfd_wait_verified "$HOST_SUPERVISOR_PID" "$HOST_SUPERVISOR_PGID" "$HOST_SUPERVISOR_START" 20000; then
+        pidfd_signal_verified "$HOST_SUPERVISOR_PID" "$HOST_SUPERVISOR_PGID" "$HOST_SUPERVISOR_START" 9 || return 1
+        pidfd_wait_verified "$HOST_SUPERVISOR_PID" "$HOST_SUPERVISOR_PGID" "$HOST_SUPERVISOR_START" 10000 \
+            || { echo "FAIL: the containment watchdog survived bounded TERM/KILL" >&2; return 1; }
     fi
     set +e
     wait "$HOST_SUPERVISOR_PID" 2>/dev/null

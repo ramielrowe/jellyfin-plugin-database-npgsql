@@ -386,6 +386,18 @@ public sealed class TestInfrastructureTests
     }
 
     [Fact]
+    public async Task SmokeShellSupervisor_PublicationFailureFailsClosedWithoutDiagnosticsLeak()
+    {
+        var root = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var result = await ExternalCommand.RunAsync(
+            "/bin/bash",
+            new[] { Path.Combine(root, "tests", "black-box-smoke.sh"), "--test-supervisor-publication-failure" },
+            TimeSpan.FromSeconds(20),
+            TestContext.Current.CancellationToken);
+        result.EnsureSuccess("Running the identity-publication failure regression", new SensitiveDataRedactor());
+    }
+
+    [Fact]
     public async Task SmokeShellContainerReaper_ValidatesBeforeMutationAndSerializesWorkers()
     {
         var root = PluginRepository.FindRoot(AppContext.BaseDirectory);

@@ -678,6 +678,13 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             throw new InvalidOperationException("The Linux process supervisor failed: " + _redactor.Redact(diagnostic));
         }
 
+        if (_supervisor.Process.ExitCode != 0 && !_supervisor.WasTerminationRequested)
+        {
+            throw new InvalidOperationException(
+                $"The supervised Jellyfin host exited unexpectedly with status {_supervisor.Process.ExitCode}: "
+                + _redactor.Redact(diagnostic));
+        }
+
         _logCompleted = true;
     }
 }

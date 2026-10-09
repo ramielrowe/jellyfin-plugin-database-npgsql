@@ -1,5 +1,6 @@
 using System;
 using System.Data;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Npgsql;
@@ -23,13 +24,17 @@ public sealed class PostgreSqlClusterLease : IAsyncDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private bool _disposed;
 
-    private PostgreSqlClusterLease(NpgsqlConnection connection, string connectionString)
+    private PostgreSqlClusterLease(NpgsqlConnection connection, string connectionString, string clusterIdentity)
     {
         _connection = connection;
         _connectionString = connectionString;
+        ClusterIdentity = clusterIdentity;
     }
 
     public string ConnectionString => _connectionString;
+
+    /// <summary>Gets PostgreSQL's stable system identifier for local lease-path namespacing.</summary>
+    public string ClusterIdentity { get; }
 
     public static async Task<PostgreSqlClusterLease> AcquireAsync(
         string administratorConnectionString,
@@ -106,7 +111,17 @@ public sealed class PostgreSqlClusterLease : IAsyncDisposable
                 }
             }
 
-            return new PostgreSqlClusterLease(connection, builder.ConnectionString);
+            command.CommandText = "SELECT system_identifier::text FROM pg_catalog.pg_control_system()";
+            var clusterIdentity = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
+            if (clusterIdentity is null
+                || clusterIdentity.Length is < 10 or > 32
+                || !clusterIdentity.All(char.IsAsciiDigit))
+            {
+                throw new InvalidOperationException(
+                    "The exclusive PostgreSQL test cluster did not return one stable numeric system identifier; no mutation was attempted.");
+            }
+
+            return new PostgreSqlClusterLease(connection, builder.ConnectionString, clusterIdentity);
         }
         catch
         {

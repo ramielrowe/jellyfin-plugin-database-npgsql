@@ -15,13 +15,15 @@ internal sealed class LinuxProcessSupervisor : IDisposable
 
     private LinuxProcessSupervisor(
         Process process,
-        LinuxProcessIdentity supervisorIdentity,
+        LinuxProcessIdentity watchdogIdentity,
+        LinuxProcessIdentity launchSupervisorIdentity,
         LinuxProcessIdentity targetIdentity,
         string identityPath,
         Task<string> standardError)
     {
         Process = process;
-        SupervisorIdentity = supervisorIdentity;
+        SupervisorIdentity = watchdogIdentity;
+        LaunchSupervisorIdentity = launchSupervisorIdentity;
         TargetIdentity = targetIdentity;
         _identityPath = identityPath;
         StandardError = standardError;
@@ -31,9 +33,13 @@ internal sealed class LinuxProcessSupervisor : IDisposable
 
     public LinuxProcessIdentity SupervisorIdentity { get; }
 
+    public LinuxProcessIdentity LaunchSupervisorIdentity { get; }
+
     public LinuxProcessIdentity TargetIdentity { get; }
 
     public Task<string> StandardError { get; }
+
+    public bool WasTerminationRequested { get; private set; }
 
     public static LinuxProcessSupervisor Start(
         string workingDirectory,
@@ -96,6 +102,8 @@ internal sealed class LinuxProcessSupervisor : IDisposable
         var process = new Process { StartInfo = startInfo };
         var started = false;
         LinuxProcessIdentity? supervisorIdentity = null;
+        LinuxProcessIdentity? launchSupervisorIdentity = null;
+        LinuxProcessIdentity? targetIdentity = null;
         try
         {
             if (!process.Start())
@@ -120,20 +128,31 @@ internal sealed class LinuxProcessSupervisor : IDisposable
             }
 
             var fields = File.ReadAllText(identityPath).Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-            if (fields.Length != 6
-                || fields[0] != "v1"
-                || !int.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out var reportedSupervisorPid)
-                || !ulong.TryParse(fields[2], NumberStyles.None, CultureInfo.InvariantCulture, out var reportedSupervisorStart)
-                || !int.TryParse(fields[3], NumberStyles.None, CultureInfo.InvariantCulture, out var targetPid)
-                || !ulong.TryParse(fields[4], NumberStyles.None, CultureInfo.InvariantCulture, out var targetStart)
-                || !int.TryParse(fields[5], NumberStyles.None, CultureInfo.InvariantCulture, out var targetGroup)
-                || reportedSupervisorPid != supervisorIdentity.ProcessId
-                || reportedSupervisorStart != supervisorIdentity.StartTime)
+            if (fields.Length != 9
+                || fields[0] != "v2"
+                || !int.TryParse(fields[1], NumberStyles.None, CultureInfo.InvariantCulture, out var reportedWatchdogPid)
+                || !ulong.TryParse(fields[2], NumberStyles.None, CultureInfo.InvariantCulture, out var reportedWatchdogStart)
+                || !int.TryParse(fields[3], NumberStyles.None, CultureInfo.InvariantCulture, out var launchSupervisorPid)
+                || !ulong.TryParse(fields[4], NumberStyles.None, CultureInfo.InvariantCulture, out var launchSupervisorStart)
+                || !int.TryParse(fields[5], NumberStyles.None, CultureInfo.InvariantCulture, out var launchSupervisorGroup)
+                || !int.TryParse(fields[6], NumberStyles.None, CultureInfo.InvariantCulture, out var targetPid)
+                || !ulong.TryParse(fields[7], NumberStyles.None, CultureInfo.InvariantCulture, out var targetStart)
+                || !int.TryParse(fields[8], NumberStyles.None, CultureInfo.InvariantCulture, out var targetGroup)
+                || reportedWatchdogPid != supervisorIdentity.ProcessId
+                || reportedWatchdogStart != supervisorIdentity.StartTime)
             {
                 throw new InvalidOperationException("The Linux process supervisor returned a malformed or mismatched identity record.");
             }
 
-            LinuxProcessIdentity targetIdentity;
+            launchSupervisorIdentity = LinuxProcessIdentity.Capture(launchSupervisorPid);
+            if (launchSupervisorIdentity.StartTime != launchSupervisorStart
+                || launchSupervisorIdentity.ProcessGroupId != launchSupervisorGroup
+                || launchSupervisorIdentity.ParentProcessId != supervisorIdentity.ProcessId)
+            {
+                launchSupervisorIdentity.Dispose();
+                throw new InvalidOperationException("The Linux launch-supervisor pidfd identity changed during initialization.");
+            }
+
             try
             {
                 targetIdentity = LinuxProcessIdentity.Capture(targetPid);
@@ -141,7 +160,7 @@ internal sealed class LinuxProcessSupervisor : IDisposable
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
             {
                 // The stable supervisor may already be reaping a root which intentionally exited first.
-                targetIdentity = new LinuxProcessIdentity(targetPid, supervisorIdentity.ProcessId, targetGroup, targetStart);
+                targetIdentity = LinuxProcessIdentity.ReportedExited(targetPid, launchSupervisorPid, targetGroup, targetStart);
             }
 
             if (targetIdentity.StartTime != targetStart
@@ -151,17 +170,26 @@ internal sealed class LinuxProcessSupervisor : IDisposable
                 throw new InvalidOperationException("The supervised target identity changed during initialization.");
             }
 
-            return new LinuxProcessSupervisor(process, supervisorIdentity, targetIdentity, identityPath, standardError);
+            return new LinuxProcessSupervisor(
+                process,
+                supervisorIdentity,
+                launchSupervisorIdentity!,
+                targetIdentity!,
+                identityPath,
+                standardError);
         }
         catch
         {
             if (started && !process.HasExited)
             {
                 supervisorIdentity ??= LinuxProcessIdentity.Capture(process.Id);
-                TrySignalVerified(process, supervisorIdentity, 15);
+                TrySignalVerified(supervisorIdentity, 15);
                 _ = process.WaitForExit(10_000);
             }
 
+            targetIdentity?.Dispose();
+            launchSupervisorIdentity?.Dispose();
+            supervisorIdentity?.Dispose();
             process.Dispose();
             TryDelete(identityPath);
             TryDelete(secretsPath);
@@ -173,22 +201,13 @@ internal sealed class LinuxProcessSupervisor : IDisposable
     {
         if (!Process.HasExited)
         {
-            if (!SupervisorIdentity.IsCurrent())
-            {
-                throw new InvalidOperationException("Refusing to signal a process supervisor whose PID identity changed.");
-            }
-
-            TrySignalVerified(Process, SupervisorIdentity, 15);
+            WasTerminationRequested = true;
+            TrySignalVerified(SupervisorIdentity, 15);
         }
 
         if (!Process.WaitForExit((int)Math.Min(timeout.TotalMilliseconds, int.MaxValue)))
         {
-            if (!SupervisorIdentity.IsCurrent())
-            {
-                throw new InvalidOperationException("The process supervisor did not stop and its PID identity is no longer provable.");
-            }
-
-            TrySignalVerified(Process, SupervisorIdentity, 9);
+            TrySignalVerified(SupervisorIdentity, 9);
             if (!Process.WaitForExit(10_000))
             {
                 throw new InvalidOperationException("The Linux process supervisor could not be confirmed terminated.");
@@ -200,7 +219,8 @@ internal sealed class LinuxProcessSupervisor : IDisposable
     {
         try
         {
-            return LinuxProcessIdentity.Capture(processId).StartTime == expectedStart;
+            using var identity = LinuxProcessIdentity.Capture(processId);
+            return identity.StartTime == expectedStart;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
         {
@@ -222,16 +242,14 @@ internal sealed class LinuxProcessSupervisor : IDisposable
         }
 
         TryDelete(_identityPath);
+        TargetIdentity.Dispose();
+        LaunchSupervisorIdentity.Dispose();
+        SupervisorIdentity.Dispose();
         Process.Dispose();
     }
 
-    private static void TrySignalVerified(Process process, LinuxProcessIdentity identity, int signal)
+    private static void TrySignalVerified(LinuxProcessIdentity identity, int signal)
     {
-        if (!identity.IsCurrent())
-        {
-            throw new InvalidOperationException("Refusing to signal a process whose PID identity changed.");
-        }
-
         identity.Signal(signal);
     }
 

@@ -65,7 +65,12 @@ digest-pinned reference. Set `JELLYFIN_NPGSQL_TEST_WORKER` when separate test
 processes need a readable worker tag; randomness already prevents collisions.
 An override which does not actually run PostgreSQL 16.6 fails after connection.
 The real test verifies concurrent worker isolation, restricted privileges,
-cleanup after success, a setup callback failure, and cancellation.
+cleanup after success, a setup callback failure, and cancellation. It also runs
+two simultaneous `dotnet` worker processes against distinct containers and two
+simultaneous `dotnet` processes against one cluster. Local owner-lease files are
+namespaced by PostgreSQL's stable system identifier, so distinct clusters never
+contend on a reused stale-control lease while actors on the same cluster still
+exclude one another.
 
 If neither opt-in is set, the real test is skipped with the exact variables to
 configure. `JELLYFIN_NPGSQL_TEST_REQUIRED=true` changes a missing opt-in into a
@@ -115,13 +120,16 @@ No helper searches for or references a sibling/parent Jellyfin checkout. The
 standalone plugin root is found by its own solution marker, so the same commands
 work after this directory is moved to its dedicated repository.
 
-On Linux, host launches go through the checked-in `tests/process-supervisor.py`
-subreaper. Both the reusable C# harness and shell black-box test use the same
-supervision boundary. It records the real host PID and kernel start identity,
-drains and redacts bounded output, and adopts and reaps detached descendants even
-when the root host exits first. Initialization fails closed if the kernel cannot
-enable subreaper supervision; no change to the vanilla Jellyfin publish is
-required.
+On Linux, host launches go through the checked-in `tests/process-supervisor.py`.
+An outer containment watchdog and inner launch supervisor are both subreapers;
+every signal is sent through a pidfd opened before identity inspection, never by
+numeric PID or process group. The watchdog adopts and reclaims the complete tree
+if the launch supervisor is killed after handoff. The launch barrier is released
+only after the identity record is durably published, and all shutdown phases are
+bounded. Tests inject publication failure, a launch-supervisor `SIGKILL`, detached
+double-forks, wrong identity data, and inherited secret output. Initialization
+fails closed when pidfds or subreaper containment are unavailable; no change to
+the vanilla Jellyfin publish is required.
 
 ## Packaged plugin black-box proof
 
