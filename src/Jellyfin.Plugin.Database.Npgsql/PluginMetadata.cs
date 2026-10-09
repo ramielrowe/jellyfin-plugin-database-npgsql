@@ -10,7 +10,11 @@ public static class PluginMetadata
     /// <summary>
     /// Gets the release version represented by this package.
     /// </summary>
+#if NPGSQL_PREDECESSOR_FIXTURE
+    public const string Version = "0.0.9.0";
+#else
     public const string Version = "0.1.0.0";
+#endif
 
     /// <summary>
     /// Gets the display name used by the Jellyfin plugin package.

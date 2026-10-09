@@ -168,6 +168,9 @@ API/media-scan proof, and intentional provider differences are documented in
 [`docs/persistence-parity.md`](docs/persistence-parity.md).
 The atomic backup format, validation boundaries, and transactional restore are
 documented in [`docs/migration-backups.md`](docs/migration-backups.md).
+The checked-in predecessor package and exact fresh-start, upgrade, restart, and
+failure matrix are documented in
+[`docs/stock-lifecycle.md`](docs/stock-lifecycle.md).
 
 The black-box smoke test exercises the packaged ZIP, early dependency/ABI
 guards, restricted PostgreSQL role, and untouched vanilla startup path:

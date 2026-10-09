@@ -7,6 +7,7 @@
     <Project Path="tests/Jellyfin.Plugin.Database.Npgsql.TestInfrastructure/Jellyfin.Plugin.Database.Npgsql.TestInfrastructure.csproj" />
     <Project Path="tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/Jellyfin.Plugin.Database.Npgsql.TestHarness.csproj" />
     <Project Path="tests/Jellyfin.Plugin.Database.Npgsql.UnitTests/Jellyfin.Plugin.Database.Npgsql.UnitTests.csproj" />
+    <Project Path="tests/fixtures/predecessor/Jellyfin.Plugin.Database.Npgsql.PredecessorFixture.csproj" />
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/Jellyfin.Plugin.Database.Npgsql.Migrations/Jellyfin.Plugin.Database.Npgsql.Migrations.csproj" />

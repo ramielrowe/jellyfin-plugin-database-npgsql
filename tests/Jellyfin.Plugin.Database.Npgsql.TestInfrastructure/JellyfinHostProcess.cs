@@ -25,6 +25,7 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
     private readonly LinuxProcessSupervisor _supervisor;
     private readonly HttpClient _httpClient;
     private readonly LinuxProcessIdentity _processIdentity;
+    private readonly bool _preserveLayoutOnDispose;
     private bool _disposed;
     private bool _logCompleted;
 
@@ -34,13 +35,15 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         LinuxProcessSupervisor supervisor,
         HttpClient httpClient,
         int httpPort,
-        LinuxProcessIdentity processIdentity)
+        LinuxProcessIdentity processIdentity,
+        bool preserveLayoutOnDispose)
     {
         _layout = layout;
         _redactor = redactor;
         _supervisor = supervisor;
         _httpClient = httpClient;
         _processIdentity = processIdentity;
+        _preserveLayoutOnDispose = preserveLayoutOnDispose;
         BaseAddress = new Uri($"http://127.0.0.1:{httpPort}/", UriKind.Absolute);
     }
 
@@ -55,6 +58,21 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         LoopbackPortReservation httpPortReservation,
         SensitiveDataRedactor redactor,
         string? ffmpegPath = null)
+        => StartCore(layout, httpPortReservation, redactor, ffmpegPath, preserveLayoutOnDispose: false);
+
+    internal static JellyfinHostProcess StartForRestartableLifecycle(
+        JellyfinHostLayout layout,
+        LoopbackPortReservation httpPortReservation,
+        SensitiveDataRedactor redactor,
+        string? ffmpegPath = null)
+        => StartCore(layout, httpPortReservation, redactor, ffmpegPath, preserveLayoutOnDispose: true);
+
+    private static JellyfinHostProcess StartCore(
+        JellyfinHostLayout layout,
+        LoopbackPortReservation httpPortReservation,
+        SensitiveDataRedactor redactor,
+        string? ffmpegPath,
+        bool preserveLayoutOnDispose)
     {
         ArgumentNullException.ThrowIfNull(layout);
         ArgumentNullException.ThrowIfNull(httpPortReservation);
@@ -111,7 +129,8 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
                 supervisor,
                 httpClient,
                 httpPort,
-                supervisor.TargetIdentity);
+                supervisor.TargetIdentity,
+                preserveLayoutOnDispose);
         }
         catch
         {
@@ -321,7 +340,10 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         {
             _httpClient.Dispose();
             _supervisor.Dispose();
-            _layout.RetainOnlySanitizedEvidence(_redactor);
+            if (!_preserveLayoutOnDispose)
+            {
+                _layout.RetainOnlySanitizedEvidence(_redactor);
+            }
         }
         GC.SuppressFinalize(this);
     }

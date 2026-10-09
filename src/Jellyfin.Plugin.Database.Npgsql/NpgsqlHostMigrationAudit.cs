@@ -85,8 +85,7 @@ internal static class NpgsqlHostMigrationAudit
     /// <summary>Validates the real host when running inside Jellyfin.</summary>
     internal static void ValidateLoadedHostIfPresent()
     {
-        var serverAssembly = AppDomain.CurrentDomain.GetAssemblies().SingleOrDefault(
-            assembly => string.Equals(assembly.GetName().Name, ServerAssemblyName, StringComparison.Ordinal));
+        var serverAssembly = FindLoadedServerAssembly();
         if (serverAssembly is null)
         {
             return;
@@ -94,6 +93,10 @@ internal static class NpgsqlHostMigrationAudit
 
         ValidateMigrationIds(ReadMigrationIds(serverAssembly));
     }
+
+    /// <summary>Reports whether the production Jellyfin server assembly is loaded in this process.</summary>
+    /// <returns><see langword="true" /> when the stock server assembly is loaded.</returns>
+    internal static bool IsLoadedHostPresent() => FindLoadedServerAssembly() is not null;
 
     /// <summary>Rejects any addition, removal, or duplicate in the audited migration set.</summary>
     /// <param name="actualMigrationIds">Migration IDs discovered from the host.</param>
@@ -138,4 +141,8 @@ internal static class NpgsqlHostMigrationAudit
             yield return timestamp.ToString("yyyyMMddHHmmsss", CultureInfo.InvariantCulture) + "_" + name;
         }
     }
+
+    private static Assembly? FindLoadedServerAssembly()
+        => AppDomain.CurrentDomain.GetAssemblies().SingleOrDefault(
+            assembly => string.Equals(assembly.GetName().Name, ServerAssemblyName, StringComparison.Ordinal));
 }

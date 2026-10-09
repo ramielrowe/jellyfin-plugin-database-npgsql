@@ -22,6 +22,7 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj" />
+    <ProjectReference Include="../fixtures/predecessor/Jellyfin.Plugin.Database.Npgsql.PredecessorFixture.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="../Jellyfin.Plugin.Database.Npgsql.TestInfrastructure/Jellyfin.Plugin.Database.Npgsql.TestInfrastructure.csproj" />
   </ItemGroup>
 </Project>

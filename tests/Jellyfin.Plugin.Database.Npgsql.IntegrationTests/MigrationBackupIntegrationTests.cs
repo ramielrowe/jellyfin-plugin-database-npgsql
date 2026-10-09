@@ -28,6 +28,138 @@ public sealed class MigrationBackupIntegrationTests
         );
         """;
 
+    [Theory]
+    [InlineData("unknown")]
+    [InlineData("gapped")]
+    [InlineData("future")]
+    public async Task Snapshot_RejectsUnknownGappedAndFutureStockHistoryBeforeMutation(string scenario)
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var scratch = Path.Combine(repositoryRoot, ".artifacts", "backup-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            var history = scenario switch
+            {
+                "unknown" => new[] { "20270101000000_UnknownMigration" },
+                "gapped" => PreMigrationHostHistory().Skip(1).ToArray(),
+                "future" => PreMigrationHostHistory()
+                    .Append("20990101000000_FutureMigration")
+                    .ToArray(),
+                _ => throw new ArgumentOutOfRangeException(nameof(scenario)),
+            };
+            await using (var connection = new global::Npgsql.NpgsqlConnection(database.RuntimeConnectionString))
+            {
+                await connection.OpenAsync(cancellationToken);
+                await using var command = connection.CreateCommand();
+                command.CommandText = HistorySchemaSqlForTest;
+                await command.ExecuteNonQueryAsync(cancellationToken);
+                command.CommandText = "INSERT INTO public.\"__EFMigrationsHistory\" VALUES ($1, '12.2.0.0')";
+                foreach (var migrationId in history)
+                {
+                    command.Parameters.Clear();
+                    command.Parameters.AddWithValue(migrationId);
+                    await command.ExecuteNonQueryAsync(cancellationToken);
+                }
+            }
+
+            var factory = new TestContextFactory(database.RuntimeConnectionString);
+            var exception = await Assert.ThrowsAsync<NotSupportedException>(
+                () => NpgsqlMigrationBackup.CreateAsync(
+                    factory,
+                    database.RuntimeConnectionString,
+                    scratch,
+                    cancellationToken));
+            Assert.Contains("unknown, gapped, or from a future", exception.Message, StringComparison.Ordinal);
+            Assert.Empty(Directory.EnumerateFileSystemEntries(scratch));
+            await using var verification = new global::Npgsql.NpgsqlConnection(database.RuntimeConnectionString);
+            await verification.OpenAsync(cancellationToken);
+            await using var verificationCommand = verification.CreateCommand();
+            verificationCommand.CommandText = "SELECT \"MigrationId\" FROM public.\"__EFMigrationsHistory\" ORDER BY \"MigrationId\"";
+            await using var reader = await verificationCommand.ExecuteReaderAsync(cancellationToken);
+            var actual = new List<string>();
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                actual.Add(reader.GetString(0));
+            }
+
+            Assert.Equal(history.Order(StringComparer.Ordinal), actual);
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+            if (Directory.Exists(scratch))
+            {
+                Directory.Delete(scratch, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Snapshot_MigrationLockContentionTimesOutWithoutMutationOrArtifact()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var scratch = Path.Combine(repositoryRoot, ".artifacts", "backup-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        var boundedBuilder = new global::Npgsql.NpgsqlConnectionStringBuilder(database.RuntimeConnectionString);
+        var runtimePassword = boundedBuilder.Password
+            ?? throw new InvalidOperationException("The isolated runtime fixture did not generate a password.");
+        await using var blocker = new global::Npgsql.NpgsqlConnection(database.RuntimeConnectionString);
+        try
+        {
+            await blocker.OpenAsync(cancellationToken);
+            await using (var lockCommand = blocker.CreateCommand())
+            {
+                lockCommand.CommandText = "SELECT pg_advisory_lock(5352051313876290384)";
+                await lockCommand.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            var factory = new TestContextFactory(boundedBuilder.ConnectionString);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromSeconds(2));
+            var started = DateTimeOffset.UtcNow;
+            var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => NpgsqlMigrationBackup.CreateAsync(
+                    factory,
+                    boundedBuilder.ConnectionString,
+                    scratch,
+                    timeout.Token));
+            Assert.True(DateTimeOffset.UtcNow - started < TimeSpan.FromSeconds(10));
+            Assert.DoesNotContain(runtimePassword, exception.ToString(), StringComparison.Ordinal);
+            Assert.Empty(Directory.EnumerateFileSystemEntries(scratch));
+            Assert.Equal(
+                0L,
+                await database.ExecuteScalarAsync<long>(
+                    "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'",
+                    cancellationToken));
+        }
+        finally
+        {
+            if (blocker.State == System.Data.ConnectionState.Open)
+            {
+                await using var unlockCommand = blocker.CreateCommand();
+                unlockCommand.CommandText = "SELECT pg_advisory_unlock(5352051313876290384)";
+                await unlockCommand.ExecuteNonQueryAsync(CancellationToken.None);
+            }
+
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+            if (Directory.Exists(scratch))
+            {
+                Directory.Delete(scratch, recursive: true);
+            }
+        }
+    }
+
     [Fact]
     public async Task PopulatedSnapshot_RestoresSchemaRowsHistoryAndIdentityExactly()
     {
@@ -305,9 +437,15 @@ public sealed class MigrationBackupIntegrationTests
                         "ProductVersion" character varying(32) NOT NULL,
                         CONSTRAINT "PK___EFMigrationsHistory" PRIMARY KEY ("MigrationId")
                     );
-                    INSERT INTO public."__EFMigrationsHistory" VALUES ('seeded-code-migration', '12.2.0.0');
                     """;
                 await command.ExecuteNonQueryAsync(cancellationToken);
+                command.CommandText = "INSERT INTO public.\"__EFMigrationsHistory\" VALUES ($1, '12.2.0.0')";
+                foreach (var migrationId in PreMigrationHostHistory())
+                {
+                    command.Parameters.Clear();
+                    command.Parameters.AddWithValue(migrationId);
+                    await command.ExecuteNonQueryAsync(cancellationToken);
+                }
             }
 
             var historyKey = await NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken);
@@ -322,7 +460,9 @@ public sealed class MigrationBackupIntegrationTests
                 await connection.OpenAsync(cancellationToken);
                 await using var command = connection.CreateCommand();
                 command.CommandText = "SELECT string_agg(\"MigrationId\", ',' ORDER BY \"MigrationId\") FROM public.\"__EFMigrationsHistory\"";
-                Assert.Equal("seeded-code-migration", await command.ExecuteScalarAsync(cancellationToken));
+                Assert.Equal(
+                    string.Join(',', PreMigrationHostHistory()),
+                    await command.ExecuteScalarAsync(cancellationToken));
             }
 
             await NpgsqlMigrationBackup.DeleteAsync(scratch, historyKey);
@@ -1238,6 +1378,12 @@ public sealed class MigrationBackupIntegrationTests
             .SingleAsync(cancellationToken);
         return result;
     }
+
+    private static string[] PreMigrationHostHistory()
+        => NpgsqlHostMigrationAudit.AuditedMigrationIds
+            .Except(NpgsqlHostMigrationAudit.AuditedSetupMigrationIds, StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
 
     private static async Task AssertDependencyBackupRejectedAsync(
         IDbContextFactory<JellyfinDbContext> factory,

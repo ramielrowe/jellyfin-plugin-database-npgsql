@@ -87,6 +87,16 @@ internal static partial class NpgsqlMigrationBackup
             }
 
             var migration = await ReadSourceMigrationAsync(connection, transaction, empty || historyOnly, cancellationToken).ConfigureAwait(false);
+            if (!empty)
+            {
+                await ValidateMigrationHistoryAsync(
+                    connection,
+                    transaction,
+                    migration,
+                    historyOnly,
+                    cancellationToken).ConfigureAwait(false);
+            }
+
             string? schemaSql = null;
             string? schemaFingerprint = null;
             if (historyOnly)
@@ -515,6 +525,62 @@ internal static partial class NpgsqlMigrationBackup
         }
 
         return script.ToString();
+    }
+
+    private static async Task ValidateMigrationHistoryAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        string? sourceMigration,
+        bool historyOnly,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new NpgsqlCommand(
+            "SELECT \"MigrationId\" FROM public.\"__EFMigrationsHistory\" ORDER BY \"MigrationId\"",
+            connection,
+            transaction);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        var actual = new List<string>();
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            actual.Add(reader.GetString(0));
+        }
+
+        var hostHistory = NpgsqlHostMigrationAudit.AuditedMigrationIds.Order(StringComparer.Ordinal).ToArray();
+        if (historyOnly)
+        {
+            var preMigrationHistory = NpgsqlHostMigrationAudit.AuditedMigrationIds
+                .Except(NpgsqlHostMigrationAudit.AuditedSetupMigrationIds, StringComparer.Ordinal)
+                .Order(StringComparer.Ordinal)
+                .ToArray();
+            if (actual.SequenceEqual(preMigrationHistory, StringComparer.Ordinal))
+            {
+                return;
+            }
+
+            throw new NotSupportedException(
+                "The pre-migration PostgreSQL history is unknown, gapped, or from a future Jellyfin/plugin release. "
+                + "Install a provider audited for the exact history or restore the matching host and plugin. Refusing migration before mutation.");
+        }
+
+        var providerHistory = sourceMigration switch
+        {
+            BaselineMigration => new[] { BaselineMigration },
+            SuccessorMigration => new[] { BaselineMigration, SuccessorMigration },
+            UuidAggregatesMigration => new[] { BaselineMigration, SuccessorMigration, UuidAggregatesMigration },
+            _ => throw new NotSupportedException(
+                "The populated PostgreSQL migration history does not end at a supported provider migration. Refusing migration before mutation."),
+        };
+        var providerOnly = providerHistory.Order(StringComparer.Ordinal).ToArray();
+        var stockHistory = hostHistory.Concat(providerHistory).Order(StringComparer.Ordinal).ToArray();
+        var exactStockHistory = actual.SequenceEqual(stockHistory, StringComparer.Ordinal);
+        var providerOnlyTestHistory = !NpgsqlHostMigrationAudit.IsLoadedHostPresent()
+            && actual.SequenceEqual(providerOnly, StringComparer.Ordinal);
+        if (!exactStockHistory && !providerOnlyTestHistory)
+        {
+            throw new NotSupportedException(
+                "The populated PostgreSQL history is unknown, gapped, or from a future Jellyfin/plugin release. "
+                + "Install a provider audited for the exact history or restore the matching host and plugin. Refusing migration before mutation.");
+        }
     }
 
     private static async Task<List<TableMetadata>> ReadTablesAsync(

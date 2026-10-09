@@ -140,6 +140,9 @@ the vanilla Jellyfin publish is required.
 
 ## Packaged plugin black-box proof
 
+The checked-in predecessor, three-process upgrade/restart proof, and lifecycle
+failure matrix are documented in [stock-lifecycle.md](stock-lifecycle.md).
+
 `tests/black-box-smoke.sh` remains the comprehensive package-level consumer of
 these conventions. It installs the built ZIP into isolated data, writes
 `database.xml`, launches the exact publish, waits for health, uses Jellyfin's

@@ -1,0 +1,18 @@
+{
+  "guid": "8a6e4c5e-2185-45df-a30f-cc828529330b",
+  "name": "Npgsql Database",
+  "description": "Npgsql Entity Framework database provider for Jellyfin.",
+  "overview": "Checked-in 0.0.9.0 predecessor used only by the stock-host upgrade proof.",
+  "owner": "ramielrowe",
+  "category": "Database",
+  "imageUrl": "",
+  "versions": [],
+  "status": "Disabled",
+  "targetAbi": "12.2.0.0",
+  "version": "0.0.9.0",
+  "changelog": "Predecessor fixture ending at AddActivityLogTypeDateIndex.",
+  "autoUpdate": false,
+  "assemblies": [
+    "Jellyfin.Plugin.Database.Npgsql.dll"
+  ]
+}
