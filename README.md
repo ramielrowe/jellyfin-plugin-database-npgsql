@@ -1,5 +1,10 @@
 # Jellyfin Npgsql database provider
 
+> **Restore platform requirement:** database-inclusive full-system restore is
+> supported only on Linux. The provider fails closed on other operating systems
+> because exact compensation requires Linux handle-relative, no-follow filesystem
+> primitives. Backup creation and ordinary PostgreSQL operation remain portable.
+
 This repository is the standalone development workspace for an Npgsql-backed
 `IJellyfinDatabaseProvider` that loads into an unmodified Jellyfin server. The
 release ZIP is intentionally self-contained except for Jellyfin's host-owned

@@ -1,8 +1,8 @@
 {
   "guid": "8a6e4c5e-2185-45df-a30f-cc828529330b",
   "name": "Npgsql Database",
-  "description": "Npgsql Entity Framework database provider for Jellyfin.",
-  "overview": "Provides a PostgreSQL-backed Jellyfin database through the vanilla custom-provider loader.",
+  "description": "Npgsql Entity Framework database provider for Jellyfin. Database-inclusive full restore requires Linux.",
+  "overview": "Provides a PostgreSQL-backed Jellyfin database through the vanilla custom-provider loader; full-system restore fails closed outside Linux.",
   "owner": "ramielrowe",
   "category": "Database",
   "imageUrl": "",

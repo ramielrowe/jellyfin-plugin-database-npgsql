@@ -27,8 +27,10 @@ the stock service extracts configuration or touches PostgreSQL. ZIP names are
 canonicalized under the same extraction semantics as the stock service, with
 case, Unicode, separator, dot-segment, ADS, trailing-dot/space, absolute-path,
 and file/directory aliases rejected. Restore uses a deadline-bounded,
-owner-readable marker-named snapshot beside the selected archive, and deletes
-only that owned snapshot afterward.
+owner-only, marker-named recovery directory below the Jellyfin data path and
+deletes only that owned directory afterward. Test-only scratch defaults below
+the repository's ignored `.artifacts/npgsql-scratch` tree; deployments may set
+`JELLYFIN_NPGSQL_SCRATCH_ROOT` to another private writable location.
 
 The decorator first lets stock process a sanitized archive whose manifest has
 no database or production-file payloads. It then creates an unpooled restore
@@ -49,15 +51,23 @@ transactional sequence restarts back together.
 Preflight streams every database row through the finalized model and requires
 the exact ordered migration ID and `ProductVersion` contract, including the
 stock `varchar(150)` and `varchar(32)` limits. Keys, unique values, and foreign
-references are stored as binary digests in an owner-only, marker-named SQLite
-validation index under the process temporary directory. Its cache and logical
-disk budget are fixed, it is cancellation-aware, and its exact directory is
-deleted internally on every exit; row count no longer determines managed heap
-growth. ZIP central-directory size and count are checked before `ZipArchive`
+references are stored by a plugin-owned external-sort index. SHA-256 is only a
+sort prefix: canonical composite-key bytes are retained and compared in full,
+so a digest collision cannot create equality. The index has a 1 MiB canonical
+key limit and an enforced 8 GiB physical-write quota (including unsorted data,
+runs, and merged output) while the archive remains capped at ten million rows.
+It uses bounded 16 MiB sort chunks, needs no SQLite library from the host, and
+fails deterministically if its real write accounting exceeds quota. Owner
+markers include process identity; dead validation directories are scavenged on
+the next validation while live/concurrent or unmarked directories are never
+removed. ZIP central-directory size and count are checked before `ZipArchive`
 materializes entries.
 
 A process-wide provider gate serializes backup and restore from preflight
-through cleanup and remains held through the stock delayed-shutdown handoff.
+through cleanup. After a scheduled restore it remains held until the host's
+actual `ApplicationStopped` acknowledgement. A delayed or failed shutdown does
+not reopen the gate in the same process; later operations fail closed instead
+of racing the scheduled restore.
 Before restore, the decorator captures file contents plus file and directory
 metadata (including configured roots) and pre-extracts archive files into an
 owner-only directory. Stock receives a private payload-free archive, so it
@@ -71,6 +81,24 @@ required handle-relative proof fail closed before filesystem mutation. Any
 later failure restores overwritten files, modes, attributes, and timestamps,
 removes newly created targets/directories, and rolls back the still-open
 provider transaction.
+
+Before the first transactional or filesystem mutation, the plugin durably
+writes a versioned recovery journal, complete old-file snapshots, staged new
+files, root identities, and the restore UUID, then fsyncs the files and owning
+directories. Every apply/commit/rollback transition is atomically rewritten and
+fsynced. The PostgreSQL transaction inserts the same UUID as a temporary
+migration-history commit marker. If commit acknowledgement is lost, a fresh
+connection queries that marker rather than guessing. On the next early-provider
+startup—before Jellyfin creates its normal database services—the plugin reads
+the journal and marker and idempotently completes either the exact new file
+state (committed marker) or the exact old file state (no marker). Once the
+committed journal is durable, marker and snapshot cleanup are best effort and
+retryable; cleanup failure cannot misreport a committed restore as failed.
+Missing, corrupt, escaping, or root-identity-mismatched journals fail startup
+closed. A separate process is killed with `Environment.FailFast` immediately
+after each durable journal transition (including both visible and absent commit
+marker outcomes); recovery is then exercised against real PostgreSQL and rerun
+to prove idempotence.
 
 If the ordinary plugin metadata is disabled, deleted, malformed, or mismatched
 while the early provider is selected, the provider refuses startup before a

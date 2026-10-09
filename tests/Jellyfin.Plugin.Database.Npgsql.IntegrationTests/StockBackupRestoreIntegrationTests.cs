@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO.Compression;
 using System.Text.Json;
 using Jellyfin.Database.Implementations;
@@ -23,6 +24,123 @@ namespace Jellyfin.Plugin.Database.Npgsql.IntegrationTests;
 [Collection(PostgreSqlModelCollection.Name)]
 public sealed class StockBackupRestoreIntegrationTests
 {
+    [Theory]
+    [InlineData("Captured", false, false)]
+    [InlineData("ApplyingFiles", false, false)]
+    [InlineData("FilesApplied", false, false)]
+    [InlineData("CommitIntent", false, false)]
+    [InlineData("CommitIntent", true, true)]
+    [InlineData("Committed", true, true)]
+    public async Task InterruptedRestoreJournal_ReconcilesOldOrNewStateIdempotently(
+        string crashBoundary,
+        bool writeDatabaseMarker,
+        bool databaseCommitted)
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var root = Path.Combine(
+            PluginRepository.FindRoot(AppContext.BaseDirectory),
+            ".artifacts",
+            "restore-recovery",
+            Guid.NewGuid().ToString("N"));
+        var paths = new TestApplicationPaths(root);
+        paths.CreateDirectories();
+        var target = Path.Combine(paths.ConfigurationDirectoryPath, "system.xml");
+        await File.WriteAllTextAsync(target, "old", cancellationToken);
+        var archivePath = Path.Combine(root, "recovery.zip");
+        using (var archive = ZipFile.Open(archivePath, ZipArchiveMode.Create))
+        {
+            var manifest = archive.CreateEntry("manifest.json");
+            await using (var writer = new StreamWriter(manifest.Open()))
+            {
+                await writer.WriteAsync("{\"Options\":{\"Database\":true}}".AsMemory(), cancellationToken);
+            }
+
+            var entry = archive.CreateEntry("Config/system.xml");
+            await using var entryWriter = new StreamWriter(entry.Open());
+            await entryWriter.WriteAsync("new".AsMemory(), cancellationToken);
+        }
+
+        await using (var context = CreateContext(database.RuntimeConnectionString))
+        {
+            await context.GetService<IMigrator>().MigrateAsync(cancellationToken: cancellationToken);
+            await SeedHostHistoryAsync(context, cancellationToken);
+        }
+
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var harness = Path.Combine(
+            repositoryRoot,
+            "tests",
+            "Jellyfin.Plugin.Database.Npgsql.TestHarness",
+            "bin",
+            "Release",
+            "net10.0",
+            "Jellyfin.Plugin.Database.Npgsql.TestHarness.dll");
+        Assert.True(File.Exists(harness), $"The restore crash harness is missing at '{harness}'.");
+        using (var process = new Process())
+        {
+            process.StartInfo = new ProcessStartInfo("dotnet")
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+            };
+            process.StartInfo.ArgumentList.Add(harness);
+            process.StartInfo.ArgumentList.Add("restore-crash");
+            process.StartInfo.ArgumentList.Add(archivePath);
+            process.StartInfo.ArgumentList.Add(root);
+            process.StartInfo.ArgumentList.Add(crashBoundary);
+            process.StartInfo.ArgumentList.Add(writeDatabaseMarker ? "marker" : "no-marker");
+            process.StartInfo.Environment["JELLYFIN_NPGSQL_RESTORE_CRASH_CONNECTION"] = database.RuntimeConnectionString;
+            Assert.True(process.Start());
+            await process.WaitForExitAsync(cancellationToken);
+            Assert.NotEqual(0, process.ExitCode);
+        }
+
+        if (crashBoundary == "Committed")
+        {
+            await using (var connection = new NpgsqlConnection(database.RuntimeConnectionString))
+            {
+                await connection.OpenAsync(cancellationToken);
+                await using var deleteMarker = new NpgsqlCommand(
+                    "DELETE FROM public.\"__EFMigrationsHistory\" WHERE \"MigrationId\" LIKE '99991231235959_JellyfinNpgsqlRestore_%'",
+                    connection);
+                _ = await deleteMarker.ExecuteNonQueryAsync(cancellationToken);
+            }
+
+            using var recoveryCrash = new Process();
+            recoveryCrash.StartInfo = new ProcessStartInfo("dotnet")
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+            };
+            recoveryCrash.StartInfo.ArgumentList.Add(harness);
+            recoveryCrash.StartInfo.ArgumentList.Add("restore-recovery-crash");
+            recoveryCrash.StartInfo.ArgumentList.Add(paths.DataPath);
+            recoveryCrash.StartInfo.Environment["JELLYFIN_NPGSQL_RESTORE_CRASH_CONNECTION"] = database.RuntimeConnectionString;
+            Assert.True(recoveryCrash.Start());
+            await recoveryCrash.WaitForExitAsync(cancellationToken);
+            Assert.NotEqual(0, recoveryCrash.ExitCode);
+        }
+
+        await NpgsqlRestoreFileSnapshot.RecoverPendingAsync(
+            paths.DataPath,
+            database.RuntimeConnectionString,
+            cancellationToken);
+        Assert.Equal(databaseCommitted ? "new" : "old", await File.ReadAllTextAsync(target, cancellationToken));
+        await NpgsqlRestoreFileSnapshot.RecoverPendingAsync(
+            paths.DataPath,
+            database.RuntimeConnectionString,
+            cancellationToken);
+        Assert.Equal(databaseCommitted ? "new" : "old", await File.ReadAllTextAsync(target, cancellationToken));
+        Directory.Delete(root, recursive: true);
+        NpgsqlConnection.ClearAllPools();
+    }
+
     [Fact]
     public async Task UntouchedHost_PublicBackupApiRoundTripsBoundPostgreSqlArchive()
     {
@@ -569,10 +687,15 @@ public sealed class StockBackupRestoreIntegrationTests
     public async Task FailureAfterSuccessfulStockSaveRollsBackRowsHistoryAndSequences()
     {
         var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
         var cancellationToken = TestContext.Current.CancellationToken;
         await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
         await using var database = await environment.CreateDatabaseAsync(cancellationToken);
-        var scratch = Path.Combine(Path.GetTempPath(), ".jellyfin-npgsql-post-save-" + Guid.NewGuid().ToString("N"));
+        var scratch = Path.Combine(
+            PluginRepository.FindRoot(AppContext.BaseDirectory),
+            ".artifacts",
+            "post-save",
+            Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(scratch);
         try
         {

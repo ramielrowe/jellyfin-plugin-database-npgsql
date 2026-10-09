@@ -10,6 +10,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 namespace Jellyfin.Plugin.Database.Npgsql;
 
@@ -25,6 +26,7 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
     private readonly IBackupService inner;
     private readonly bool isActiveProvider;
     private readonly IServiceProvider? services;
+    private readonly IHostApplicationLifetime? applicationLifetime;
 
     /// <summary>Initializes a new instance of the <see cref="NpgsqlBackupServiceDecorator"/> class without a runtime model.</summary>
     /// <param name="inner">The exact stock Jellyfin service.</param>
@@ -43,6 +45,7 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
         this.inner = inner;
         this.isActiveProvider = isActiveProvider;
         this.services = services;
+        this.applicationLifetime = services?.GetService<IHostApplicationLifetime>();
     }
 
     /// <inheritdoc />
@@ -126,6 +129,8 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
 
         ProviderOperationGate.Wait(deadline.Token);
         var handoffStarted = false;
+        ShutdownGateRelease? release = null;
+        CancellationTokenRegistration stoppedRegistration = default;
         try
         {
             using var context = this.services?
@@ -135,29 +140,42 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
                 archivePath,
                 context?.Model,
                 deadline.Token).GetAwaiter().GetResult();
+            if (this.applicationLifetime is null)
+            {
+                throw new InvalidOperationException(
+                    "The PostgreSQL restore cannot schedule a restart because the host application lifetime is unavailable. The provider operation gate remains fail-closed.");
+            }
+
+            release = new ShutdownGateRelease();
+            stoppedRegistration = this.applicationLifetime.ApplicationStopped.Register(release.Release);
             this.inner.ScheduleRestoreAndRestartServer(archivePath);
             handoffStarted = true;
-            _ = ReleaseGateAfterShutdownHandoffAsync();
         }
         finally
         {
             if (!handoffStarted)
             {
+                release?.Abandon();
+                stoppedRegistration.Dispose();
                 ProviderOperationGate.Release();
             }
         }
     }
 
-    private static async Task ReleaseGateAfterShutdownHandoffAsync()
+#pragma warning disable SA1201 // Gate callback is kept beside the scheduling operation it protects.
+    private sealed class ShutdownGateRelease
     {
-        try
+        private int released;
+
+        internal void Release()
         {
-            await Task.Delay(TimeSpan.FromMilliseconds(750)).ConfigureAwait(false);
+            if (Interlocked.Exchange(ref this.released, 1) == 0)
+            {
+                ProviderOperationGate.Release();
+            }
         }
-        finally
-        {
-            ProviderOperationGate.Release();
-        }
+
+        internal void Abandon() => _ = Interlocked.Exchange(ref this.released, 1);
     }
 
     private static async Task RestoreHistoryAsync(
@@ -280,10 +298,12 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
     {
         using var deadline = new CancellationTokenSource(OperationDeadline);
         await ProviderOperationGate.WaitAsync(deadline.Token).ConfigureAwait(false);
+        var keepGateHeld = false;
         try
         {
             IDbContextFactory<JellyfinDbContext>? contextFactory = null;
             IReadOnlyList<HistoryRow>? originalHistory = null;
+            string? connectionString = null;
             if (this.services is not null)
             {
                 contextFactory = this.services.GetRequiredService<IDbContextFactory<JellyfinDbContext>>();
@@ -291,6 +311,7 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
                 await using (context.ConfigureAwait(false))
                 {
                     model = context.Model;
+                    connectionString = context.Database.GetConnectionString();
                     originalHistory = (await context.GetService<IHistoryRepository>()
                         .GetAppliedMigrationsAsync(deadline.Token).ConfigureAwait(false))
                         .Select(row => new HistoryRow(row.MigrationId, row.ProductVersion))
@@ -312,10 +333,10 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
                     applicationPaths,
                     deadline.Token).ConfigureAwait(false);
 #pragma warning restore CA2007
-            using var scope = NpgsqlRestoreScope.Enter(snapshot.Path);
+            using var scope = NpgsqlRestoreScope.Enter(snapshot.Path, fileSnapshot?.RestoreId);
             using var databaseScope = coordinatedFactory is null
                 ? null
-                : NpgsqlRestoreScope.Enter(snapshot.Path);
+                : NpgsqlRestoreScope.Enter(snapshot.Path, fileSnapshot?.RestoreId);
             try
             {
                 await this.inner.RestoreBackupAsync(
@@ -336,10 +357,36 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
 
                 if (coordinatedFactory is not null)
                 {
+                    fileSnapshot?.MarkCommitIntent();
                     await NpgsqlRestoreCoordinator.CommitCurrentAsync(deadline.Token).ConfigureAwait(false);
                 }
 
                 fileSnapshot?.Commit();
+                if (fileSnapshot is not null && connectionString is not null)
+                {
+                    try
+                    {
+                        await NpgsqlRestoreCoordinator.DeleteMarkerAsync(
+                            connectionString,
+                            fileSnapshot.RestoreId,
+                            deadline.Token).ConfigureAwait(false);
+                    }
+#pragma warning disable CA1031 // Cleanup after a durable committed journal is deferred to startup recovery.
+                    catch
+#pragma warning restore CA1031
+                    {
+                        fileSnapshot.DeferCleanup();
+                        this.applicationLifetime?.StopApplication();
+
+                        // The committed journal remains authoritative and startup retries marker cleanup.
+                    }
+                }
+            }
+            catch (NpgsqlRestoreCoordinator.NpgsqlRestoreRecoveryRequiredException)
+            {
+                keepGateHeld = true;
+                this.applicationLifetime?.StopApplication();
+                throw;
             }
             catch (Exception restoreException)
             {
@@ -399,7 +446,11 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
         }
         finally
         {
-            ProviderOperationGate.Release();
+            if (!keepGateHeld)
+            {
+                ProviderOperationGate.Release();
+            }
         }
     }
 }
+#pragma warning restore SA1201

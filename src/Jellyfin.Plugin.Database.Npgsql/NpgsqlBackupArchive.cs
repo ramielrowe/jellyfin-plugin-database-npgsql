@@ -6,7 +6,6 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Jellyfin.Database.Implementations;
-using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
@@ -1150,11 +1149,6 @@ internal static class NpgsqlBackupArchive
 #pragma warning disable SA1204 // Validation helpers are kept beside the operations which use them.
     private sealed class ModelValidationState : IDisposable
     {
-        private const int KeyKind = 0;
-        private const int UniqueKind = 1;
-        private const int ForeignKind = 2;
-        private const long BytesPerIndexedHashBudget = 128;
-
         private static readonly string[] PluginMigrationIds =
         [
             "20261009061101_InitialPostgreSqlBaseline",
@@ -1168,82 +1162,21 @@ internal static class NpgsqlBackupArchive
         private readonly HashSet<string> histories = new(StringComparer.Ordinal);
         private readonly List<string> orderedHistories = new();
         private readonly string scratchRoot;
-        private readonly string databasePath;
-        private readonly SqliteConnection connection;
-        private readonly SqliteTransaction transaction;
-        private readonly SqliteCommand insert;
-        private readonly long maximumLogicalBytes;
-        private long indexedHashes;
+        private readonly NpgsqlExactDiskIndex index;
         private bool disposed;
 
         internal ModelValidationState(IModel model, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var maximumEntriesPerRow = model.GetEntityTypes()
-                .Select(entity => entity.GetKeys().Count()
-                    + entity.GetIndexes().Count(index => index.IsUnique)
-                    + entity.GetForeignKeys().Count())
-                .DefaultIfEmpty(1)
-                .Max();
-            this.maximumLogicalBytes = checked(MaximumDatabaseRows * maximumEntriesPerRow * BytesPerIndexedHashBudget);
-            if (this.maximumLogicalBytes > MaximumExpandedBytes)
-            {
-                throw new InvalidDataException(
-                    "The runtime model's strict restore-validation index budget exceeds the supported disk limit.");
-            }
-
-            this.scratchRoot = Path.Combine(
-                Path.GetTempPath(),
-                ".jellyfin-npgsql-validation-" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(this.scratchRoot);
-            if (!OperatingSystem.IsWindows())
-            {
-                File.SetUnixFileMode(
-                    this.scratchRoot,
-                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-            }
-
-            this.databasePath = Path.Combine(this.scratchRoot, "relationships.sqlite");
+            var scratchParent = NpgsqlScratchSpace.GetValidationRoot();
+            NpgsqlScratchSpace.ScavengeValidationDirectories(scratchParent);
+            this.scratchRoot = NpgsqlScratchSpace.CreateOwnedDirectory(scratchParent, "validation");
             try
             {
-                this.connection = new SqliteConnection(new SqliteConnectionStringBuilder
-                {
-                    DataSource = this.databasePath,
-                    Mode = SqliteOpenMode.ReadWriteCreate,
-                    Cache = SqliteCacheMode.Private,
-                    Pooling = false,
-                }.ToString());
-                this.connection.Open();
-                using (var setup = this.connection.CreateCommand())
-                {
-                    setup.CommandText = """
-                        PRAGMA journal_mode=OFF;
-                        PRAGMA synchronous=OFF;
-                        PRAGMA temp_store=FILE;
-                        PRAGMA cache_size=-4096;
-                        PRAGMA mmap_size=0;
-                        CREATE TABLE value_set (
-                            kind INTEGER NOT NULL,
-                            set_id INTEGER NOT NULL,
-                            hash BLOB NOT NULL,
-                            PRIMARY KEY (kind, set_id, hash)
-                        ) WITHOUT ROWID;
-                        """;
-                    setup.ExecuteNonQuery();
-                }
-
-                this.transaction = this.connection.BeginTransaction();
-                this.insert = this.connection.CreateCommand();
-                this.insert.Transaction = this.transaction;
-                this.insert.CommandText = "INSERT OR IGNORE INTO value_set (kind, set_id, hash) VALUES ($kind, $set, $hash)";
-                _ = this.insert.Parameters.Add("$kind", SqliteType.Integer);
-                _ = this.insert.Parameters.Add("$set", SqliteType.Integer);
-                _ = this.insert.Parameters.Add("$hash", SqliteType.Blob);
-                this.insert.Prepare();
+                this.index = new NpgsqlExactDiskIndex(this.scratchRoot);
             }
             catch
             {
-                this.connection?.Dispose();
                 DeleteValidationScratch(this.scratchRoot);
                 throw;
             }
@@ -1281,10 +1214,7 @@ internal static class NpgsqlBackupArchive
             }
 
             this.disposed = true;
-            this.insert.Dispose();
-            this.transaction.Dispose();
-            this.connection.Dispose();
-            DeleteValidationScratch(this.scratchRoot);
+            this.index.Dispose();
         }
 
         internal void AddHistory(string migrationId, string productVersion)
@@ -1364,12 +1294,11 @@ internal static class NpgsqlBackupArchive
 
             foreach (var key in entityType.GetKeys())
             {
-                var hash = HashValues(key.Properties, persistedValues, allowNull: false, path);
-                if (!this.TryInsert(KeyKind, this.keys[key], hash, cancellationToken))
-                {
-                    throw new InvalidDataException(
-                        $"Database backup entry '{path}' contains a duplicate key for '{entityType.ClrType.Name}'.");
-                }
+                this.index.Add(
+                    this.keys[key],
+                    EncodeValues(key.Properties, persistedValues, allowNull: false, path),
+                    duplicatesAllowed: false,
+                    duplicateDescription: "key");
             }
 
             foreach (var index in entityType.GetIndexes().Where(index => index.IsUnique))
@@ -1380,12 +1309,11 @@ internal static class NpgsqlBackupArchive
                     continue;
                 }
 
-                var hash = HashValues(values);
-                if (!this.TryInsert(UniqueKind, this.uniqueIndexes[index], hash, cancellationToken))
-                {
-                    throw new InvalidDataException(
-                        $"Database backup entry '{path}' contains a duplicate unique value for '{entityType.ClrType.Name}'.");
-                }
+                this.index.Add(
+                    this.uniqueIndexes[index],
+                    EncodeValues(values),
+                    duplicatesAllowed: false,
+                    duplicateDescription: "unique value");
             }
 
             foreach (var foreignKey in entityType.GetForeignKeys())
@@ -1402,12 +1330,11 @@ internal static class NpgsqlBackupArchive
                         $"Database backup entry '{path}' contains a partially null relationship for '{entityType.ClrType.Name}'.");
                 }
 
-                _ = this.TryInsert(
-                    ForeignKind,
+                this.index.Add(
                     this.foreignKeys[foreignKey].SetId,
-                    HashValues(values),
-                    cancellationToken,
-                    ignoreDuplicate: true);
+                    EncodeValues(values),
+                    duplicatesAllowed: true,
+                    duplicateDescription: "relationship");
             }
         }
 
@@ -1424,28 +1351,14 @@ internal static class NpgsqlBackupArchive
                     $"the migration history is not the exact supported ordered lineage; missing [{string.Join(", ", missing)}], unknown [{string.Join(", ", unknown)}]");
             }
 
+            foreach (var setId in this.keys.Values.Concat(this.uniqueIndexes.Values))
+            {
+                this.index.CompleteSet(setId);
+            }
+
             foreach (var (foreignKey, store) in this.foreignKeys)
             {
-                using var query = this.connection.CreateCommand();
-                query.Transaction = this.transaction;
-                query.CommandText = """
-                    SELECT 1
-                    FROM value_set AS reference
-                    WHERE reference.kind = $foreign_kind
-                      AND reference.set_id = $foreign_set
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM value_set AS principal
-                          WHERE principal.kind = $key_kind
-                            AND principal.set_id = $principal_set
-                            AND principal.hash = reference.hash)
-                    LIMIT 1
-                    """;
-                _ = query.Parameters.AddWithValue("$foreign_kind", ForeignKind);
-                _ = query.Parameters.AddWithValue("$foreign_set", store.SetId);
-                _ = query.Parameters.AddWithValue("$key_kind", KeyKind);
-                _ = query.Parameters.AddWithValue("$principal_set", store.PrincipalSetId);
-                if (query.ExecuteScalar() is not null)
+                if (this.index.ContainsMissingFrom(store.SetId, store.PrincipalSetId))
                 {
                     throw new InvalidDataException(
                         $"The database backup contains an unresolved relationship from '{foreignKey.DeclaringEntityType.ClrType.Name}' "
@@ -1462,38 +1375,7 @@ internal static class NpgsqlBackupArchive
             }
         }
 
-        private bool TryInsert(
-            int kind,
-            int setId,
-            byte[] hash,
-            CancellationToken cancellationToken,
-            bool ignoreDuplicate = false)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            this.insert.Parameters["$kind"].Value = kind;
-            this.insert.Parameters["$set"].Value = setId;
-            this.insert.Parameters["$hash"].Value = hash;
-            try
-            {
-                var changed = this.insert.ExecuteNonQuery() != 0;
-                if (changed)
-                {
-                    this.indexedHashes = checked(this.indexedHashes + 1);
-                    if (checked(this.indexedHashes * BytesPerIndexedHashBudget) > this.maximumLogicalBytes)
-                    {
-                        throw new InvalidDataException("The restore validation index exceeded its strict disk budget.");
-                    }
-                }
-
-                return changed || ignoreDuplicate;
-            }
-            catch (SqliteException exception)
-            {
-                throw new InvalidDataException("The bounded restore validation index failed.", exception);
-            }
-        }
-
-        private static byte[] HashValues(
+        private static byte[] EncodeValues(
             IReadOnlyList<IProperty> properties,
             IReadOnlyDictionary<IProperty, object?> persistedValues,
             bool allowNull,
@@ -1505,7 +1387,7 @@ internal static class NpgsqlBackupArchive
                 throw new InvalidDataException($"Database backup entry '{path}' contains a null key value.");
             }
 
-            return HashValues(values);
+            return EncodeValues(values);
         }
 
         private static object?[] ReadValues(
@@ -1546,26 +1428,30 @@ internal static class NpgsqlBackupArchive
             }).ToArray();
         }
 
-        private static byte[] HashValues(IReadOnlyList<object?> values)
+        private static byte[] EncodeValues(IReadOnlyList<object?> values)
         {
-            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            using var stream = new MemoryStream();
+            Span<byte> length = stackalloc byte[4];
             foreach (var value in values)
             {
                 if (value is null)
                 {
-                    hash.AppendData([0]);
+                    stream.WriteByte(0);
                     continue;
                 }
 
+                stream.WriteByte(1);
                 var typeBytes = Encoding.UTF8.GetBytes(value.GetType().FullName ?? value.GetType().Name);
                 var valueBytes = JsonSerializer.SerializeToUtf8Bytes(value, value.GetType(), SerializerOptions);
-                hash.AppendData(BitConverter.GetBytes(typeBytes.Length));
-                hash.AppendData(typeBytes);
-                hash.AppendData(BitConverter.GetBytes(valueBytes.Length));
-                hash.AppendData(valueBytes);
+                BinaryPrimitives.WriteInt32LittleEndian(length, typeBytes.Length);
+                stream.Write(length);
+                stream.Write(typeBytes);
+                BinaryPrimitives.WriteInt32LittleEndian(length, valueBytes.Length);
+                stream.Write(length);
+                stream.Write(valueBytes);
             }
 
-            return hash.GetHashAndReset();
+            return stream.ToArray();
         }
 
         private static void ValidatePropertyJsonType(IProperty property, JsonElement value, string path)

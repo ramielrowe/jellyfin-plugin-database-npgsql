@@ -115,6 +115,13 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
             customOptions.Options);
         this.connectionString = configured.ConnectionString;
         this.restoreDataSource = NpgsqlRestoreDataSource.Create(configured);
+        if (this.applicationDataPath is not null)
+        {
+            NpgsqlRestoreFileSnapshot.RecoverPendingAsync(
+                this.applicationDataPath,
+                this.connectionString,
+                CancellationToken.None).GetAwaiter().GetResult();
+        }
 
         LogProviderLoaded(
             this.logger,

@@ -14,6 +14,7 @@ using MediaBrowser.Controller.SystemBackupService;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -417,6 +418,26 @@ public sealed class BackupArchiveTests : IDisposable
     }
 
     [Fact]
+    public async Task RestoreFilesystemSnapshot_RejectsProviderRecoveryDirectoryTargets()
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux restore recovery contract.");
+        var paths = new TestApplicationPaths(Path.Combine(this.testRoot, "reserved-recovery"));
+        paths.CreateDirectories();
+        var archivePath = Path.Combine(this.testRoot, "reserved-recovery.zip");
+        using (var archive = ZipFile.Open(archivePath, ZipArchiveMode.Create))
+        {
+            _ = archive.CreateEntry("Data/.jellyfin-npgsql-restore-recovery/restore-attacker/recovery-journal.json");
+        }
+
+        var failure = await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlRestoreFileSnapshot.CaptureAsync(
+                archivePath,
+                paths,
+                TestContext.Current.CancellationToken));
+        Assert.Contains("provider-owned recovery directory", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task RestoreFilesystemSnapshot_RejectsSymlinkAndHardLinkTargets()
     {
         Assert.SkipWhen(OperatingSystem.IsWindows(), "Unix link safety contract.");
@@ -484,6 +505,67 @@ public sealed class BackupArchiveTests : IDisposable
             Directory.Delete(paths.ConfigurationDirectoryPath);
             Directory.Move(movedRoot, paths.ConfigurationDirectoryPath);
         }
+    }
+
+    [Theory]
+    [InlineData("restore-apply-after-open-parent")]
+    [InlineData("restore-apply-before-rename")]
+    [InlineData("restore-apply-after-rename")]
+    public async Task RestoreFilesystemSnapshot_RootSwapAtEveryApplyBoundaryRecoversHeldTree(
+        string swapPoint)
+    {
+        Assert.SkipWhen(!OperatingSystem.IsLinux(), "Linux handle-relative replacement contract.");
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var paths = new TestApplicationPaths(Path.Combine(this.testRoot, "stage-swap-" + swapPoint));
+        paths.CreateDirectories();
+        var target = Path.Combine(paths.ConfigurationDirectoryPath, "system.xml");
+        await File.WriteAllTextAsync(target, "before", cancellationToken);
+        var outside = Path.Combine(this.testRoot, "stage-swap-outside-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outside);
+        var outsideTarget = Path.Combine(outside, "system.xml");
+        await File.WriteAllTextAsync(outsideTarget, "outside", cancellationToken);
+        var archivePath = Path.Combine(this.testRoot, "stage-swap.zip");
+        using (var archive = ZipFile.Open(archivePath, ZipArchiveMode.Create))
+        {
+            var manifest = archive.CreateEntry("manifest.json");
+            await using (var manifestWriter = new StreamWriter(manifest.Open()))
+            {
+                await manifestWriter.WriteAsync("{\"Options\":{\"Database\":true}}".AsMemory(), cancellationToken);
+            }
+
+            var entry = archive.CreateEntry("Config/system.xml");
+            await using var writer = new StreamWriter(entry.Open());
+            await writer.WriteAsync("restored".AsMemory(), cancellationToken);
+        }
+
+        var movedRoot = paths.ConfigurationDirectoryPath + ".held";
+        var swapped = false;
+        await using var snapshot = await NpgsqlRestoreFileSnapshot.CaptureAsync(
+            archivePath,
+            paths,
+            cancellationToken);
+        using (NpgsqlBackupFileSystem.InjectFaults(point =>
+        {
+            if (!swapped && string.Equals(point, swapPoint, StringComparison.Ordinal))
+            {
+                swapped = true;
+                Directory.Move(paths.ConfigurationDirectoryPath, movedRoot);
+                Directory.CreateSymbolicLink(paths.ConfigurationDirectoryPath, outside);
+            }
+        }))
+        {
+            await Assert.ThrowsAsync<InvalidDataException>(() => snapshot.ApplyAsync(cancellationToken));
+        }
+
+        Assert.True(swapped);
+        Assert.Equal("outside", await File.ReadAllTextAsync(outsideTarget, cancellationToken));
+        var compensation = await Assert.ThrowsAsync<InvalidDataException>(
+            () => snapshot.RollbackAsync(cancellationToken));
+        Assert.Contains("renamed or replaced", compensation.Message, StringComparison.Ordinal);
+        Directory.Delete(paths.ConfigurationDirectoryPath);
+        Directory.Move(movedRoot, paths.ConfigurationDirectoryPath);
+        Assert.Equal("before", await File.ReadAllTextAsync(target, cancellationToken));
+        Assert.Equal("outside", await File.ReadAllTextAsync(outsideTarget, cancellationToken));
     }
 
     [Theory]
@@ -555,7 +637,7 @@ public sealed class BackupArchiveTests : IDisposable
     public async Task ProviderGate_SerializesRestoreAgainstBackup()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
-        var restorePath = this.CreateStockArchive();
+        var restorePath = this.CreateStockArchive(historyJson: CreateExactHistoryJson());
         await NpgsqlBackupArchive.BindAsync(restorePath, true, cancellationToken);
         var createPath = this.CreateStockArchive(databaseIncluded: false);
         var inner = new BlockingBackupService(restorePath, createPath);
@@ -578,18 +660,24 @@ public sealed class BackupArchiveTests : IDisposable
     public async Task ProviderGate_RemainsHeldThroughScheduledShutdownWindow()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
-        var restorePath = this.CreateStockArchive();
+        var restorePath = this.CreateStockArchive(historyJson: CreateExactHistoryJson());
         await NpgsqlBackupArchive.BindAsync(restorePath, true, cancellationToken);
         var createPath = this.CreateStockArchive(databaseIncluded: false);
         var inner = new ScheduledBackupService(createPath);
-        var decorator = new NpgsqlBackupServiceDecorator(inner, true);
+        var lifetime = new TestHostApplicationLifetime();
+        await using var services = new ServiceCollection()
+            .AddSingleton<IHostApplicationLifetime>(lifetime)
+            .AddSingleton<IDbContextFactory<JellyfinDbContext>>(new TestDbContextFactory())
+            .BuildServiceProvider();
+        var decorator = new NpgsqlBackupServiceDecorator(inner, true, services);
 
         decorator.ScheduleRestoreAndRestartServer(restorePath);
         var backup = decorator.CreateBackupAsync(new BackupOptionsDto { Database = false });
         var premature = await Task.WhenAny(
             backup,
-            Task.Delay(TimeSpan.FromMilliseconds(300), cancellationToken));
+            Task.Delay(TimeSpan.FromMilliseconds(1250), cancellationToken));
         Assert.NotSame(backup, premature);
+        lifetime.SignalStopped();
         _ = await backup.WaitAsync(TimeSpan.FromSeconds(3), cancellationToken);
         Assert.Equal(1, inner.ScheduleCalls);
     }
@@ -797,9 +885,11 @@ public sealed class BackupArchiveTests : IDisposable
 
         await NpgsqlBackupArchive.BindAsync(path, true, cancellationToken);
         using var context = CreateContext();
+        var validationRoot = NpgsqlScratchSpace.GetValidationRoot();
+        Directory.CreateDirectory(validationRoot);
         var scratchBefore = Directory.GetDirectories(
-            Path.GetTempPath(),
-            ".jellyfin-npgsql-validation-*",
+            validationRoot,
+            "validation-*",
             SearchOption.TopDirectoryOnly).ToHashSet(StringComparer.Ordinal);
         GC.Collect();
         GC.WaitForPendingFinalizers();
@@ -816,9 +906,89 @@ public sealed class BackupArchiveTests : IDisposable
             retainedGrowth < maximumRetainedManagedBytes,
             $"Validation retained {retainedGrowth} managed bytes for {rowCount} rows.");
         Assert.Empty(Directory.GetDirectories(
-            Path.GetTempPath(),
-            ".jellyfin-npgsql-validation-*",
+            validationRoot,
+            "validation-*",
             SearchOption.TopDirectoryOnly).Except(scratchBefore, StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public void ExactDiskIndex_ResolvesForcedDigestCollisionsByCanonicalBytesAndEnforcesQuota()
+    {
+        var collisionRoot = Path.Combine(this.testRoot, "collision-index");
+        using (NpgsqlExactDiskIndex.InjectDigestForTests(_ => new byte[32]))
+        using (var index = new NpgsqlExactDiskIndex(collisionRoot))
+        {
+            index.Add(1, "first"u8, duplicatesAllowed: false, duplicateDescription: "key");
+            index.Add(1, "second"u8, duplicatesAllowed: false, duplicateDescription: "key");
+            index.CompleteSet(1);
+        }
+
+        var quotaRoot = Path.Combine(this.testRoot, "quota-index");
+        using (NpgsqlExactDiskIndex.InjectQuotaForTests(16))
+        using (var index = new NpgsqlExactDiskIndex(quotaRoot))
+        {
+            var failure = Assert.Throws<InvalidDataException>(
+                () => index.Add(1, "quota"u8, duplicatesAllowed: false, duplicateDescription: "key"));
+            Assert.Contains("disk quota", failure.Message, StringComparison.Ordinal);
+        }
+
+        var diskFullRoot = Path.Combine(this.testRoot, "disk-full-index");
+        using (NpgsqlBackupFileSystem.InjectFaults(point =>
+        {
+            if (point == "validation-index-write")
+            {
+                throw new IOException("Simulated disk full.");
+            }
+        }))
+        using (var index = new NpgsqlExactDiskIndex(diskFullRoot))
+        {
+            var failure = Assert.Throws<InvalidDataException>(
+                () => index.Add(1, "disk-full"u8, duplicatesAllowed: false, duplicateDescription: "key"));
+            Assert.Contains("bounded disk area", failure.Message, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void ValidationScratch_ScavengesOnlyMarkerOwnedDeadProcessDirectories()
+    {
+        var root = Path.Combine(this.testRoot, "validation-scavenge");
+        var owned = NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation");
+        var unknown = Path.Combine(root, "validation-unknown");
+        Directory.CreateDirectory(unknown);
+        File.WriteAllText(
+            Path.Combine(owned, ".jellyfin-npgsql-owner.json"),
+            JsonSerializer.Serialize(new
+            {
+                Provider = PluginMetadata.Id.ToString("D"),
+                ProcessId = int.MaxValue,
+                ProcessStartUtc = DateTime.UnixEpoch,
+                Purpose = "validation",
+            }));
+
+        NpgsqlScratchSpace.ScavengeValidationDirectories(root);
+
+        Assert.False(Directory.Exists(owned));
+        Assert.True(Directory.Exists(unknown));
+    }
+
+    [Fact]
+    public async Task RestoreRecovery_CorruptJournalFailsClosedBeforeDatabaseAccess()
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux restore recovery contract.");
+        var data = Path.Combine(this.testRoot, "corrupt-recovery");
+        var directory = Path.Combine(data, ".jellyfin-npgsql-restore-recovery", "restore-corrupt");
+        Directory.CreateDirectory(directory);
+        await File.WriteAllTextAsync(
+            Path.Combine(directory, "recovery-journal.json"),
+            "{not-json",
+            TestContext.Current.CancellationToken);
+
+        var failure = await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlRestoreFileSnapshot.RecoverPendingAsync(
+                data,
+                "Host=should-not-connect.invalid;Database=none;Username=none",
+                TestContext.Current.CancellationToken));
+        Assert.Contains("fail-closed", failure.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1122,6 +1292,35 @@ public sealed class BackupArchiveTests : IDisposable
             => throw new NotSupportedException();
 
         public void ScheduleRestoreAndRestartServer(string archivePath) => this.ScheduleCalls++;
+    }
+
+    private sealed class TestHostApplicationLifetime : IHostApplicationLifetime, IDisposable
+    {
+        private readonly CancellationTokenSource started = new();
+        private readonly CancellationTokenSource stopping = new();
+        private readonly CancellationTokenSource stopped = new();
+
+        public CancellationToken ApplicationStarted => this.started.Token;
+
+        public CancellationToken ApplicationStopping => this.stopping.Token;
+
+        public CancellationToken ApplicationStopped => this.stopped.Token;
+
+        public void StopApplication() => this.stopping.Cancel();
+
+        internal void SignalStopped() => this.stopped.Cancel();
+
+        public void Dispose()
+        {
+            this.started.Dispose();
+            this.stopping.Dispose();
+            this.stopped.Dispose();
+        }
+    }
+
+    private sealed class TestDbContextFactory : IDbContextFactory<JellyfinDbContext>
+    {
+        public JellyfinDbContext CreateDbContext() => CreateContext();
     }
 
     private sealed class TestApplicationPaths(string root) : IServerApplicationPaths
