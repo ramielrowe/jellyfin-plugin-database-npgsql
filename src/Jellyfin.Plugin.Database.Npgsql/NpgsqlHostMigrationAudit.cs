@@ -62,6 +62,23 @@ internal static class NpgsqlHostMigrationAudit
         "20260915120000_MigrateRatingLevels",
     ];
 
+    /// <summary>The exact audited routines that execute instead of being seeded on fresh setup.</summary>
+    internal static readonly string[] AuditedSetupMigrationIds =
+    [
+        "20250420090000_AddDefaultPluginRepository",
+        "20250420110000_ReaddDefaultPluginRepository",
+        "20250420160000_AddDefaultCastReceivers",
+        "20250420170000_UpdateDefaultPluginRepository",
+        "20250420230000_MoveTrickplayFiles",
+    ];
+
+    /// <summary>The exact audited routines assigned to the core-initialisation stage.</summary>
+    internal static readonly string[] AuditedCoreInitialisationMigrationIds =
+    [
+        "20260522092304_UpdateNormalizedUsername",
+        "20260531160000_DisableLegacyAuthorization",
+    ];
+
     private const string ServerAssemblyName = "jellyfin";
     private const string MigrationAttributeName = "Jellyfin.Server.Migrations.JellyfinMigrationAttribute";
 

@@ -1034,13 +1034,23 @@ public sealed class ModelCompatibilityTests
             await CreateSchemaAsync(database.RuntimeConnectionString, cancellationToken);
             await using (var context = CreateContext(database.RuntimeConnectionString))
             {
-                var migrationId = Assert.Single(context.Database.GetMigrations());
+                var migrationIds = context.Database.GetMigrations().ToArray();
+                Assert.Equal(
+                    [
+                        "20261009061101_InitialPostgreSqlBaseline",
+                        "20261009061446_AddActivityLogTypeDateIndex",
+                    ],
+                    migrationIds);
                 await context.Database.ExecuteSqlRawAsync(
                     "CREATE TABLE IF NOT EXISTS \"__EFMigrationsHistory\" (\"MigrationId\" character varying(150) NOT NULL CONSTRAINT \"PK___EFMigrationsHistory\" PRIMARY KEY, \"ProductVersion\" character varying(32) NOT NULL)",
                     cancellationToken);
-                await context.Database.ExecuteSqlInterpolatedAsync(
-                    $"INSERT INTO \"__EFMigrationsHistory\" (\"MigrationId\", \"ProductVersion\") VALUES ({migrationId}, {"10.0.3"})",
-                    cancellationToken);
+                foreach (var migrationId in migrationIds)
+                {
+                    await context.Database.ExecuteSqlInterpolatedAsync(
+                        $"INSERT INTO \"__EFMigrationsHistory\" (\"MigrationId\", \"ProductVersion\") VALUES ({migrationId}, {"10.0.3"})",
+                        cancellationToken);
+                }
+
                 foreach (var (vanillaMigrationId, productVersion) in vanillaHistory)
                 {
                     await context.Database.ExecuteSqlInterpolatedAsync(

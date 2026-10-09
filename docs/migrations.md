@@ -62,22 +62,28 @@ the same `__EFMigrationsHistory` table. The plugin's IDs use their own timestamp
 and names and preserve unrelated history rows on upgrade or downgrade.
 
 This release pins all 49 Jellyfin 12.2 code-migration IDs in
-`NpgsqlHostMigrationAudit`. Provider initialization reflects the loaded
-`jellyfin` assembly and rejects additions, removals, and duplicates before
-reading configuration or opening PostgreSQL. A future host migration therefore
-cannot run merely because its database ABI still has the same major/minor number.
+`NpgsqlHostMigrationAudit`. The classification was audited against the migration
+attributes in the exact supported Jellyfin 12.2 source commit
+`ca0f16eb7c195f720a1493ed469a27c4657db0c6`: five routines have
+`RunMigrationOnSetup = true`, and the other 44 are seeded into history on a fresh
+setup. Provider initialization reflects the loaded `jellyfin` assembly and
+rejects additions, removals, and duplicates before reading configuration or
+opening PostgreSQL. A future host migration therefore cannot run merely because
+its database ABI still has the same major/minor number.
 
 The current CoreInitialisation routines are
 `20260522092304_UpdateNormalizedUsername` and
 `20260531160000_DisableLegacyAuthorization`. Neither is marked to run on a fresh
 setup, so vanilla Jellyfin records both as already applied before the plugin
-baseline runs. The four setup-safe routines are AddDefaultPluginRepository,
-ReaddDefaultPluginRepository, AddDefaultCastReceivers, and MoveTrickplayFiles;
-they still execute normally. The pristine-host migration test starts an untouched
-publish against an empty, pre-created PostgreSQL database and requires it to
-become healthy with the exact 49 code rows plus the two plugin rows. This proves
-the legacy transforms were seeded and every setup routine completed without
-changing Jellyfin's migration service.
+baseline runs. The five setup-safe routines are AddDefaultPluginRepository,
+ReaddDefaultPluginRepository, AddDefaultCastReceivers,
+UpdateDefaultPluginRepository, and MoveTrickplayFiles; they still execute
+normally. Unit tests require the setup and seeded partitions to be disjoint and
+to cover all 49 pinned IDs exactly. The pristine-host migration test starts an
+untouched publish against an empty, pre-created PostgreSQL database and requires
+it to become healthy with the exact 49 code rows plus the two plugin rows. This
+proves the legacy transforms were seeded and every setup routine completed
+without changing Jellyfin's migration service.
 
 The real PostgreSQL migration test uses only the generated restricted login. It
 applies the baseline twice, migrates up/down/up through the successor without

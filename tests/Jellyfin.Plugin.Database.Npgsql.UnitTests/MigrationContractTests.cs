@@ -63,6 +63,43 @@ public sealed class MigrationContractTests
         Assert.Throws<NotSupportedException>(() => NpgsqlHostMigrationAudit.ValidateMigrationIds(duplicate));
     }
 
+    [Fact]
+    public void HostMigrationAudit_ClassifiesEveryPinnedMigrationForFreshSetup()
+    {
+        Assert.Equal(49, NpgsqlHostMigrationAudit.AuditedMigrationIds.Length);
+        Assert.Equal(
+            49,
+            NpgsqlHostMigrationAudit.AuditedMigrationIds.Distinct(StringComparer.Ordinal).Count());
+        Assert.Equal(
+            [
+                "20250420090000_AddDefaultPluginRepository",
+                "20250420110000_ReaddDefaultPluginRepository",
+                "20250420160000_AddDefaultCastReceivers",
+                "20250420170000_UpdateDefaultPluginRepository",
+                "20250420230000_MoveTrickplayFiles",
+            ],
+            NpgsqlHostMigrationAudit.AuditedSetupMigrationIds);
+        Assert.Equal(
+            [
+                "20260522092304_UpdateNormalizedUsername",
+                "20260531160000_DisableLegacyAuthorization",
+            ],
+            NpgsqlHostMigrationAudit.AuditedCoreInitialisationMigrationIds);
+
+        var setup = NpgsqlHostMigrationAudit.AuditedSetupMigrationIds.ToHashSet(StringComparer.Ordinal);
+        Assert.Equal(5, setup.Count);
+        Assert.All(setup, migrationId => Assert.Contains(migrationId, NpgsqlHostMigrationAudit.AuditedMigrationIds));
+
+        var seeded = NpgsqlHostMigrationAudit.AuditedMigrationIds
+            .Where(migrationId => !setup.Contains(migrationId))
+            .ToHashSet(StringComparer.Ordinal);
+        Assert.Equal(44, seeded.Count);
+        Assert.All(
+            NpgsqlHostMigrationAudit.AuditedCoreInitialisationMigrationIds,
+            migrationId => Assert.Contains(migrationId, seeded));
+        Assert.Equal(49, setup.Concat(seeded).Distinct(StringComparer.Ordinal).Count());
+    }
+
     private static JellyfinDbContext CreateRuntimeContext()
     {
         var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
