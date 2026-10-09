@@ -335,6 +335,7 @@ public sealed class MigrationBackupIntegrationTests
 
     [Theory]
     [InlineData("flush-existing-root")]
+    [InlineData("flush-existing-root-parent")]
     [InlineData("flush-table-0000")]
     [InlineData("flush-schema")]
     [InlineData("flush-manifest")]
@@ -364,8 +365,10 @@ public sealed class MigrationBackupIntegrationTests
                 await context.SaveChangesAsync(cancellationToken);
             }
 
+            var observedPoints = new List<string>();
             using var faults = NpgsqlBackupFileSystem.InjectFaults(point =>
             {
+                observedPoints.Add(point);
                 if (string.Equals(point, failurePoint, StringComparison.Ordinal))
                 {
                     throw new IOException("Injected no-space-left or durable-publication failure.");
@@ -374,6 +377,10 @@ public sealed class MigrationBackupIntegrationTests
             await Assert.ThrowsAsync<IOException>(
                 () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
             Assert.Empty(Directory.EnumerateFileSystemEntries(scratch));
+            if (!failurePoint.StartsWith("flush-existing-root", StringComparison.Ordinal))
+            {
+                Assert.Contains(observedPoints, point => point.StartsWith("flush-root-after-delete-", StringComparison.Ordinal));
+            }
         }
         finally
         {
@@ -462,18 +469,24 @@ public sealed class MigrationBackupIntegrationTests
             }
 
             Directory.Delete(scratch);
+            var failedParentSyncs = 0;
             using (NpgsqlBackupFileSystem.InjectFaults(point =>
             {
-                if (string.Equals(point, "flush-root-parent-after-create", StringComparison.Ordinal))
+                if (string.Equals(point, "flush-root-parent-after-create", StringComparison.Ordinal)
+                    || string.Equals(point, "flush-existing-root-parent", StringComparison.Ordinal))
                 {
+                    failedParentSyncs++;
                     throw new IOException("Injected parent directory sync failure.");
                 }
             }))
             {
                 await Assert.ThrowsAsync<IOException>(
                     () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
+                await Assert.ThrowsAsync<IOException>(
+                    () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
             }
 
+            Assert.Equal(2, failedParentSyncs);
             Assert.True(Directory.Exists(scratch));
             Assert.Empty(Directory.EnumerateFileSystemEntries(scratch));
             var retryKey = await NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken);
@@ -531,6 +544,17 @@ public sealed class MigrationBackupIntegrationTests
                 () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
             await context.Database.ExecuteSqlRawAsync("ALTER TABLE public.\"ActivityLogs\" ALTER COLUMN \"Overview\" TYPE text", cancellationToken);
 
+            await context.Database.ExecuteSqlRawAsync("ALTER TABLE public.\"KeyframeData\" ALTER COLUMN \"KeyframeTicks\" TYPE bigint[][] USING \"KeyframeTicks\"::bigint[][]", cancellationToken);
+            Assert.Equal(2, await context.Database.SqlQueryRaw<int>(
+                "SELECT attribute.attndims AS \"Value\" FROM pg_catalog.pg_attribute attribute WHERE attribute.attrelid = 'public.\"KeyframeData\"'::regclass AND attribute.attname = 'KeyframeTicks'")
+                .SingleAsync(cancellationToken));
+            await Assert.ThrowsAsync<NotSupportedException>(
+                () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
+            await context.Database.ExecuteSqlRawAsync("ALTER TABLE public.\"KeyframeData\" ALTER COLUMN \"KeyframeTicks\" TYPE bigint[] USING \"KeyframeTicks\"::bigint[]", cancellationToken);
+            Assert.Equal(1, await context.Database.SqlQueryRaw<int>(
+                "SELECT attribute.attndims AS \"Value\" FROM pg_catalog.pg_attribute attribute WHERE attribute.attrelid = 'public.\"KeyframeData\"'::regclass AND attribute.attname = 'KeyframeTicks'")
+                .SingleAsync(cancellationToken));
+
             await context.Database.ExecuteSqlRawAsync("GRANT SELECT (\"Overview\") ON TABLE public.\"ActivityLogs\" TO PUBLIC", cancellationToken);
             await Assert.ThrowsAsync<NotSupportedException>(
                 () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
@@ -550,6 +574,16 @@ public sealed class MigrationBackupIntegrationTests
             await Assert.ThrowsAsync<NotSupportedException>(
                 () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
             await context.Database.ExecuteSqlRawAsync("ALTER TABLE public.\"ActivityLogs\" RESET (autovacuum_enabled)", cancellationToken);
+
+            await context.Database.ExecuteSqlRawAsync("ALTER TABLE public.\"ActivityLogs\" SET (toast.autovacuum_enabled = false)", cancellationToken);
+            Assert.Contains(
+                "autovacuum_enabled=false",
+                await context.Database.SqlQueryRaw<string>(
+                    "SELECT option_value AS \"Value\" FROM pg_catalog.pg_class parent JOIN pg_catalog.pg_class toast ON toast.oid = parent.reltoastrelid CROSS JOIN LATERAL unnest(toast.reloptions) option_value WHERE parent.oid = 'public.\"ActivityLogs\"'::regclass")
+                    .ToListAsync(cancellationToken));
+            await Assert.ThrowsAsync<NotSupportedException>(
+                () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
+            await context.Database.ExecuteSqlRawAsync("ALTER TABLE public.\"ActivityLogs\" RESET (toast.autovacuum_enabled)", cancellationToken);
 
             await context.Database.ExecuteSqlRawAsync("ALTER INDEX public.\"IX_ActivityLogs_DateCreated\" SET (fillfactor = 80)", cancellationToken);
             await Assert.ThrowsAsync<NotSupportedException>(
@@ -583,6 +617,117 @@ public sealed class MigrationBackupIntegrationTests
             await context.Database.ExecuteSqlRawAsync("ALTER SEQUENCE public.\"ActivityLogs_Id_seq\" CACHE 2", cancellationToken);
             await Assert.ThrowsAsync<NotSupportedException>(
                 () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
+            Assert.Empty(Directory.EnumerateFileSystemEntries(scratch));
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+            if (Directory.Exists(scratch))
+            {
+                Directory.Delete(scratch, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task PopulatedSnapshot_RejectsRestrictedOwnerPublicationMembershipWithoutMutation()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var scratch = Path.Combine(repositoryRoot, ".artifacts", "backup-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            var factory = new TestContextFactory(database.RuntimeConnectionString);
+            await using var context = factory.CreateDbContext();
+            await context.GetService<IMigrator>().MigrateAsync(Successor, cancellationToken);
+            var privileges = await context.Database.SqlQueryRaw<bool>(
+                "SELECT NOT rolsuper AND NOT rolreplication AS \"Value\" FROM pg_catalog.pg_roles WHERE rolname = current_user")
+                .SingleAsync(cancellationToken);
+            Assert.True(privileges);
+
+            await context.Database.ExecuteSqlRawAsync(
+                "CREATE PUBLICATION \"JellyfinBackupContractPublication\" FOR TABLE public.\"ActivityLogs\"",
+                cancellationToken);
+            await Assert.ThrowsAsync<NotSupportedException>(
+                () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
+
+            var membershipCount = await context.Database.SqlQueryRaw<long>(
+                "SELECT count(*) AS \"Value\" FROM pg_catalog.pg_publication_rel membership JOIN pg_catalog.pg_class relation ON relation.oid = membership.prrelid JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace WHERE namespace.nspname = 'public'")
+                .SingleAsync(cancellationToken);
+            Assert.Equal(1, membershipCount);
+            Assert.True(await context.Database.SqlQueryRaw<bool>(
+                "SELECT to_regclass('public.\"ActivityLogs\"') IS NOT NULL AS \"Value\"")
+                .SingleAsync(cancellationToken));
+            Assert.Empty(Directory.EnumerateFileSystemEntries(scratch));
+
+            await context.Database.ExecuteSqlRawAsync(
+                "DROP PUBLICATION \"JellyfinBackupContractPublication\"",
+                cancellationToken);
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+            if (Directory.Exists(scratch))
+            {
+                Directory.Delete(scratch, recursive: true);
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData("before-delete-completed", true)]
+    [InlineData("after-delete-completed", false)]
+    [InlineData("flush-root-after-delete-completed", false)]
+    public async Task CompletedDeletion_RetryDurablySyncsTheRootAfterInjectedFailure(
+        string failurePoint,
+        bool directorySurvivesFailure)
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var scratch = Path.Combine(repositoryRoot, ".artifacts", "backup-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            var factory = new TestContextFactory(database.RuntimeConnectionString);
+            await using (var context = factory.CreateDbContext())
+            {
+                await context.GetService<IMigrator>().MigrateAsync(Successor, cancellationToken);
+            }
+
+            var key = await NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken);
+            using (NpgsqlBackupFileSystem.InjectFaults(point =>
+            {
+                if (string.Equals(point, failurePoint, StringComparison.Ordinal))
+                {
+                    throw new IOException("Injected completed backup deletion failure.");
+                }
+            }))
+            {
+                await Assert.ThrowsAsync<IOException>(() => NpgsqlMigrationBackup.DeleteAsync(scratch, key));
+            }
+
+            Assert.Equal(directorySurvivesFailure, Directory.Exists(Path.Combine(scratch, key)));
+            var retryPoints = new List<string>();
+            using (NpgsqlBackupFileSystem.InjectFaults(retryPoints.Add))
+            {
+                await NpgsqlMigrationBackup.DeleteAsync(scratch, key);
+            }
+
+            Assert.Contains("flush-root-after-delete-completed", retryPoints);
+            if (directorySurvivesFailure)
+            {
+                Assert.Contains("after-delete-completed", retryPoints);
+            }
+
             Assert.Empty(Directory.EnumerateFileSystemEntries(scratch));
         }
         finally

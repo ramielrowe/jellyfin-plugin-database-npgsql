@@ -211,18 +211,39 @@ internal static partial class NpgsqlMigrationBackup
             unpublishedFinalDirectory = null;
             return key;
         }
-        finally
+        catch (Exception operationException)
         {
-            if (partialDirectory is not null)
-            {
-                TryDeleteOwnedDirectory(partialDirectory);
-            }
-
+            var cleanupFailures = new List<Exception>();
             if (unpublishedFinalDirectory is not null)
             {
-                TryDeleteOwnedDirectory(unpublishedFinalDirectory);
+                TryDeleteOwnedDirectoryDurably(
+                    unpublishedFinalDirectory,
+                    backupRoot,
+                    "failed-publication",
+                    cleanupFailures);
             }
 
+            if (partialDirectory is not null)
+            {
+                TryDeleteOwnedDirectoryDurably(
+                    partialDirectory,
+                    backupRoot,
+                    "partial-backup",
+                    cleanupFailures);
+            }
+
+            if (cleanupFailures.Count != 0)
+            {
+                cleanupFailures.Insert(0, operationException);
+                throw new AggregateException(
+                    "The PostgreSQL migration backup failed and its durable filesystem cleanup did not complete.",
+                    cleanupFailures);
+            }
+
+            throw;
+        }
+        finally
+        {
             OperationGate.Release();
         }
     }
@@ -374,13 +395,24 @@ internal static partial class NpgsqlMigrationBackup
         try
         {
             var directory = ResolveKeyDirectory(backupRoot, key, allowPartial: false);
-            if (!Directory.Exists(directory))
+            var canonicalRoot = Path.GetFullPath(backupRoot);
+            if (!Directory.Exists(canonicalRoot))
             {
                 return;
             }
 
-            RejectLinks(directory, backupRoot);
+            RejectLinks(canonicalRoot, canonicalRoot);
+            if (!Directory.Exists(directory))
+            {
+                NpgsqlBackupFileSystem.FlushDirectory(canonicalRoot, "flush-root-after-delete-completed");
+                return;
+            }
+
+            RejectLinks(directory, canonicalRoot);
+            NpgsqlBackupFileSystem.Checkpoint("before-delete-completed");
             Directory.Delete(directory, recursive: true);
+            NpgsqlBackupFileSystem.Checkpoint("after-delete-completed");
+            NpgsqlBackupFileSystem.FlushDirectory(canonicalRoot, "flush-root-after-delete-completed");
         }
         finally
         {
@@ -488,7 +520,8 @@ internal static partial class NpgsqlMigrationBackup
                    c.is_identity, c.identity_generation, c.is_generated, coalesce(c.generation_expression, ''),
                    pg_catalog.format_type(attribute.atttypid, attribute.atttypmod),
                    c.character_maximum_length, c.numeric_precision, c.numeric_scale,
-                   c.datetime_precision, coalesce(c.collation_schema, ''), coalesce(c.collation_name, '')
+                   c.datetime_precision, coalesce(c.collation_schema, ''), coalesce(c.collation_name, ''),
+                   attribute.attndims
             FROM information_schema.columns c
             JOIN information_schema.tables t
               ON t.table_schema = c.table_schema AND t.table_name = c.table_name
@@ -531,7 +564,8 @@ internal static partial class NpgsqlMigrationBackup
                 await ReadNullableInt32Async(reader, 15, cancellationToken).ConfigureAwait(false),
                 await ReadNullableInt32Async(reader, 16, cancellationToken).ConfigureAwait(false),
                 reader.GetString(17),
-                reader.GetString(18)));
+                reader.GetString(18),
+                reader.GetInt32(19)));
         }
 
         return tables;
@@ -1012,7 +1046,7 @@ internal static partial class NpgsqlMigrationBackup
               LEFT JOIN pg_catalog.pg_tablespace tablespace ON tablespace.oid = relation.reltablespace
               WHERE namespace.nspname = 'public'
               UNION ALL
-              SELECT 'column|' || namespace.nspname || '|' || relation.relname || '|' || attribute.attname || '|' || attribute.attnum || '|' || pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) || '|' || attribute.attnotnull || '|' || attribute.attidentity::text || '|' || attribute.attgenerated::text || '|' || coalesce(collation_namespace.nspname || '.' || collation_definition.collname, '') || '|' || coalesce(pg_get_expr(default_definition.adbin, default_definition.adrelid), '') || '|' || coalesce(attribute.attacl::text, '') || '|' || attribute.attstattarget || '|' || attribute.attstorage::text || '|' || attribute.attcompression::text || '|' || attribute.atthasmissing || '|' || coalesce(attribute.attmissingval::text, '') || '|' || attribute.attislocal || '|' || attribute.attinhcount || '|' || coalesce(attribute.attoptions::text, '') || '|' || coalesce(attribute.attfdwoptions::text, '') || '|' || coalesce(information.character_maximum_length::text, '') || '|' || coalesce(information.numeric_precision::text, '') || '|' || coalesce(information.numeric_scale::text, '') || '|' || coalesce(information.datetime_precision::text, '') || '|' || coalesce(col_description(relation.oid, attribute.attnum), '')
+              SELECT 'column|' || namespace.nspname || '|' || relation.relname || '|' || attribute.attname || '|' || attribute.attnum || '|' || pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) || '|' || attribute.attndims || '|' || attribute.attnotnull || '|' || attribute.attidentity::text || '|' || attribute.attgenerated::text || '|' || coalesce(collation_namespace.nspname || '.' || collation_definition.collname, '') || '|' || coalesce(pg_get_expr(default_definition.adbin, default_definition.adrelid), '') || '|' || coalesce(attribute.attacl::text, '') || '|' || attribute.attstattarget || '|' || attribute.attstorage::text || '|' || attribute.attcompression::text || '|' || attribute.atthasmissing || '|' || coalesce(attribute.attmissingval::text, '') || '|' || attribute.attislocal || '|' || attribute.attinhcount || '|' || coalesce(attribute.attoptions::text, '') || '|' || coalesce(attribute.attfdwoptions::text, '') || '|' || coalesce(information.character_maximum_length::text, '') || '|' || coalesce(information.numeric_precision::text, '') || '|' || coalesce(information.numeric_scale::text, '') || '|' || coalesce(information.datetime_precision::text, '') || '|' || coalesce(col_description(relation.oid, attribute.attnum), '')
               FROM pg_catalog.pg_attribute attribute
               JOIN pg_catalog.pg_class relation ON relation.oid = attribute.attrelid
               JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
@@ -1031,6 +1065,31 @@ internal static partial class NpgsqlMigrationBackup
               JOIN pg_catalog.pg_class index_relation ON index_relation.oid = index_definition.indexrelid
               JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace
               WHERE namespace.nspname = 'public'
+              UNION ALL
+              SELECT 'toast-relation|' || parent_namespace.nspname || '|' || parent.relname || '|' || toast.relkind::text || '|' || toast.relpersistence::text || '|' || pg_get_userbyid(toast.relowner) || '|' || coalesce(toast.relacl::text, '') || '|' || toast.relrowsecurity || '|' || toast.relforcerowsecurity || '|' || toast.relreplident::text || '|' || toast.relispartition || '|' || toast.relchecks || '|' || toast.relhasrules || '|' || toast.relhastriggers || '|' || coalesce(toast_access_method.amname, '') || '|' || coalesce(toast_tablespace.spcname, '') || '|' || coalesce(toast.reloptions::text, '') || '|' || coalesce(obj_description(toast.oid, 'pg_class'), '')
+              FROM pg_catalog.pg_class parent
+              JOIN pg_catalog.pg_namespace parent_namespace ON parent_namespace.oid = parent.relnamespace
+              JOIN pg_catalog.pg_class toast ON toast.oid = parent.reltoastrelid
+              LEFT JOIN pg_catalog.pg_am toast_access_method ON toast_access_method.oid = toast.relam
+              LEFT JOIN pg_catalog.pg_tablespace toast_tablespace ON toast_tablespace.oid = toast.reltablespace
+              WHERE parent_namespace.nspname = 'public'
+              UNION ALL
+              SELECT 'toast-column|' || parent_namespace.nspname || '|' || parent.relname || '|' || attribute.attname || '|' || attribute.attnum || '|' || pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) || '|' || attribute.attndims || '|' || attribute.attnotnull || '|' || attribute.attstattarget || '|' || attribute.attstorage::text || '|' || attribute.attcompression::text || '|' || attribute.atthasmissing || '|' || coalesce(attribute.attmissingval::text, '') || '|' || attribute.attislocal || '|' || attribute.attinhcount || '|' || coalesce(attribute.attoptions::text, '') || '|' || coalesce(attribute.attfdwoptions::text, '')
+              FROM pg_catalog.pg_class parent
+              JOIN pg_catalog.pg_namespace parent_namespace ON parent_namespace.oid = parent.relnamespace
+              JOIN pg_catalog.pg_class toast ON toast.oid = parent.reltoastrelid
+              JOIN pg_catalog.pg_attribute attribute ON attribute.attrelid = toast.oid
+              WHERE parent_namespace.nspname = 'public' AND attribute.attnum > 0 AND NOT attribute.attisdropped
+              UNION ALL
+              SELECT 'toast-index|' || parent_namespace.nspname || '|' || parent.relname || '|' || index_relation.relkind::text || '|' || index_relation.relpersistence::text || '|' || pg_get_userbyid(index_relation.relowner) || '|' || coalesce(index_relation.relacl::text, '') || '|' || coalesce(index_access_method.amname, '') || '|' || coalesce(index_tablespace.spcname, '') || '|' || coalesce(index_relation.reloptions::text, '') || '|' || index_definition.indisunique || '|' || index_definition.indisprimary || '|' || index_definition.indisexclusion || '|' || index_definition.indimmediate || '|' || index_definition.indisclustered || '|' || index_definition.indisvalid || '|' || index_definition.indcheckxmin || '|' || index_definition.indisready || '|' || index_definition.indislive || '|' || index_definition.indisreplident || '|' || index_definition.indnullsnotdistinct || '|' || index_definition.indnatts || '|' || index_definition.indnkeyatts || '|' || index_definition.indkey::text || '|' || index_definition.indcollation::text || '|' || index_definition.indclass::text || '|' || index_definition.indoption::text || '|' || coalesce(pg_get_expr(index_definition.indexprs, index_definition.indrelid), '') || '|' || coalesce(pg_get_expr(index_definition.indpred, index_definition.indrelid), '') || '|' || coalesce(obj_description(index_relation.oid, 'pg_class'), '')
+              FROM pg_catalog.pg_class parent
+              JOIN pg_catalog.pg_namespace parent_namespace ON parent_namespace.oid = parent.relnamespace
+              JOIN pg_catalog.pg_class toast ON toast.oid = parent.reltoastrelid
+              JOIN pg_catalog.pg_index index_definition ON index_definition.indrelid = toast.oid
+              JOIN pg_catalog.pg_class index_relation ON index_relation.oid = index_definition.indexrelid
+              LEFT JOIN pg_catalog.pg_am index_access_method ON index_access_method.oid = index_relation.relam
+              LEFT JOIN pg_catalog.pg_tablespace index_tablespace ON index_tablespace.oid = index_relation.reltablespace
+              WHERE parent_namespace.nspname = 'public'
               UNION ALL
               SELECT 'function|' || n.nspname || '|' || p.proname || '|' || pg_catalog.oidvectortypes(p.proargtypes) || '|' || pg_get_userbyid(p.proowner) || '|' || coalesce(p.proacl::text, '') || '|' || p.prokind::text || '|' || p.prosecdef || '|' || p.proleakproof || '|' || p.proisstrict || '|' || p.proretset || '|' || p.provolatile::text || '|' || p.proparallel::text || '|' || p.procost || '|' || p.prorows || '|' || coalesce(p.proconfig::text, '') || '|' || pg_get_functiondef(p.oid) || '|' || coalesce(obj_description(p.oid, 'pg_proc'), '') FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public'
               UNION ALL
@@ -1150,6 +1209,10 @@ internal static partial class NpgsqlMigrationBackup
               + (SELECT count(*) FROM pg_catalog.pg_ts_dict object JOIN pg_catalog.pg_namespace namespace ON namespace.oid = object.dictnamespace WHERE namespace.nspname = 'public')
               + (SELECT count(*) FROM pg_catalog.pg_ts_parser object JOIN pg_catalog.pg_namespace namespace ON namespace.oid = object.prsnamespace WHERE namespace.nspname = 'public')
               + (SELECT count(*) FROM pg_catalog.pg_ts_template object JOIN pg_catalog.pg_namespace namespace ON namespace.oid = object.tmplnamespace WHERE namespace.nspname = 'public')
+              + (SELECT count(*) FROM pg_catalog.pg_publication_rel membership JOIN pg_catalog.pg_class relation ON relation.oid = membership.prrelid JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace WHERE namespace.nspname = 'public')
+              + (SELECT count(*) FROM pg_catalog.pg_publication_namespace membership JOIN pg_catalog.pg_namespace namespace ON namespace.oid = membership.pnnspid WHERE namespace.nspname = 'public')
+              + (SELECT count(*) FROM pg_catalog.pg_publication publication WHERE publication.puballtables)
+              + (SELECT count(*) FROM pg_catalog.pg_subscription_rel membership JOIN pg_catalog.pg_class relation ON relation.oid = membership.srrelid JOIN pg_catalog.pg_namespace namespace ON namespace.oid = relation.relnamespace WHERE namespace.nspname = 'public')
             """;
         await using var command = new NpgsqlCommand(Sql, connection, transaction);
         var unsupported = (long)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
@@ -1361,7 +1424,10 @@ internal static partial class NpgsqlMigrationBackup
                 await stream.DisposeAsync().ConfigureAwait(false);
             }
 
-            TryDeleteOwnedDirectory(stageDirectory);
+            DeleteOwnedDirectoryDurably(
+                stageDirectory,
+                Path.GetDirectoryName(stageDirectory)!,
+                "restore-stage");
             throw;
         }
     }
@@ -1425,6 +1491,7 @@ internal static partial class NpgsqlMigrationBackup
             RejectLinks(canonicalRoot, canonicalRoot);
             SetDirectoryPermissions(canonicalRoot);
             NpgsqlBackupFileSystem.FlushDirectory(canonicalRoot, "flush-existing-root");
+            NpgsqlBackupFileSystem.FlushDirectory(parent, "flush-existing-root-parent");
             return;
         }
 
@@ -1485,26 +1552,38 @@ internal static partial class NpgsqlMigrationBackup
             var name = Path.GetFileName(directory);
             if (PartialKeyPattern().IsMatch(name) || RestorePartialPattern().IsMatch(name))
             {
-                TryDeleteOwnedDirectory(directory);
+                DeleteOwnedDirectoryDurably(directory, root, "scavenged-partial");
             }
         }
     }
 
-    private static void TryDeleteOwnedDirectory(string directory)
+    private static void DeleteOwnedDirectoryDurably(string directory, string root, string operation)
+    {
+        var canonicalRoot = Path.GetFullPath(root);
+        RejectLinks(directory, canonicalRoot);
+        if (Directory.Exists(directory))
+        {
+            NpgsqlBackupFileSystem.Checkpoint("before-delete-" + operation);
+            Directory.Delete(directory, recursive: true);
+            NpgsqlBackupFileSystem.Checkpoint("after-delete-" + operation);
+        }
+
+        NpgsqlBackupFileSystem.FlushDirectory(canonicalRoot, "flush-root-after-delete-" + operation);
+    }
+
+    private static void TryDeleteOwnedDirectoryDurably(
+        string directory,
+        string root,
+        string operation,
+        List<Exception> failures)
     {
         try
         {
-            RejectLinks(directory, Path.GetDirectoryName(directory)!);
-            if (Directory.Exists(directory))
-            {
-                Directory.Delete(directory, recursive: true);
-            }
+            DeleteOwnedDirectoryDurably(directory, root, operation);
         }
-        catch (IOException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
         {
-        }
-        catch (UnauthorizedAccessException)
-        {
+            failures.Add(exception);
         }
     }
 
@@ -1633,7 +1712,8 @@ internal static partial class NpgsqlMigrationBackup
         int? NumericScale,
         int? DateTimePrecision,
         string CollationSchema,
-        string CollationName);
+        string CollationName,
+        int DeclaredArrayDimensions);
 
     private sealed record SequenceDefinition(
         string Schema,
@@ -1684,7 +1764,10 @@ internal static partial class NpgsqlMigrationBackup
                 await stream.DisposeAsync().ConfigureAwait(false);
             }
 
-            TryDeleteOwnedDirectory(stageDirectory);
+            DeleteOwnedDirectoryDurably(
+                stageDirectory,
+                Path.GetDirectoryName(stageDirectory)!,
+                "restore-stage");
         }
     }
 }
