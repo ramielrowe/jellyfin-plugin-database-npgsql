@@ -1068,6 +1068,7 @@ public sealed class ModelCompatibilityTests
                     [
                         "20261009061101_InitialPostgreSqlBaseline",
                         "20261009061446_AddActivityLogTypeDateIndex",
+                        "20261009113458_AddUuidMinMaxAggregates",
                     ],
                     migrationIds);
                 await context.Database.ExecuteSqlRawAsync(

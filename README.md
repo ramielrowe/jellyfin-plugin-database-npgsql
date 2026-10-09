@@ -163,6 +163,9 @@ recorded in [`docs/model-compatibility.md`](docs/model-compatibility.md).
 The independent migration lineage, design-time workflow, hand-authored SQL
 boundary, and pinned host migration audit are documented in
 [`docs/migrations.md`](docs/migrations.md).
+The SQLite differential matrix, repeated PostgreSQL runs, stock-server
+API/media-scan proof, and intentional provider differences are documented in
+[`docs/persistence-parity.md`](docs/persistence-parity.md).
 The atomic backup format, validation boundaries, and transactional restore are
 documented in [`docs/migration-backups.md`](docs/migration-backups.md).
 

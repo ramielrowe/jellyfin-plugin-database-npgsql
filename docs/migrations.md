@@ -55,6 +55,13 @@ extension or requires superuser privileges.
 It adds and reversibly removes `IX_ActivityLogs_Npgsql_Type_DateCreated`, proving
 same-provider upgrade and downgrade independently from the baseline.
 
+`20261009113458_AddUuidMinMaxAggregates` installs reversible `min(uuid)` and
+`max(uuid)` aggregates plus two provider-prefixed transition functions. Vanilla
+Jellyfin uses UUID minima while collapsing presentation-key groups, but
+PostgreSQL 16 has no built-in UUID minimum or maximum aggregate. The objects are
+created in the application-owned `public` schema by the restricted runtime role;
+they require no extension or elevated privilege.
+
 ## Shared migration history audit
 
 Vanilla Jellyfin deliberately stores code-migration IDs and EF migration IDs in
@@ -81,7 +88,7 @@ UpdateDefaultPluginRepository, and MoveTrickplayFiles; they still execute
 normally. Unit tests require the setup and seeded partitions to be disjoint and
 to cover all 49 pinned IDs exactly. The pristine-host migration test starts an
 untouched publish against an empty, pre-created PostgreSQL database and requires
-it to become healthy with the exact 49 code rows plus the two plugin rows. This
+it to become healthy with the exact 49 code rows plus the three plugin rows. This
 proves the legacy transforms were seeded and every setup routine completed
 without changing Jellyfin's migration service.
 

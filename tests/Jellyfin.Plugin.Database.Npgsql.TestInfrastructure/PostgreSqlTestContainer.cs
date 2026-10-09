@@ -277,12 +277,12 @@ public sealed class PostgreSqlTestContainer : IAsyncDisposable
         {
             throw new InvalidOperationException(
                 $"Refusing to remove test container name '{expectedContainerName}' with immutable ID '{containerId}' because its ID, name, or ownership labels do not match. "
-                + $"Inspect that exact ID and remove it manually only after confirming it is disposable: docker inspect {containerId}; docker rm --force {containerId}");
+                + $"Inspect that exact ID and remove it manually only after confirming it is disposable: docker inspect {containerId}; docker rm --force --volumes {containerId}");
         }
 
         var result = await ExternalCommand.RunAsync(
             "docker",
-            new[] { "rm", "--force", containerId },
+            new[] { "rm", "--force", "--volumes", containerId },
             TimeSpan.FromSeconds(30),
             CancellationToken.None).ConfigureAwait(false);
         if (result.ExitCode != 0

@@ -15,7 +15,7 @@ public sealed class MigrationContractTests
         "Host=127.0.0.1;Port=1;Database=migration_contract;Username=migration_contract;Password=not-used;Pooling=false;Timeout=1";
 
     [Fact]
-    public void RuntimeContext_OwnsFreshBaselineSuccessorSnapshotAndIdempotentScript()
+    public void RuntimeContext_OwnsFreshMigrationLineageSnapshotAndIdempotentScript()
     {
         using var context = CreateRuntimeContext();
 
@@ -23,6 +23,7 @@ public sealed class MigrationContractTests
             [
                 "20261009061101_InitialPostgreSqlBaseline",
                 "20261009061446_AddActivityLogTypeDateIndex",
+                "20261009113458_AddUuidMinMaxAggregates",
             ],
             context.Database.GetMigrations());
         Assert.False(context.Database.HasPendingModelChanges());
@@ -30,7 +31,10 @@ public sealed class MigrationContractTests
         var script = context.GetService<IMigrator>().GenerateScript(options: MigrationsSqlGenerationOptions.Idempotent);
         Assert.Contains("20261009061101_InitialPostgreSqlBaseline", script, StringComparison.Ordinal);
         Assert.Contains("20261009061446_AddActivityLogTypeDateIndex", script, StringComparison.Ordinal);
+        Assert.Contains("20261009113458_AddUuidMinMaxAggregates", script, StringComparison.Ordinal);
         Assert.Contains("__JellyfinTextNodes", script, StringComparison.Ordinal);
+        Assert.Contains("CREATE AGGREGATE public.min(uuid)", script, StringComparison.Ordinal);
+        Assert.Contains("CREATE AGGREGATE public.max(uuid)", script, StringComparison.Ordinal);
         Assert.Contains("IX_ActivityLogs_Npgsql_Type_DateCreated", script, StringComparison.Ordinal);
         Assert.DoesNotContain("Digest", script, StringComparison.Ordinal);
     }

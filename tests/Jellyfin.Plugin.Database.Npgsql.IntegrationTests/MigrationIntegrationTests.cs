@@ -15,6 +15,7 @@ public sealed class MigrationIntegrationTests
 {
     private const string Baseline = "20261009061101_InitialPostgreSqlBaseline";
     private const string Successor = "20261009061446_AddActivityLogTypeDateIndex";
+    private const string UuidAggregates = "20261009113458_AddUuidMinMaxAggregates";
     private const string CoreNormalizedUsername = "20260522092304_UpdateNormalizedUsername";
     private const string CoreDisableLegacyAuthorization = "20260531160000_DisableLegacyAuthorization";
 
@@ -73,6 +74,7 @@ public sealed class MigrationIntegrationTests
             var expected = NpgsqlHostMigrationAudit.AuditedMigrationIds
                 .Append(Baseline)
                 .Append(Successor)
+                .Append(UuidAggregates)
                 .Order(StringComparer.Ordinal)
                 .ToArray();
             Assert.Equal(expected, await ReadHistoryAsync(context, cancellationToken));
@@ -89,7 +91,7 @@ public sealed class MigrationIntegrationTests
     }
 
     [Fact]
-    public async Task RestrictedRole_BaselineIsRepeatableAndSuccessorRoundTripsWithoutDataLoss()
+    public async Task RestrictedRole_MigrationLineageRoundTripsWithoutDataLoss()
     {
         var options = PostgreSqlTestOptions.FromEnvironment();
         Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
@@ -120,11 +122,12 @@ public sealed class MigrationIntegrationTests
             Assert.True(await IndexExistsAsync(context, cancellationToken));
 
             Assert.Equal(
-                [CoreNormalizedUsername, CoreDisableLegacyAuthorization, Baseline, Successor],
+                [CoreNormalizedUsername, CoreDisableLegacyAuthorization, Baseline, Successor, UuidAggregates],
                 await ReadHistoryAsync(context, cancellationToken));
 
             Assert.Equal(5, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgname LIKE 'TR_%_Intern' AND NOT tgisinternal", cancellationToken));
-            Assert.Equal(10, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace AND proname LIKE '__jellyfin_%'", cancellationToken));
+            Assert.Equal(12, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace AND proname LIKE '__jellyfin_%'", cancellationToken));
+            Assert.Equal(2, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace AND prokind = 'a' AND proname IN ('min', 'max') AND pg_catalog.pg_get_function_identity_arguments(oid) = 'uuid'", cancellationToken));
             Assert.Equal(0, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_extension WHERE extname IN ('pgcrypto', 'citext')", cancellationToken));
             Assert.Equal(0, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_constraint WHERE conname IN ('PK_BaseItemProviders', 'PK_PeopleBaseItemMap', 'PK_UserData')", cancellationToken));
             Assert.True(await ScalarAsync<bool>(context, "SELECT NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = current_user", cancellationToken));
@@ -142,7 +145,7 @@ public sealed class MigrationIntegrationTests
             Assert.True(await IndexExistsAsync(context, cancellationToken));
             Assert.Equal(1, await context.ActivityLogs.CountAsync(cancellationToken));
             Assert.Equal(
-                [CoreNormalizedUsername, CoreDisableLegacyAuthorization, Baseline, Successor],
+                [CoreNormalizedUsername, CoreDisableLegacyAuthorization, Baseline, Successor, UuidAggregates],
                 await ReadHistoryAsync(context, cancellationToken));
         }
         finally

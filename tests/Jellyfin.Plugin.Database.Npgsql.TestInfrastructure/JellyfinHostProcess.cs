@@ -200,8 +200,20 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
     }
 
     public async Task<string> GetStringAsync(string relativePath, CancellationToken cancellationToken)
+        => await GetStringAsync(relativePath, authorization: null, cancellationToken).ConfigureAwait(false);
+
+    public async Task<string> GetStringAsync(
+        string relativePath,
+        string? authorization,
+        CancellationToken cancellationToken)
     {
-        using var response = await SendAsync(new HttpRequestMessage(HttpMethod.Get, relativePath), cancellationToken).ConfigureAwait(false);
+        using var request = new HttpRequestMessage(HttpMethod.Get, relativePath);
+        if (!string.IsNullOrEmpty(authorization))
+        {
+            request.Headers.TryAddWithoutValidation("Authorization", authorization);
+        }
+
+        using var response = await SendAsync(request, cancellationToken).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
         return await ReadBoundedResponseAsync(response, cancellationToken).ConfigureAwait(false);
     }
@@ -217,6 +229,23 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
+        if (!string.IsNullOrEmpty(authorization))
+        {
+            request.Headers.TryAddWithoutValidation("Authorization", authorization);
+        }
+
+        using var response = await SendAsync(request, cancellationToken).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        return await ReadBoundedResponseAsync(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<string> DeleteAsync(
+        string relativePath,
+        string? authorization,
+        CancellationToken cancellationToken)
+    {
+        ValidateRelativePath(relativePath);
+        using var request = new HttpRequestMessage(HttpMethod.Delete, relativePath);
         if (!string.IsNullOrEmpty(authorization))
         {
             request.Headers.TryAddWithoutValidation("Authorization", authorization);

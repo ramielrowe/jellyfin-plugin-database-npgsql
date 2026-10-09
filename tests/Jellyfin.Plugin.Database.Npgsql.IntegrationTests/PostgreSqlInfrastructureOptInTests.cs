@@ -157,7 +157,7 @@ public sealed class PostgreSqlInfrastructureOptInTests
                 {
                     var removal = await ExternalCommand.RunAsync(
                         "docker",
-                        new[] { "rm", "--force" }.Concat(immutableIds),
+                        new[] { "rm", "--force", "--volumes" }.Concat(immutableIds),
                         TimeSpan.FromSeconds(30),
                         CancellationToken.None);
                     removal.EnsureSuccess("Removing stale-container test controls", new SensitiveDataRedactor());
@@ -207,7 +207,7 @@ public sealed class PostgreSqlInfrastructureOptInTests
                 {
                     var removal = await ExternalCommand.RunAsync(
                         "docker",
-                        new[] { "rm", "--force" }.Concat(duplicateIds),
+                        new[] { "rm", "--force", "--volumes" }.Concat(duplicateIds),
                         TimeSpan.FromSeconds(30),
                         CancellationToken.None);
                     removal.EnsureSuccess("Removing duplicate-lease container controls", new SensitiveDataRedactor());

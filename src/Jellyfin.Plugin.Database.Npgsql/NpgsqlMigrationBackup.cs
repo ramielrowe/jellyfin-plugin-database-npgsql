@@ -22,6 +22,7 @@ internal static partial class NpgsqlMigrationBackup
     private const int FormatVersion = 2;
     private const string BaselineMigration = "20261009061101_InitialPostgreSqlBaseline";
     private const string SuccessorMigration = "20261009061446_AddActivityLogTypeDateIndex";
+    private const string UuidAggregatesMigration = "20261009113458_AddUuidMinMaxAggregates";
     private const string ManifestFile = "manifest.json";
     private const string CompletionFile = "complete";
     private const string HistorySchemaSql = """
@@ -94,7 +95,7 @@ internal static partial class NpgsqlMigrationBackup
             }
             else if (!empty)
             {
-                await ValidateSupportedModelAsync(context.Model, connection, transaction, tables, cancellationToken).ConfigureAwait(false);
+                await ValidateSupportedModelAsync(context.Model, connection, transaction, tables, migration!, cancellationToken).ConfigureAwait(false);
                 tables = await OrderTablesForRestoreAsync(connection, transaction, tables, cancellationToken).ConfigureAwait(false);
                 schemaSql = GenerateSupportedSchemaSql(context, migration!);
                 if (string.IsNullOrWhiteSpace(schemaSql))
@@ -465,13 +466,14 @@ internal static partial class NpgsqlMigrationBackup
         }
 
         await using var command = new NpgsqlCommand(
-            "SELECT \"MigrationId\" FROM public.\"__EFMigrationsHistory\" WHERE \"MigrationId\" IN (@baseline, @successor) ORDER BY \"MigrationId\" DESC LIMIT 1",
+            "SELECT \"MigrationId\" FROM public.\"__EFMigrationsHistory\" WHERE \"MigrationId\" IN (@baseline, @successor, @uuidAggregates) ORDER BY \"MigrationId\" DESC LIMIT 1",
             connection,
             transaction);
         command.Parameters.AddWithValue("baseline", BaselineMigration);
         command.Parameters.AddWithValue("successor", SuccessorMigration);
+        command.Parameters.AddWithValue("uuidAggregates", UuidAggregatesMigration);
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
-        if (result is not (BaselineMigration or SuccessorMigration))
+        if (result is not (BaselineMigration or SuccessorMigration or UuidAggregatesMigration))
         {
             throw new NotSupportedException(
                 "The populated PostgreSQL database does not have a supported plugin migration baseline. Refusing migration before mutation.");
@@ -482,9 +484,14 @@ internal static partial class NpgsqlMigrationBackup
 
     private static string GenerateSupportedSchemaSql(JellyfinDbContext context, string sourceMigration)
     {
-        var selectedMigrations = sourceMigration == BaselineMigration
-            ? new[] { BaselineMigration }
-            : new[] { BaselineMigration, SuccessorMigration };
+        var selectedMigrations = sourceMigration switch
+        {
+            BaselineMigration => new[] { BaselineMigration },
+            SuccessorMigration => new[] { BaselineMigration, SuccessorMigration },
+            UuidAggregatesMigration => new[] { BaselineMigration, SuccessorMigration, UuidAggregatesMigration },
+            _ => throw new NotSupportedException(
+                $"The provider migration '{sourceMigration}' is unavailable; no rollback-capable backup was published."),
+        };
         var migrationsAssembly = context.GetService<IMigrationsAssembly>();
         var sqlGenerator = context.GetService<IMigrationsSqlGenerator>();
         var historyRepository = context.GetService<IHistoryRepository>();
@@ -639,10 +646,11 @@ internal static partial class NpgsqlMigrationBackup
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
         IReadOnlyList<TableMetadata> actualTables,
+        string sourceMigration,
         CancellationToken cancellationToken)
     {
         ValidateSupportedModelTables(model, actualTables);
-        await ValidateSupportedSchemaObjectsAsync(connection, transaction, actualTables, cancellationToken).ConfigureAwait(false);
+        await ValidateSupportedSchemaObjectsAsync(connection, transaction, actualTables, sourceMigration, cancellationToken).ConfigureAwait(false);
     }
 
     private static void ValidateSupportedModelTables(IModel model, IReadOnlyList<TableMetadata> actualTables)
@@ -726,6 +734,7 @@ internal static partial class NpgsqlMigrationBackup
         NpgsqlConnection connection,
         NpgsqlTransaction transaction,
         IReadOnlyList<TableMetadata> tables,
+        string sourceMigration,
         CancellationToken cancellationToken)
     {
         const string UnsupportedObjectsSql = """
@@ -786,6 +795,17 @@ internal static partial class NpgsqlMigrationBackup
             "__jellyfin_sqlite_like(text, text)",
             "__jellyfin_sqlite_like_escape(text, text, text)",
         };
+        if (sourceMigration == UuidAggregatesMigration)
+        {
+            expectedFunctions.UnionWith(
+                [
+                    "__jellyfin_uuid_max(uuid, uuid)",
+                    "__jellyfin_uuid_min(uuid, uuid)",
+                    "max(uuid)",
+                    "min(uuid)",
+                ]);
+        }
+
         var functions = await ReadStringSetAsync(
             connection,
             transaction,
@@ -1092,7 +1112,7 @@ internal static partial class NpgsqlMigrationBackup
               LEFT JOIN pg_catalog.pg_tablespace index_tablespace ON index_tablespace.oid = index_relation.reltablespace
               WHERE parent_namespace.nspname = 'public'
               UNION ALL
-              SELECT 'function|' || n.nspname || '|' || p.proname || '|' || pg_catalog.oidvectortypes(p.proargtypes) || '|' || pg_get_userbyid(p.proowner) || '|' || coalesce(p.proacl::text, '') || '|' || p.prokind::text || '|' || p.prosecdef || '|' || p.proleakproof || '|' || p.proisstrict || '|' || p.proretset || '|' || p.provolatile::text || '|' || p.proparallel::text || '|' || p.procost || '|' || p.prorows || '|' || coalesce(p.proconfig::text, '') || '|' || pg_get_functiondef(p.oid) || '|' || coalesce(obj_description(p.oid, 'pg_proc'), '') FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public'
+              SELECT 'function|' || n.nspname || '|' || p.proname || '|' || pg_catalog.oidvectortypes(p.proargtypes) || '|' || pg_get_userbyid(p.proowner) || '|' || coalesce(p.proacl::text, '') || '|' || p.prokind::text || '|' || p.prosecdef || '|' || p.proleakproof || '|' || p.proisstrict || '|' || p.proretset || '|' || p.provolatile::text || '|' || p.proparallel::text || '|' || p.procost || '|' || p.prorows || '|' || coalesce(p.proconfig::text, '') || '|' || CASE WHEN p.prokind = 'a' THEN 'aggregate|' || aggregate_definition.aggkind::text || '|' || aggregate_definition.aggnumdirectargs || '|' || aggregate_definition.aggtransfn::regprocedure::text || '|' || aggregate_definition.aggfinalfn::regprocedure::text || '|' || aggregate_definition.aggcombinefn::regprocedure::text || '|' || aggregate_definition.aggserialfn::regprocedure::text || '|' || aggregate_definition.aggdeserialfn::regprocedure::text || '|' || aggregate_definition.aggmtransfn::regprocedure::text || '|' || aggregate_definition.aggminvtransfn::regprocedure::text || '|' || aggregate_definition.aggmfinalfn::regprocedure::text || '|' || aggregate_definition.aggfinalextra || '|' || aggregate_definition.aggmfinalextra || '|' || aggregate_definition.aggfinalmodify::text || '|' || aggregate_definition.aggmfinalmodify::text || '|' || aggregate_definition.aggsortop || '|' || aggregate_definition.aggtranstype::regtype::text || '|' || aggregate_definition.aggtransspace || '|' || aggregate_definition.aggmtranstype::regtype::text || '|' || aggregate_definition.aggmtransspace || '|' || coalesce(aggregate_definition.agginitval, '') || '|' || coalesce(aggregate_definition.aggminitval, '') ELSE pg_get_functiondef(p.oid) END || '|' || coalesce(obj_description(p.oid, 'pg_proc'), '') FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace LEFT JOIN pg_catalog.pg_aggregate aggregate_definition ON aggregate_definition.aggfnoid = p.oid WHERE n.nspname = 'public'
               UNION ALL
               SELECT 'trigger|' || n.nspname || '|' || c.relname || '|' || t.tgname || '|' || t.tgenabled::text || '|' || pg_get_triggerdef(t.oid, true) || '|' || coalesce(obj_description(t.oid, 'pg_trigger'), '') FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND NOT t.tgisinternal
               UNION ALL
@@ -1402,7 +1422,7 @@ internal static partial class NpgsqlMigrationBackup
             || manifest.ForeignKeys is null
             || (manifest.Empty && (manifest.HistoryOnly || manifest.Tables.Count != 0 || manifest.SchemaFile is not null))
             || (manifest.HistoryOnly && (manifest.Empty || manifest.SourceMigration is not null || manifest.SchemaFile is null || manifest.Tables.Count != 1))
-            || (!manifest.Empty && !manifest.HistoryOnly && (manifest.SourceMigration is not (BaselineMigration or SuccessorMigration) || manifest.SchemaFile is null || manifest.SchemaHash is null)))
+            || (!manifest.Empty && !manifest.HistoryOnly && (manifest.SourceMigration is not (BaselineMigration or SuccessorMigration or UuidAggregatesMigration) || manifest.SchemaFile is null || manifest.SchemaHash is null)))
         {
             throw new InvalidDataException("The PostgreSQL migration backup manifest is incompatible or malformed; the database was not changed.");
         }
