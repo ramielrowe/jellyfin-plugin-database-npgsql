@@ -5,6 +5,7 @@
   <Folder Name="/tests/">
     <Project Path="tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests.csproj" />
     <Project Path="tests/Jellyfin.Plugin.Database.Npgsql.TestInfrastructure/Jellyfin.Plugin.Database.Npgsql.TestInfrastructure.csproj" />
+    <Project Path="tests/Jellyfin.Plugin.Database.Npgsql.TestProvider/Jellyfin.Plugin.Database.Npgsql.TestProvider.csproj" />
     <Project Path="tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/Jellyfin.Plugin.Database.Npgsql.TestHarness.csproj" />
     <Project Path="tests/Jellyfin.Plugin.Database.Npgsql.UnitTests/Jellyfin.Plugin.Database.Npgsql.UnitTests.csproj" />
   </Folder>

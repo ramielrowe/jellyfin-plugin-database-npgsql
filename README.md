@@ -156,6 +156,10 @@ explicit test-administrator connection or an immutable pinned container; the
 host fixture accepts an integrity-checked vanilla Jellyfin publish or ZIP and
 has no sibling/parent checkout dependency.
 
+The audited late-model transformations, exact chunk-interned text-key design,
+and the public query-compatibility contract are
+recorded in [`docs/model-compatibility.md`](docs/model-compatibility.md).
+
 Until the backup bead lands, run its provider-core stage instead. It exercises
 the packaged ZIP, early dependency/ABI guards, a restricted real PostgreSQL role,
 and the untouched vanilla startup path, then proves the deliberate backup guard

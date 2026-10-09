@@ -19,7 +19,7 @@ namespace Jellyfin.Plugin.Database.Npgsql;
 /// Initializes a new instance of the <see cref="NpgsqlDatabaseProvider"/> class.
 /// </remarks>
 /// <param name="logger">The host logger.</param>
-public sealed partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvider> logger) : IJellyfinDatabaseProvider
+public partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvider> logger) : IJellyfinDatabaseProvider
 {
     private const string PluginProviderType = "PLUGIN_PROVIDER";
 
@@ -31,6 +31,12 @@ public sealed partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvide
 
     private readonly ILogger<NpgsqlDatabaseProvider> logger = logger;
     private string? connectionString;
+
+    /// <summary>Gets the exact folder accepted by the early provider loader.</summary>
+    protected virtual string RequiredPluginDirectory => PluginMetadata.InstallationDirectory;
+
+    /// <summary>Gets the exact provider assembly accepted by the early provider loader.</summary>
+    protected virtual string RequiredPluginAssembly => PluginMetadata.AssemblyFileName;
 
     /// <inheritdoc />
     public IDbContextFactory<JellyfinDbContext>? DbContextFactory { get; set; }
@@ -151,15 +157,15 @@ public sealed partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvide
     }
 
     /// <inheritdoc />
-    public Task<string> MigrationBackupFast(CancellationToken cancellationToken)
+    public virtual Task<string> MigrationBackupFast(CancellationToken cancellationToken)
         => throw CreateFastBackupNotSupportedException();
 
     /// <inheritdoc />
-    public Task RestoreBackupFast(string key, CancellationToken cancellationToken)
+    public virtual Task RestoreBackupFast(string key, CancellationToken cancellationToken)
         => throw CreateFastBackupNotSupportedException();
 
     /// <inheritdoc />
-    public Task DeleteBackup(string key)
+    public virtual Task DeleteBackup(string key)
         => throw CreateFastBackupNotSupportedException();
 
     /// <inheritdoc />
@@ -284,13 +290,13 @@ public sealed partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvide
 
         var selectedDirectory = Path.GetFileName(Path.GetDirectoryName(providerAssembly.Location));
         if (string.IsNullOrWhiteSpace(pluginName)
-            || !string.Equals(pluginName, PluginMetadata.InstallationDirectory, StringComparison.Ordinal)
+            || !string.Equals(pluginName, this.RequiredPluginDirectory, StringComparison.Ordinal)
             || !string.Equals(selectedDirectory, pluginName, StringComparison.Ordinal)
-            || !string.Equals(pluginAssembly, PluginMetadata.AssemblyFileName, StringComparison.Ordinal))
+            || !string.Equals(pluginAssembly, this.RequiredPluginAssembly, StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
                 $"Jellyfin selected the Npgsql provider from folder '{selectedDirectory}', but this release requires the exact folder and PluginName "
-                + $"'{PluginMetadata.InstallationDirectory}' plus PluginAssembly '{PluginMetadata.AssemblyFileName}'. Remove ambiguous prefix-matching "
+                + $"'{this.RequiredPluginDirectory}' plus PluginAssembly '{this.RequiredPluginAssembly}'. Remove ambiguous prefix-matching "
                 + "folders, restore the complete release ZIP there, update database.xml atomically, and restart. No database connection was attempted.");
         }
     }

@@ -62,7 +62,9 @@ internal static class NpgsqlOptionsBootstrap
                     npgsql.ConfigureDataSource(configured.ConfigureDataSource);
                 }
             });
-        options.ReplaceService<IModelCustomizer, NpgsqlModelCustomizer>();
+        options
+            .ReplaceService<IModelCustomizer, NpgsqlModelCustomizer>()
+            .AddInterceptors(NpgsqlQueryExpressionInterceptor.Instance);
         return configured;
     }
 
