@@ -84,13 +84,17 @@ unchanged Jellyfin 12.2 host actually supplies:
 - Three-argument `EF.Functions.Like(match, pattern)` becomes a mapped function
   which folds ASCII `A-Z` only and emits PostgreSQL `ESCAPE ''`, matching SQLite's
   lack of an implicit escape character. Four-argument `Like` remains distinct:
-  match, pattern, and its one-character explicit escape are folded consistently,
-  including uppercase ASCII escape markers. Empty or multi-character explicit
-  escapes fail as they do on SQLite. `%` and `_` remain wildcards.
+  the original pattern is parsed with the original case-sensitive one-character
+  escape before literal content is ASCII-folded. The parsed tokens are emitted as
+  a canonical backslash-escaped PostgreSQL pattern, so a folded literal can never
+  become an escape or wildcard. Empty or multi-character explicit escapes fail as
+  they do on SQLite. `%` and `_` remain wildcards only when they were unescaped in
+  the original pattern.
 - `People.Name.StartsWith(prefix)` uses an indexable, `C`-collated 512-character
-  generated ASCII prefix with `text_pattern_ops`, then applies the complete folded
-  name predicate. Long names/prefixes retain exact semantics without risking
-  PostgreSQL's B-tree entry limit.
+  generated ASCII prefix with `text_pattern_ops`. Its accelerator is emitted as a
+  no-escape `LIKE` predicate (rather than Npgsql's parameterized `left()` rewrite),
+  then the complete folded name predicate is applied. Long names/prefixes retain
+  exact semantics without risking PostgreSQL's B-tree entry limit.
 - ordering by a nullable key first adds an explicit null marker: ascending puts
   null first and descending puts null last, matching SQLite before applying the
   requested value direction. The same rewrite applies to `ThenBy`.
@@ -109,6 +113,12 @@ isolate and `EXPLAIN` every replacement to prove it is planner-usable. Some form
 covering/order behavior necessarily becomes a bounded-prefix scan plus filter or
 sort; this is explicit rather than risking runtime B-tree overflow.
 
+Plan proofs execute tagged LINQ first, capture the actual Npgsql command and typed
+parameter values, and run `EXPLAIN` with clones of those parameters. They do not
+depend on `enable_seqscan` or another global planner override. The fixture uses
+production-shaped cardinalities and asserts the target index conditions, both
+`ItemValue.Type` and `Value` participation, and all nullable ordering directions.
+
 The discriminator is bounded at 511 characters, matching the existing provider
 smoke contract. Other bounded identifiers, UTC timestamp converters, ordinal `C`
 collations, UUID operations, and the generated ASCII-lower people name are tested
@@ -122,6 +132,14 @@ nodes, compare parameterized LIKE expressions directly with SQLite, validate
 with trigger-owned IDs through raw SQL, verify exact append-only growth, and
 EXPLAIN the actual intercepted LINQ for People prefix, ItemValue equality,
 nullable ordering, and every replacement index.
+
+A separate inverse-order test uses ordinary tracked `SaveChangesAsync` calls. A
+test-only trigger deterministically creates one `40P01` deadlock after the real
+interning trigger, while a nontransactional sequence proves the failed operation
+was replayed. A second trigger raises `40001` once. Both saves complete through the
+provider's automatic execution strategy; returned shadow IDs, tracker states,
+canonical node counts, and exact persisted rows prove retries have no duplicate
+side effects.
 
 The full-host model test uses a separate test-only provider assembly and a wholly
 disposable database to bridge the unfinished backup bead. It first lets an

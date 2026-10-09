@@ -1,7 +1,9 @@
+using System.Data.Common;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Locking;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -90,12 +92,14 @@ public sealed class ModelCompatibilityTests
     [Fact]
     public void RuntimeModelGuard_RejectsAnyFinalizedModelDriftBeforeDatabaseUse()
     {
-        using var context = CreateDriftedContext();
+        var commandAttempts = new CommandAttemptInterceptor();
+        using var context = CreateDriftedContext(commandAttempts);
 
-        var exception = Assert.Throws<InvalidOperationException>(() => _ = context.Model);
+        var exception = Assert.Throws<InvalidOperationException>(() => context.BaseItems.Any());
 
         Assert.Contains("complete finalized Jellyfin database model", exception.Message, StringComparison.Ordinal);
         Assert.Contains("before any schema operation", exception.Message, StringComparison.Ordinal);
+        Assert.Equal(0, commandAttempts.Count);
     }
 
     [Fact]
@@ -121,6 +125,8 @@ public sealed class ModelCompatibilityTests
         Assert.Contains("BEFORE INSERT OR UPDATE ON", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
         Assert.DoesNotContain("digest(", NpgsqlTextInterning.InstallSql, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("pgcrypto", NpgsqlTextInterning.InstallSql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("convert_to(pattern_character, 'UTF8') = convert_to(escape_value, 'UTF8')", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
+        Assert.DoesNotContain("ascii_lower\"(escape_value)", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -147,6 +153,8 @@ public sealed class ModelCompatibilityTests
         Assert.Contains("\"NameLower\"", peopleSql, StringComparison.Ordinal);
         Assert.Contains("__jellyfin_ascii_prefix", peopleSql, StringComparison.Ordinal);
         Assert.Contains("__jellyfin_ascii_lower", peopleSql, StringComparison.Ordinal);
+        Assert.Contains("LIKE", peopleSql, StringComparison.Ordinal);
+        Assert.Contains("ESCAPE ''", peopleSql, StringComparison.Ordinal);
 
         var ascendingSql = context.BaseItems.OrderBy(item => item.SortName).ToQueryString();
         Assert.Contains("CASE", ascendingSql, StringComparison.Ordinal);
@@ -170,14 +178,29 @@ public sealed class ModelCompatibilityTests
             new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
     }
 
-    private static JellyfinDbContext CreateDriftedContext()
+    private static JellyfinDbContext CreateDriftedContext(DbCommandInterceptor commandInterceptor)
     {
         var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
         var builder = new DbContextOptionsBuilder<JellyfinDbContext>();
         NpgsqlOptionsBootstrap.Configure(builder, ConnectionString, null);
+        builder.AddInterceptors(commandInterceptor);
         return new DriftedJellyfinDbContext(
             builder.Options,
             provider);
+    }
+
+    private sealed class CommandAttemptInterceptor : DbCommandInterceptor
+    {
+        public int Count { get; private set; }
+
+        public override InterceptionResult<DbDataReader> ReaderExecuting(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<DbDataReader> result)
+        {
+            Count++;
+            return result;
+        }
     }
 
     private static IReadOnlyEntityType Entity<TEntity>(IReadOnlyModel model)

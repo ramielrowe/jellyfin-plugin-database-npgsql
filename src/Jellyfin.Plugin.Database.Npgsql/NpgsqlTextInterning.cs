@@ -65,14 +65,57 @@ internal static class NpgsqlTextInterning
         IMMUTABLE STRICT PARALLEL SAFE
         SET search_path = pg_catalog, public
         AS $jellyfin$
+        DECLARE
+            pattern_length integer := char_length(pattern_value);
+            pattern_offset integer := 1;
+            pattern_character text;
+            folded_literal text;
+            canonical_pattern text := '';
         BEGIN
             IF char_length(escape_value) <> 1 THEN
                 RAISE EXCEPTION 'ESCAPE expression must be a single character'
                     USING ERRCODE = '22023';
             END IF;
+
+            -- SQLite recognizes the escape token before applying its ASCII-only
+            -- case folding. In particular, ESCAPE 'X' does not make a lower-case
+            -- x in the pattern an escape. Build a canonical PostgreSQL pattern
+            -- token by token so folding can never change which characters are
+            -- literals and which are wildcards.
+            WHILE pattern_offset <= pattern_length LOOP
+                pattern_character := substr(pattern_value, pattern_offset, 1);
+                IF convert_to(pattern_character, 'UTF8') = convert_to(escape_value, 'UTF8') THEN
+                    pattern_offset := pattern_offset + 1;
+                    IF pattern_offset > pattern_length THEN
+                        -- SQLite treats a trailing escape token as a pattern that
+                        -- cannot match rather than as a literal escape character.
+                        RETURN false;
+                    END IF;
+
+                    pattern_character := substr(pattern_value, pattern_offset, 1);
+                    folded_literal := public."__jellyfin_ascii_lower"(pattern_character);
+                    IF folded_literal IN ('%', '_', E'\\') THEN
+                        canonical_pattern := canonical_pattern || E'\\';
+                    END IF;
+
+                    canonical_pattern := canonical_pattern || folded_literal;
+                ELSIF pattern_character IN ('%', '_') THEN
+                    canonical_pattern := canonical_pattern || pattern_character;
+                ELSE
+                    folded_literal := public."__jellyfin_ascii_lower"(pattern_character);
+                    IF folded_literal = E'\\' THEN
+                        canonical_pattern := canonical_pattern || E'\\';
+                    END IF;
+
+                    canonical_pattern := canonical_pattern || folded_literal;
+                END IF;
+
+                pattern_offset := pattern_offset + 1;
+            END LOOP;
+
             RETURN public."__jellyfin_ascii_lower"(match_value) LIKE
-                public."__jellyfin_ascii_lower"(pattern_value)
-                ESCAPE public."__jellyfin_ascii_lower"(escape_value);
+                canonical_pattern
+                ESCAPE E'\\';
         END;
         $jellyfin$;
 

@@ -32,6 +32,14 @@ public sealed class NpgsqlQueryExpressionInterceptor : IQueryExpressionIntercept
     private static readonly MethodInfo SqliteLikeWithEscapeMethod = typeof(NpgsqlQueryDbFunctions)
         .GetMethod(nameof(NpgsqlQueryDbFunctions.SqliteLikeWithEscape), BindingFlags.Public | BindingFlags.Static)!;
 
+    private static readonly MethodInfo EfLikeWithEscapeMethod = typeof(DbFunctionsExtensions)
+        .GetMethods(BindingFlags.Public | BindingFlags.Static)
+        .Single(method => method.Name == nameof(DbFunctionsExtensions.Like)
+            && method.GetParameters().Length == 4);
+
+    private static readonly MethodInfo StringConcatMethod = typeof(string)
+        .GetMethod(nameof(string.Concat), BindingFlags.Public | BindingFlags.Static, [typeof(string), typeof(string)])!;
+
     /// <summary>Gets the stateless shared interceptor.</summary>
     public static NpgsqlQueryExpressionInterceptor Instance { get; } = new();
 
@@ -119,7 +127,12 @@ public sealed class NpgsqlQueryExpressionInterceptor : IQueryExpressionIntercept
                 Expression.Constant("NameLowerPrefix"));
             var boundedPrefix = Expression.Call(AsciiPrefixMethod, node.Arguments[0]);
             return Expression.AndAlso(
-                Expression.Call(boundedName, node.Method, boundedPrefix),
+                Expression.Call(
+                    EfLikeWithEscapeMethod,
+                    Expression.Constant(EF.Functions),
+                    boundedName,
+                    Expression.Call(StringConcatMethod, boundedPrefix, Expression.Constant("%")),
+                    Expression.Constant(string.Empty)),
                 Expression.Call(loweredName, node.Method, loweredPrefix));
         }
 
