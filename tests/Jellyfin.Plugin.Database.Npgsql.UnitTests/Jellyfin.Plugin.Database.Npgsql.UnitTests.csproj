@@ -19,5 +19,6 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj" />
+    <ProjectReference Include="../../tools/Jellyfin.Plugin.Database.Npgsql.Migrations/Jellyfin.Plugin.Database.Npgsql.Migrations.csproj" />
   </ItemGroup>
 </Project>

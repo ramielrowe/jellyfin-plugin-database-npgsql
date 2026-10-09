@@ -58,6 +58,8 @@ public partial class NpgsqlDatabaseProvider(ILogger<NpgsqlDatabaseProvider> logg
                 + "Jellyfin version and provider package. No database connection was attempted.");
         }
 
+        NpgsqlHostMigrationAudit.ValidateLoadedHostIfPresent();
+
         var customOptions = ValidateDatabaseConfiguration(databaseConfiguration);
         this.ValidateSelectedDirectory(customOptions.PluginName, customOptions.PluginAssembly);
 

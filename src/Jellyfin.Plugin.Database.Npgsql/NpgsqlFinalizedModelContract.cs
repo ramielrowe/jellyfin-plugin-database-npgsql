@@ -22,7 +22,7 @@ namespace Jellyfin.Plugin.Database.Npgsql;
 internal sealed class NpgsqlFinalizedModelContract : IModelFinalizedConvention
 {
     /// <summary>The reviewed complete finalized-model SHA-256.</summary>
-    internal const string ExpectedSha256 = "4736620EC6FA5188AC9361C9B28A84DBC45C17753F02828F13968D028EBE38AD";
+    internal const string ExpectedSha256 = "3A1CF5F43269EB4987B3E762B380BF8A2D39F639BB69049F3594AEC076257F5E";
 
     /// <inheritdoc />
     public IModel ProcessModelFinalized(IModel model)

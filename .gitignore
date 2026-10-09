@@ -3,6 +3,8 @@
 /.packages/
 /.nuget-http/
 /.dotnet/
+/.dotnet-cli/
+/.nuget-packages/
 /.vs/
 /.idea/
 **/[Bb]in/

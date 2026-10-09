@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 
@@ -18,10 +18,10 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 {
                     Id = table.Column<int>(type: "integer", nullable: false)
                         .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
-                    Name = table.Column<string>(type: "character varying(512)", maxLength: 512, nullable: false),
-                    Overview = table.Column<string>(type: "character varying(512)", maxLength: 512, nullable: true),
-                    ShortOverview = table.Column<string>(type: "character varying(512)", maxLength: 512, nullable: true),
-                    Type = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: false),
+                    Name = table.Column<string>(type: "character varying(512)", maxLength: 512, nullable: false, collation: "C"),
+                    Overview = table.Column<string>(type: "character varying(512)", maxLength: 512, nullable: true, collation: "C"),
+                    ShortOverview = table.Column<string>(type: "character varying(512)", maxLength: 512, nullable: true, collation: "C"),
+                    Type = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: false, collation: "C"),
                     UserId = table.Column<Guid>(type: "uuid", nullable: false),
                     ItemId = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: true),
                     DateCreated = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
@@ -42,7 +42,7 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                     DateCreated = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
                     DateLastActivity = table.Column<DateTime>(type: "timestamp with time zone", nullable: false),
                     Name = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
-                    AccessToken = table.Column<string>(type: "text", nullable: false)
+                    AccessToken = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false)
                 },
                 constraints: table =>
                 {
@@ -67,13 +67,13 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                     IsLocked = table.Column<bool>(type: "boolean", nullable: false),
                     Name = table.Column<string>(type: "text", nullable: true),
                     OfficialRating = table.Column<string>(type: "text", nullable: true),
-                    MediaType = table.Column<string>(type: "text", nullable: true),
+                    MediaType = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: true),
                     Overview = table.Column<string>(type: "text", nullable: true),
                     ParentIndexNumber = table.Column<int>(type: "integer", nullable: true),
                     PremiereDate = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
                     ProductionYear = table.Column<int>(type: "integer", nullable: true),
                     Genres = table.Column<string>(type: "text", nullable: true),
-                    SortName = table.Column<string>(type: "text", nullable: true),
+                    SortName = table.Column<string>(type: "text", nullable: true, collation: "C"),
                     ForcedSortName = table.Column<string>(type: "text", nullable: true),
                     RunTimeTicks = table.Column<long>(type: "bigint", nullable: true),
                     DateCreated = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
@@ -94,9 +94,9 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                     InheritedParentalRatingSubValue = table.Column<int>(type: "integer", nullable: true),
                     UnratedType = table.Column<string>(type: "text", nullable: true),
                     CriticRating = table.Column<float>(type: "real", nullable: true),
-                    CleanName = table.Column<string>(type: "text", nullable: true),
+                    CleanName = table.Column<string>(type: "text", nullable: true, collation: "C"),
                     PresentationUniqueKey = table.Column<string>(type: "text", nullable: true),
-                    OriginalTitle = table.Column<string>(type: "text", nullable: true),
+                    OriginalTitle = table.Column<string>(type: "text", nullable: true, collation: "C"),
                     OriginalLanguage = table.Column<string>(type: "text", nullable: true),
                     PrimaryVersionId = table.Column<Guid>(type: "uuid", nullable: true),
                     DateLastMediaAdded = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
@@ -152,7 +152,8 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                     ItemId = table.Column<Guid>(type: "uuid", nullable: false),
                     Client = table.Column<string>(type: "character varying(32)", maxLength: 32, nullable: false),
                     Key = table.Column<string>(type: "text", nullable: false),
-                    Value = table.Column<string>(type: "text", nullable: true)
+                    Value = table.Column<string>(type: "text", nullable: true),
+                    KeyInternId = table.Column<long>(type: "bigint", nullable: false)
                 },
                 constraints: table =>
                 {
@@ -165,7 +166,7 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 {
                     Id = table.Column<int>(type: "integer", nullable: false)
                         .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
-                    DeviceId = table.Column<string>(type: "text", nullable: false),
+                    DeviceId = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: false),
                     CustomName = table.Column<string>(type: "text", nullable: true)
                 },
                 constraints: table =>
@@ -180,7 +181,8 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                     ItemValueId = table.Column<Guid>(type: "uuid", nullable: false),
                     Type = table.Column<int>(type: "integer", nullable: false),
                     Value = table.Column<string>(type: "text", nullable: false),
-                    CleanValue = table.Column<string>(type: "text", nullable: false)
+                    CleanValue = table.Column<string>(type: "text", nullable: false),
+                    ValueInternId = table.Column<long>(type: "bigint", nullable: false)
                 },
                 constraints: table =>
                 {
@@ -208,8 +210,10 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 columns: table => new
                 {
                     Id = table.Column<Guid>(type: "uuid", nullable: false),
-                    Name = table.Column<string>(type: "text", nullable: false),
-                    PersonType = table.Column<string>(type: "text", nullable: true)
+                    Name = table.Column<string>(type: "text", nullable: false, collation: "C"),
+                    PersonType = table.Column<string>(type: "text", nullable: true),
+                    NameLower = table.Column<string>(type: "text", nullable: true, computedColumnSql: "translate(\"Name\", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')", stored: true, collation: "C"),
+                    NameLowerPrefix = table.Column<string>(type: "character varying(512)", maxLength: 512, nullable: true, computedColumnSql: "left(translate(\"Name\", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 512)", stored: true, collation: "C")
                 },
                 constraints: table =>
                 {
@@ -239,8 +243,8 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 columns: table => new
                 {
                     Id = table.Column<Guid>(type: "uuid", nullable: false),
-                    Username = table.Column<string>(type: "character varying(255)", maxLength: 255, nullable: false),
-                    NormalizedUsername = table.Column<string>(type: "character varying(255)", maxLength: 255, nullable: false),
+                    Username = table.Column<string>(type: "character varying(255)", maxLength: 255, nullable: false, collation: "C"),
+                    NormalizedUsername = table.Column<string>(type: "character varying(255)", maxLength: 255, nullable: false, collation: "C"),
                     Password = table.Column<string>(type: "character varying(65535)", maxLength: 65535, nullable: true),
                     MustUpdatePassword = table.Column<bool>(type: "boolean", nullable: false),
                     AudioLanguagePreference = table.Column<string>(type: "character varying(255)", maxLength: 255, nullable: true),
@@ -371,7 +375,8 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 {
                     ItemId = table.Column<Guid>(type: "uuid", nullable: false),
                     ProviderId = table.Column<string>(type: "text", nullable: false),
-                    ProviderValue = table.Column<string>(type: "text", nullable: false)
+                    ProviderValue = table.Column<string>(type: "text", nullable: false),
+                    ProviderIdInternId = table.Column<long>(type: "bigint", nullable: false)
                 },
                 constraints: table =>
                 {
@@ -475,7 +480,7 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                     StreamIndex = table.Column<int>(type: "integer", nullable: false),
                     StreamType = table.Column<int>(type: "integer", nullable: false),
                     Codec = table.Column<string>(type: "text", nullable: true),
-                    Language = table.Column<string>(type: "text", nullable: true),
+                    Language = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: true),
                     ChannelLayout = table.Column<string>(type: "text", nullable: true),
                     Profile = table.Column<string>(type: "text", nullable: true),
                     AspectRatio = table.Column<string>(type: "text", nullable: true),
@@ -563,7 +568,8 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                     ItemId = table.Column<Guid>(type: "uuid", nullable: false),
                     PeopleId = table.Column<Guid>(type: "uuid", nullable: false),
                     SortOrder = table.Column<int>(type: "integer", nullable: true),
-                    ListOrder = table.Column<int>(type: "integer", nullable: true)
+                    ListOrder = table.Column<int>(type: "integer", nullable: true),
+                    RoleInternId = table.Column<long>(type: "bigint", nullable: false)
                 },
                 constraints: table =>
                 {
@@ -611,7 +617,7 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                     Id = table.Column<int>(type: "integer", nullable: false)
                         .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
                     UserId = table.Column<Guid>(type: "uuid", nullable: false),
-                    AccessToken = table.Column<string>(type: "text", nullable: false),
+                    AccessToken = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
                     AppName = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
                     AppVersion = table.Column<string>(type: "character varying(32)", maxLength: 32, nullable: false),
                     DeviceName = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false),
@@ -771,7 +777,8 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                     AudioStreamIndex = table.Column<int>(type: "integer", nullable: true),
                     SubtitleStreamIndex = table.Column<int>(type: "integer", nullable: true),
                     Likes = table.Column<bool>(type: "boolean", nullable: true),
-                    RetentionDate = table.Column<DateTime>(type: "timestamp with time zone", nullable: true)
+                    RetentionDate = table.Column<DateTime>(type: "timestamp with time zone", nullable: true),
+                    CustomDataKeyInternId = table.Column<long>(type: "bigint", nullable: false)
                 },
                 constraints: table =>
                 {
@@ -848,9 +855,28 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 column: "ItemId");
 
             migrationBuilder.CreateIndex(
-                name: "IX_BaseItemProviders_ProviderId_ItemId_ProviderValue",
+                name: "IX_BaseItemProviders_ItemId_ProviderIdInternId",
                 table: "BaseItemProviders",
-                columns: new[] { "ProviderId", "ItemId", "ProviderValue" });
+                columns: new[] { "ItemId", "ProviderIdInternId" },
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_BaseItemProviders_ProviderId",
+                table: "BaseItemProviders",
+                column: "ProviderId")
+                .Annotation("Npgsql:IndexMethod", "hash");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_BaseItemProviders_ProviderValue",
+                table: "BaseItemProviders",
+                column: "ProviderValue")
+                .Annotation("Npgsql:IndexMethod", "hash");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_BaseItems_CleanName",
+                table: "BaseItems",
+                column: "CleanName")
+                .Annotation("Npgsql:IndexMethod", "hash");
 
             migrationBuilder.CreateIndex(
                 name: "IX_BaseItems_ExtraType_OwnerId",
@@ -859,19 +885,45 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 filter: "\"ExtraType\" IS NOT NULL");
 
             migrationBuilder.CreateIndex(
-                name: "IX_BaseItems_IsFolder_TopParentId_IsVirtualItem_PresentationUn~",
-                table: "BaseItems",
-                columns: new[] { "IsFolder", "TopParentId", "IsVirtualItem", "PresentationUniqueKey", "DateCreated" });
-
-            migrationBuilder.CreateIndex(
-                name: "IX_BaseItems_MediaType_TopParentId_IsVirtualItem_PresentationU~",
-                table: "BaseItems",
-                columns: new[] { "MediaType", "TopParentId", "IsVirtualItem", "PresentationUniqueKey" });
-
-            migrationBuilder.CreateIndex(
                 name: "IX_BaseItems_Name",
                 table: "BaseItems",
-                column: "Name");
+                column: "Name")
+                .Annotation("Npgsql:IndexMethod", "hash");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_BaseItems_Npgsql_IsFolder_TopParentId_IsVirtualItem",
+                table: "BaseItems",
+                columns: new[] { "IsFolder", "TopParentId", "IsVirtualItem" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_BaseItems_Npgsql_MediaType_TopParentId_IsVirtualItem",
+                table: "BaseItems",
+                columns: new[] { "MediaType", "TopParentId", "IsVirtualItem" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_BaseItems_Npgsql_Type",
+                table: "BaseItems",
+                column: "Type");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_BaseItems_Npgsql_Type_IsFolder_IsVirtualItem",
+                table: "BaseItems",
+                columns: new[] { "Type", "IsFolder", "IsVirtualItem" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_BaseItems_Npgsql_Type_ParentIndexNumber_IndexNumber",
+                table: "BaseItems",
+                columns: new[] { "Type", "ParentIndexNumber", "IndexNumber" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_BaseItems_Npgsql_Type_TopParentId",
+                table: "BaseItems",
+                columns: new[] { "Type", "TopParentId" });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_BaseItems_Npgsql_Type_TopParentId_IsVirtualItem_DateCreated",
+                table: "BaseItems",
+                columns: new[] { "Type", "TopParentId", "IsVirtualItem", "DateCreated" });
 
             migrationBuilder.CreateIndex(
                 name: "IX_BaseItems_OwnerId",
@@ -887,12 +939,14 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
             migrationBuilder.CreateIndex(
                 name: "IX_BaseItems_Path",
                 table: "BaseItems",
-                column: "Path");
+                column: "Path")
+                .Annotation("Npgsql:IndexMethod", "hash");
 
             migrationBuilder.CreateIndex(
                 name: "IX_BaseItems_PresentationUniqueKey",
                 table: "BaseItems",
-                column: "PresentationUniqueKey");
+                column: "PresentationUniqueKey")
+                .Annotation("Npgsql:IndexMethod", "hash");
 
             migrationBuilder.CreateIndex(
                 name: "IX_BaseItems_PrimaryVersionId",
@@ -913,7 +967,20 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
             migrationBuilder.CreateIndex(
                 name: "IX_BaseItems_SeriesName",
                 table: "BaseItems",
-                column: "SeriesName");
+                column: "SeriesName")
+                .Annotation("Npgsql:IndexMethod", "hash");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_BaseItems_SeriesPresentationUniqueKey",
+                table: "BaseItems",
+                column: "SeriesPresentationUniqueKey")
+                .Annotation("Npgsql:IndexMethod", "hash");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_BaseItems_SortName",
+                table: "BaseItems",
+                column: "SortName")
+                .Annotation("Npgsql:IndexMethod", "hash");
 
             migrationBuilder.CreateIndex(
                 name: "IX_BaseItems_TopParentId_Id",
@@ -942,44 +1009,9 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 columns: new[] { "TopParentId", "Type", "IsVirtualItem", "DateCreated" });
 
             migrationBuilder.CreateIndex(
-                name: "IX_BaseItems_Type_CleanName",
-                table: "BaseItems",
-                columns: new[] { "Type", "CleanName" });
-
-            migrationBuilder.CreateIndex(
-                name: "IX_BaseItems_Type_SeriesPresentationUniqueKey_IsFolder_IsVirtu~",
-                table: "BaseItems",
-                columns: new[] { "Type", "SeriesPresentationUniqueKey", "IsFolder", "IsVirtualItem" });
-
-            migrationBuilder.CreateIndex(
-                name: "IX_BaseItems_Type_SeriesPresentationUniqueKey_ParentIndexNumbe~",
-                table: "BaseItems",
-                columns: new[] { "Type", "SeriesPresentationUniqueKey", "ParentIndexNumber", "IndexNumber" });
-
-            migrationBuilder.CreateIndex(
-                name: "IX_BaseItems_Type_SeriesPresentationUniqueKey_PresentationUniq~",
-                table: "BaseItems",
-                columns: new[] { "Type", "SeriesPresentationUniqueKey", "PresentationUniqueKey", "SortName" });
-
-            migrationBuilder.CreateIndex(
                 name: "IX_BaseItems_Type_TopParentId_Id",
                 table: "BaseItems",
                 columns: new[] { "Type", "TopParentId", "Id" });
-
-            migrationBuilder.CreateIndex(
-                name: "IX_BaseItems_Type_TopParentId_IsVirtualItem_PresentationUnique~",
-                table: "BaseItems",
-                columns: new[] { "Type", "TopParentId", "IsVirtualItem", "PresentationUniqueKey", "DateCreated" });
-
-            migrationBuilder.CreateIndex(
-                name: "IX_BaseItems_Type_TopParentId_PresentationUniqueKey",
-                table: "BaseItems",
-                columns: new[] { "Type", "TopParentId", "PresentationUniqueKey" });
-
-            migrationBuilder.CreateIndex(
-                name: "IX_BaseItems_Type_TopParentId_SortName",
-                table: "BaseItems",
-                columns: new[] { "Type", "TopParentId", "SortName" });
 
             migrationBuilder.CreateIndex(
                 name: "IX_BaseItems_Type_TopParentId_StartDate",
@@ -992,9 +1024,15 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 column: "ItemId");
 
             migrationBuilder.CreateIndex(
-                name: "IX_CustomItemDisplayPreferences_UserId_ItemId_Client_Key",
+                name: "IX_CustomItemDisplayPreferences_Key",
                 table: "CustomItemDisplayPreferences",
-                columns: new[] { "UserId", "ItemId", "Client", "Key" },
+                column: "Key")
+                .Annotation("Npgsql:IndexMethod", "hash");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_CustomItemDisplayPreferences_UserId_ItemId_Client_KeyIntern~",
+                table: "CustomItemDisplayPreferences",
+                columns: new[] { "UserId", "ItemId", "Client", "KeyInternId" },
                 unique: true);
 
             migrationBuilder.CreateIndex(
@@ -1041,15 +1079,27 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 column: "UserId");
 
             migrationBuilder.CreateIndex(
-                name: "IX_ItemValues_Type_CleanValue",
+                name: "IX_ItemValues_CleanValue",
                 table: "ItemValues",
-                columns: new[] { "Type", "CleanValue" });
+                column: "CleanValue")
+                .Annotation("Npgsql:IndexMethod", "hash");
 
             migrationBuilder.CreateIndex(
-                name: "IX_ItemValues_Type_Value",
+                name: "IX_ItemValues_Npgsql_Type",
                 table: "ItemValues",
-                columns: new[] { "Type", "Value" },
+                column: "Type");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_ItemValues_Type_ValueInternId",
+                table: "ItemValues",
+                columns: new[] { "Type", "ValueInternId" },
                 unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_ItemValues_Value",
+                table: "ItemValues",
+                column: "Value")
+                .Annotation("Npgsql:IndexMethod", "hash");
 
             migrationBuilder.CreateIndex(
                 name: "IX_ItemValuesMap_ItemId",
@@ -1077,6 +1127,12 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 columns: new[] { "ItemId", "ListOrder" });
 
             migrationBuilder.CreateIndex(
+                name: "IX_PeopleBaseItemMap_ItemId_PeopleId_RoleInternId",
+                table: "PeopleBaseItemMap",
+                columns: new[] { "ItemId", "PeopleId", "RoleInternId" },
+                unique: true);
+
+            migrationBuilder.CreateIndex(
                 name: "IX_PeopleBaseItemMap_ItemId_SortOrder",
                 table: "PeopleBaseItemMap",
                 columns: new[] { "ItemId", "SortOrder" });
@@ -1087,9 +1143,23 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 columns: new[] { "PeopleId", "ItemId" });
 
             migrationBuilder.CreateIndex(
+                name: "IX_PeopleBaseItemMap_Role",
+                table: "PeopleBaseItemMap",
+                column: "Role")
+                .Annotation("Npgsql:IndexMethod", "hash");
+
+            migrationBuilder.CreateIndex(
                 name: "IX_Peoples_Name",
                 table: "Peoples",
-                column: "Name");
+                column: "Name")
+                .Annotation("Npgsql:IndexMethod", "hash");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_Peoples_Npgsql_NameLowerPrefix",
+                table: "Peoples",
+                column: "NameLowerPrefix")
+                .Annotation("Npgsql:IndexMethod", "btree")
+                .Annotation("Npgsql:IndexOperators", new[] { "text_pattern_ops" });
 
             migrationBuilder.CreateIndex(
                 name: "IX_Permissions_UserId_Kind",
@@ -1101,6 +1171,18 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 name: "IX_Preferences_UserId_Kind",
                 table: "Preferences",
                 columns: new[] { "UserId", "Kind" },
+                unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "IX_UserData_CustomDataKey",
+                table: "UserData",
+                column: "CustomDataKey")
+                .Annotation("Npgsql:IndexMethod", "hash");
+
+            migrationBuilder.CreateIndex(
+                name: "IX_UserData_ItemId_UserId_CustomDataKeyInternId",
+                table: "UserData",
+                columns: new[] { "ItemId", "UserId", "CustomDataKeyInternId" },
                 unique: true);
 
             migrationBuilder.CreateIndex(
@@ -1149,6 +1231,11 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
                 table: "Users",
                 column: "Username",
                 unique: true);
+
+            // EF represents the logical full-text identities, but cannot express
+            // their bounded PostgreSQL trie, triggers, or replacement of three
+            // unsafe physical text primary keys.
+            migrationBuilder.Sql(NpgsqlTextInterning.InstallSql);
         }
 
         /// <inheritdoc />
@@ -1246,6 +1333,8 @@ namespace Jellyfin.Plugin.Database.Npgsql.Migrations
 
             migrationBuilder.DropTable(
                 name: "Users");
+
+            migrationBuilder.Sql(NpgsqlTextInterning.UninstallSql);
         }
     }
 }

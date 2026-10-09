@@ -293,6 +293,15 @@
           "Npgsql.EntityFrameworkCore.PostgreSQL": "[10.0.3, )"
         }
       },
+      "jellyfin.plugin.database.npgsql.migrations": {
+        "type": "Project",
+        "dependencies": {
+          "Jellyfin.Database.Implementations": "[12.2.0, )",
+          "Jellyfin.Plugin.Database.Npgsql": "[0.1.0, )",
+          "Microsoft.EntityFrameworkCore": "[10.0.11, )",
+          "Npgsql.EntityFrameworkCore.PostgreSQL": "[10.0.3, )"
+        }
+      },
       "Microsoft.EntityFrameworkCore.Relational": {
         "type": "CentralTransitive",
         "requested": "[10.0.11, )",

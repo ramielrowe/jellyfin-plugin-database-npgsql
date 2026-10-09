@@ -84,7 +84,7 @@ public sealed class ModelCompatibilityTests
         var model = context.GetService<IDesignTimeModel>().Model;
 
         Assert.Equal(
-            "4736620EC6FA5188AC9361C9B28A84DBC45C17753F02828F13968D028EBE38AD",
+            "3A1CF5F43269EB4987B3E762B380BF8A2D39F639BB69049F3594AEC076257F5E",
             NpgsqlFinalizedModelContract.ExpectedSha256);
         Assert.Equal(NpgsqlModelCustomizer.ModelContract, model[NpgsqlModelCustomizer.ModelContractAnnotation]);
     }

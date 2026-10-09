@@ -67,7 +67,7 @@ fi
 mkdir -p "$REFERENCE_REPORT_DIR"
 
 mapfile -d '' -t audited_projects < <(
-    find "$PLUGIN_ROOT/src" "$PLUGIN_ROOT/tests" \
+    find "$PLUGIN_ROOT/src" "$PLUGIN_ROOT/tests" "$PLUGIN_ROOT/tools" \
         -path "$PLUGIN_ROOT/tests/feasibility" -prune -o \
         -type f -name '*.csproj' -print0 \
         | sort -z
@@ -93,8 +93,10 @@ done
 # Regression control: import one known ProjectReference outside PLUGIN_ROOT and
 # prove the same target rejects it. This also guards against an audit target
 # that silently stops running after an SDK/MSBuild change.
-negative_root=$(mktemp -d)
-trap 'rm -rf "$negative_root"' EXIT
+# Keep this deliberately outside PLUGIN_ROOT so the boundary check sees an
+# escaping ProjectReference, but inside the enclosing writable workspace rather
+# than /tmp. The fixture is tiny and overwritten in place on every run.
+negative_root="$PLUGIN_ROOT/../tmp/jellyfin-plugin-database-npgsql-audit-negative-control"
 mkdir -p "$negative_root/forbidden"
 cat >"$negative_root/forbidden/Forbidden.csproj" <<'EOF'
 <Project Sdk="Microsoft.NET.Sdk">

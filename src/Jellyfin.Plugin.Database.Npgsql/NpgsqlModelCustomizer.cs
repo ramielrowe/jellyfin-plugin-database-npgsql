@@ -203,6 +203,8 @@ public sealed class NpgsqlModelCustomizer(ModelCustomizerDependencies dependenci
         activity.Property(entity => entity.Overview).UseCollation("C");
         activity.Property(entity => entity.ShortOverview).UseCollation("C");
         activity.Property(entity => entity.Type).UseCollation("C");
+        activity.HasIndex(entity => new { entity.Type, entity.DateCreated })
+            .HasDatabaseName("IX_ActivityLogs_Npgsql_Type_DateCreated");
 
         var users = modelBuilder.Entity<User>();
         users.Property(entity => entity.Username).UseCollation("C");

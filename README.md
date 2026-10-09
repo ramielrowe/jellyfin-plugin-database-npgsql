@@ -138,6 +138,7 @@ dotnet test --project tests/Jellyfin.Plugin.Database.Npgsql.UnitTests/Jellyfin.P
 dotnet test --project tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests.csproj --configuration Release --no-build
 dotnet msbuild build/Package.proj -target:Package -property:Configuration=Release
 ./scripts/audit-build.sh
+./scripts/verify-migrations.sh
 ```
 
 The package target writes a staged, allowlisted layout and ZIP beneath
@@ -159,6 +160,9 @@ has no sibling/parent checkout dependency.
 The audited late-model transformations, exact chunk-interned text-key design,
 and the public query-compatibility contract are
 recorded in [`docs/model-compatibility.md`](docs/model-compatibility.md).
+The independent migration lineage, design-time workflow, hand-authored SQL
+boundary, and pinned host migration audit are documented in
+[`docs/migrations.md`](docs/migrations.md).
 
 Until the backup bead lands, run its provider-core stage instead. It exercises
 the packaged ZIP, early dependency/ABI guards, a restricted real PostgreSQL role,

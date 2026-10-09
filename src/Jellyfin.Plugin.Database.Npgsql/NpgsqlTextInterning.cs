@@ -265,4 +265,22 @@ internal static class NpgsqlTextInterning
         ALTER TABLE public."PeopleBaseItemMap" DROP CONSTRAINT IF EXISTS "PK_PeopleBaseItemMap";
         ALTER TABLE public."UserData" DROP CONSTRAINT IF EXISTS "PK_UserData";
         """;
+
+    /// <summary>
+    /// Removes the PostgreSQL-only exact-text support after model tables have
+    /// been removed by the baseline migration rollback.
+    /// </summary>
+    internal const string UninstallSql = """
+        DROP FUNCTION IF EXISTS public."__jellyfin_intern_BaseItemProviders"();
+        DROP FUNCTION IF EXISTS public."__jellyfin_intern_PeopleBaseItemMap"();
+        DROP FUNCTION IF EXISTS public."__jellyfin_intern_UserData"();
+        DROP FUNCTION IF EXISTS public."__jellyfin_intern_ItemValues"();
+        DROP FUNCTION IF EXISTS public."__jellyfin_intern_CustomItemDisplayPreferences"();
+        DROP FUNCTION IF EXISTS public."__jellyfin_intern_text"(text);
+        DROP FUNCTION IF EXISTS public."__jellyfin_sqlite_like_escape"(text, text, text);
+        DROP FUNCTION IF EXISTS public."__jellyfin_sqlite_like"(text, text);
+        DROP FUNCTION IF EXISTS public."__jellyfin_ascii_prefix"(text);
+        DROP FUNCTION IF EXISTS public."__jellyfin_ascii_lower"(text);
+        DROP TABLE IF EXISTS public."__JellyfinTextNodes";
+        """;
 }
