@@ -104,17 +104,24 @@ and host-integrity verification:
 ```sh
 export JELLYFIN_NPGSQL_TEST_HOST_PUBLISH=/path/to/vanilla-jellyfin-publish
 export JELLYFIN_NPGSQL_TEST_HOST_SHA256=<hash printed above>
-export JELLYFIN_NPGSQL_TEST_ARTIFACT_ROOT=/tmp/jellyfin-npgsql-tests
 dotnet test --project tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests.csproj \
   --filter 'FullyQualifiedName~PristineHostOptInTests'
 ```
 
+Host-test scratch data defaults to the standalone plugin's ignored
+`.artifacts/host-tests` directory. Set `JELLYFIN_NPGSQL_TEST_ARTIFACT_ROOT` to
+an absolute path only when a different filesystem is needed; choosing a path
+inside a writable workspace lets the C# harness clean it without a sandbox
+permission prompt.
+
 For a ZIP, calculate the ordinary file SHA-256 with `hash-archive`, then set
 `JELLYFIN_NPGSQL_TEST_HOST_ARCHIVE` instead. ZIP traversal paths are rejected.
-Successful runs delete their isolated case directory. A failed host run copies
-only redacted collected logs into a mode-0700 failure directory (mode-0600
-files), then deletes configuration, data, cache, media, raw logs, keys,
-passfiles, certificates, and the host copy.
+Every run creates an ownership-marked case directory and validates that marker
+before recursively deleting it. A failed host run keeps at most 8 MiB of
+redacted diagnostics under `.artifacts/host-tests/retained-evidence`, prints
+the exact retained path and byte count, and then deletes the entire case,
+including configuration, data, cache, media, raw logs, keys, passfiles,
+certificates, and the copied host. Successful runs retain no case artifacts.
 
 No helper searches for or references a sibling/parent Jellyfin checkout. The
 standalone plugin root is found by its own solution marker, so the same commands

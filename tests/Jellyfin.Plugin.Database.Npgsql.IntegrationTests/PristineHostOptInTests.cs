@@ -1,8 +1,5 @@
 using System;
 using System.IO;
-using System.Linq;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
@@ -12,8 +9,6 @@ namespace Jellyfin.Plugin.Database.Npgsql.IntegrationTests;
 
 public sealed class PristineHostOptInTests
 {
-    private const string ArtifactRootEnvironmentVariable = "JELLYFIN_NPGSQL_TEST_ARTIFACT_ROOT";
-
     [Fact]
     public async Task UntouchedPublish_StartsRepeatedlyWithoutParentCheckout()
     {
@@ -39,13 +34,9 @@ public sealed class PristineHostOptInTests
             + $"{PristineJellyfinPublishOptions.Sha256EnvironmentVariable}, to run pristine-host tests.");
 
         var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
-        var configuredArtifactRoot = Environment.GetEnvironmentVariable(ArtifactRootEnvironmentVariable);
-        var artifactRoot = configuredArtifactRoot
-            ?? Path.Combine(Path.GetTempPath(), "jellyfin-npgsql-test-host-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(artifactRoot);
-        var caseRoot = Path.Combine(artifactRoot, "case-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(caseRoot);
-        var succeeded = false;
+        using var artifacts = HostTestArtifactScope.Create("pristine-host");
+        var caseRoot = artifacts.CaseDirectory;
+        var evidenceRedactor = new SensitiveDataRedactor();
         try
         {
             var publish = await PristineJellyfinPublish.CreateAsync(
@@ -53,7 +44,7 @@ public sealed class PristineHostOptInTests
                 Path.Combine(caseRoot, "pristine-host"),
                 TestContext.Current.CancellationToken);
             var ffmpeg = Path.Combine(repositoryRoot, "tests", "fixtures", "fake-ffmpeg.sh");
-            var portCoordinationRoot = Path.Combine(artifactRoot, ".port-leases");
+            var portCoordinationRoot = Path.Combine(artifacts.ArtifactRoot, ".port-leases");
             for (var launch = 0; launch < 2; launch++)
             {
                 using var httpPort = LoopbackPortReservation.Acquire(portCoordinationRoot);
@@ -61,6 +52,7 @@ public sealed class PristineHostOptInTests
                 var layout = JellyfinHostLayout.Create(Path.Combine(caseRoot, "runs"), publish, "launch-" + launch);
                 layout.WriteNetworkConfiguration(httpPort.Port, httpsPort.Port);
                 var password = "test-only-" + Guid.NewGuid().ToString("N");
+                evidenceRedactor.Add(password);
                 var redactor = new SensitiveDataRedactor(password);
                 await using var host = JellyfinHostProcess.Start(
                     layout,
@@ -85,71 +77,18 @@ public sealed class PristineHostOptInTests
                 var token = document.RootElement.GetProperty("AccessToken").GetString();
                 Assert.False(string.IsNullOrWhiteSpace(token));
                 redactor.Add(token);
+                evidenceRedactor.Add(token);
                 await host.StopGracefullyAsync(token!, TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
                 await publish.VerifyUnchangedAsync(TestContext.Current.CancellationToken);
             }
-
-            succeeded = true;
         }
-        finally
+        catch (Exception exception)
         {
-            if (!succeeded && Directory.Exists(caseRoot))
-            {
-                var retained = Path.Combine(artifactRoot, "failed-" + Path.GetFileName(caseRoot));
-                if (OperatingSystem.IsWindows())
-                {
-                    Directory.CreateDirectory(retained);
-                }
-                else
-                {
-                    Directory.CreateDirectory(retained, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-                }
-
-                foreach (var log in Directory.EnumerateFiles(caseRoot, "*", SearchOption.AllDirectories)
-                             .Where(path => path.Contains(
-                                 Path.DirectorySeparatorChar + "collected-logs" + Path.DirectorySeparatorChar,
-                                 StringComparison.Ordinal)))
-                {
-                    var relative = Path.GetRelativePath(caseRoot, log);
-                    var prefix = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(relative))).ToLowerInvariant()[..16];
-                    var destination = Path.Combine(retained, prefix + "-" + Path.GetFileName(log));
-                    var options = new FileStreamOptions
-                    {
-                        Access = FileAccess.Write,
-                        Mode = FileMode.CreateNew,
-                        Share = FileShare.None
-                    };
-                    if (!OperatingSystem.IsWindows())
-                    {
-                        options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
-                    }
-
-                    using var source = File.OpenRead(log);
-                    using var output = new FileStream(destination, options);
-                    source.CopyTo(output);
-                }
-
-                if (!OperatingSystem.IsWindows())
-                {
-                    File.SetUnixFileMode(retained, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-                    foreach (var log in Directory.EnumerateFiles(retained))
-                    {
-                        File.SetUnixFileMode(log, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-                    }
-                }
-            }
-
-            if (Directory.Exists(caseRoot))
-            {
-                Directory.Delete(caseRoot, recursive: true);
-            }
-
-            if (configuredArtifactRoot is null
-                && Directory.Exists(artifactRoot)
-                && !Directory.EnumerateFileSystemEntries(artifactRoot).Any())
-            {
-                Directory.Delete(artifactRoot);
-            }
+            artifacts.RetainFailureEvidence(exception, evidenceRedactor);
+            throw new InvalidOperationException(
+                $"The pristine-host proof failed. Bounded sanitized diagnostics are in '{artifacts.RetainedEvidenceDirectory}' "
+                + $"({artifacts.RetainedEvidenceBytes} bytes); its copied host and case scratch directory were removed.",
+                exception);
         }
     }
 }

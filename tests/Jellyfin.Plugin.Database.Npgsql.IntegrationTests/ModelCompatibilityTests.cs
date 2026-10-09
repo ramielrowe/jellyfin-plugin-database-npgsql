@@ -1014,9 +1014,10 @@ public sealed class ModelCompatibilityTests
         await using var environment = await PostgreSqlTestEnvironment.CreateAsync(databaseOptions, cancellationToken);
         await using var database = await environment.CreateDatabaseAsync(cancellationToken);
         var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
-        var artifactRoot = Path.Combine(Path.GetTempPath(), "jellyfin-npgsql-model-host-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(artifactRoot);
-        var succeeded = false;
+        using var artifacts = HostTestArtifactScope.Create("model-compatibility");
+        var artifactRoot = artifacts.CaseDirectory;
+        var databasePassword = new global::Npgsql.NpgsqlConnectionStringBuilder(database.RuntimeConnectionString).Password;
+        var evidenceRedactor = new SensitiveDataRedactor(database.RuntimeConnectionString, databasePassword);
         try
         {
             var publish = await PristineJellyfinPublish.CreateAsync(
@@ -1067,7 +1068,8 @@ public sealed class ModelCompatibilityTests
             using var httpsPort = LoopbackPortReservation.Acquire(portLeaseRoot);
             layout.WriteNetworkConfiguration(httpPort.Port, httpsPort.Port);
             var password = "model-host-" + Guid.NewGuid().ToString("N");
-            var redactor = new SensitiveDataRedactor(password, database.RuntimeConnectionString);
+            evidenceRedactor.Add(password);
+            var redactor = new SensitiveDataRedactor(password, database.RuntimeConnectionString, databasePassword);
             await using (var host = JellyfinHostProcess.Start(layout, httpPort, redactor, ffmpeg))
             {
                 await host.WaitUntilReadyAsync(TimeSpan.FromMinutes(2), cancellationToken);
@@ -1088,6 +1090,7 @@ public sealed class ModelCompatibilityTests
                 var token = document.RootElement.GetProperty("AccessToken").GetString();
                 Assert.False(string.IsNullOrWhiteSpace(token));
                 redactor.Add(token);
+                evidenceRedactor.Add(token);
                 await host.StopGracefullyAsync(token!, TimeSpan.FromSeconds(30), cancellationToken);
             }
 
@@ -1097,21 +1100,17 @@ public sealed class ModelCompatibilityTests
                 Assert.True(await context.Users.AnyAsync(user => user.Username == "model-admin", cancellationToken));
             }
 
-            succeeded = true;
         }
         catch (Exception exception)
         {
+            artifacts.RetainFailureEvidence(exception, evidenceRedactor);
             throw new InvalidOperationException(
-                $"The pristine-host model proof failed; isolated diagnostics remain under '{artifactRoot}'.",
+                $"The pristine-host model proof failed. Bounded sanitized diagnostics are in '{artifacts.RetainedEvidenceDirectory}' "
+                + $"({artifacts.RetainedEvidenceBytes} bytes); its copied host and case scratch directory were removed.",
                 exception);
         }
         finally
         {
-            if (succeeded && Directory.Exists(artifactRoot))
-            {
-                Directory.Delete(artifactRoot, recursive: true);
-            }
-
             global::Npgsql.NpgsqlConnection.ClearAllPools();
         }
     }

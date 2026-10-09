@@ -17,6 +17,99 @@ namespace Jellyfin.Plugin.Database.Npgsql.IntegrationTests;
 public sealed class TestInfrastructureTests
 {
     [Fact]
+    public void HostArtifactScope_ForcedHostProofFailureRetainsBoundedDiagnosticsAndDeletesCopiedHost()
+    {
+        var tempRoot = CreateTemporaryDirectory();
+        const string Secret = "forced-host-proof-secret";
+        try
+        {
+            var artifacts = HostTestArtifactScope.Create("forced-host-proof", Path.Combine(tempRoot, "artifact-root"));
+            var caseRoot = artifacts.CaseDirectory;
+            string retainedEvidence;
+            try
+            {
+                var copiedHost = Path.Combine(caseRoot, "host");
+                Directory.CreateDirectory(copiedHost);
+                using (var largeHostFile = File.Create(Path.Combine(copiedHost, "jellyfin.dll")))
+                {
+                    largeHostFile.SetLength(32L * 1024 * 1024);
+                }
+
+                var collectedLogs = Path.Combine(caseRoot, "runs", "collected-logs");
+                Directory.CreateDirectory(collectedLogs);
+                File.WriteAllText(
+                    Path.Combine(collectedLogs, "jellyfin.log"),
+                    Secret + new string('x', HostTestArtifactScope.MaximumRetainedEvidenceBytes + 1024));
+
+                try
+                {
+                    throw new InvalidOperationException("Intentionally forced host proof failure containing " + Secret);
+                }
+                catch (Exception exception)
+                {
+                    artifacts.RetainFailureEvidence(exception, new SensitiveDataRedactor(Secret));
+                }
+
+                retainedEvidence = Assert.IsType<string>(artifacts.RetainedEvidenceDirectory);
+                Assert.InRange(artifacts.RetainedEvidenceBytes, 1, HostTestArtifactScope.MaximumRetainedEvidenceBytes);
+            }
+            finally
+            {
+                artifacts.Dispose();
+            }
+
+            Assert.False(Directory.Exists(caseRoot));
+            Assert.True(Directory.Exists(retainedEvidence));
+            Assert.False(Directory.Exists(Path.Combine(retainedEvidence, "host")));
+            var evidenceFiles = Directory.EnumerateFiles(retainedEvidence, "*", SearchOption.AllDirectories).ToArray();
+            Assert.NotEmpty(evidenceFiles);
+            Assert.All(
+                evidenceFiles,
+                path => Assert.DoesNotContain(Secret, File.ReadAllText(path), StringComparison.Ordinal));
+            Assert.InRange(
+                evidenceFiles.Sum(path => new FileInfo(path).Length),
+                1,
+                HostTestArtifactScope.MaximumRetainedEvidenceBytes + 256);
+
+            var successfulCase = HostTestArtifactScope.Create("successful-host-proof", Path.Combine(tempRoot, "artifact-root"));
+            var successfulCaseRoot = successfulCase.CaseDirectory;
+            Directory.CreateDirectory(Path.Combine(successfulCaseRoot, "host"));
+            successfulCase.Dispose();
+            Assert.False(Directory.Exists(successfulCaseRoot));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void HostArtifactScope_RefusesCleanupWhenOwnershipMarkerChanges()
+    {
+        var tempRoot = CreateTemporaryDirectory();
+        try
+        {
+            var artifacts = HostTestArtifactScope.Create("marker-proof", Path.Combine(tempRoot, "artifact-root"));
+            var caseRoot = artifacts.CaseDirectory;
+            var marker = Assert.Single(Directory.EnumerateFiles(caseRoot, ".*", SearchOption.TopDirectoryOnly));
+            var expectedMarker = File.ReadAllText(marker);
+            File.WriteAllText(marker, "changed ownership");
+
+            var exception = Assert.Throws<InvalidOperationException>(artifacts.Dispose);
+            Assert.Contains("ownership marker", exception.Message, StringComparison.Ordinal);
+            Assert.True(Directory.Exists(caseRoot));
+
+            File.WriteAllText(marker, expectedMarker);
+            artifacts.Dispose();
+            Assert.False(Directory.Exists(caseRoot));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
     public void ResourceNames_AreUniqueWorkerScopedAndDestructivelyValidated()
     {
         var first = TestResourceNames.Create("worker 1");
