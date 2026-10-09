@@ -12,6 +12,7 @@
     <PackageReference Include="Jellyfin.Database.Implementations" ExcludeAssets="runtime" Private="false" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" ExcludeAssets="runtime" Private="false" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" ExcludeAssets="runtime" Private="false" />
+    <PackageReference Include="Microsoft.Data.Sqlite" ExcludeAssets="runtime" Private="false" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" ExcludeAssets="runtime" Private="false" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" ExcludeAssets="runtime" Private="false" />
   </ItemGroup>

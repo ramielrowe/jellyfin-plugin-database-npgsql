@@ -1,9 +1,11 @@
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
+using Jellyfin.Database.Implementations.Locking;
 using Jellyfin.Server.Implementations.SystemBackupService;
 using MediaBrowser.Controller;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Plugins;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace Jellyfin.Plugin.Database.Npgsql;
@@ -37,9 +39,17 @@ public sealed class NpgsqlPluginServiceRegistrator : IPluginServiceRegistrator
             "PLUGIN_PROVIDER",
             StringComparison.OrdinalIgnoreCase);
 
+        serviceCollection.AddSingleton(serviceProvider =>
+            new NpgsqlRestoreDbContextFactory(
+                serviceProvider.GetRequiredService<IDbContextFactory<JellyfinDbContext>>(),
+                serviceProvider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<JellyfinDbContext>>(),
+                serviceProvider.GetRequiredService<IJellyfinDatabaseProvider>(),
+                serviceProvider.GetRequiredService<IEntityFrameworkCoreLockingBehavior>()));
+
         serviceCollection.Remove(stockDescriptor);
         serviceCollection.AddSingleton(
-            serviceProvider => new StockBackupService(CreateStockService(serviceProvider, stockDescriptor)));
+            serviceProvider => new StockBackupService(
+                CreateStockService(serviceProvider, stockDescriptor, isActiveProvider)));
         var decoratorDescriptor = ServiceDescriptor.Singleton<IBackupService>(serviceProvider =>
             new NpgsqlBackupServiceDecorator(
                 serviceProvider.GetRequiredService<StockBackupService>().Value,
@@ -52,21 +62,39 @@ public sealed class NpgsqlPluginServiceRegistrator : IPluginServiceRegistrator
 
     private static IBackupService CreateStockService(
         IServiceProvider serviceProvider,
-        ServiceDescriptor descriptor)
+        ServiceDescriptor descriptor,
+        bool isActiveProvider)
     {
         if (descriptor.ImplementationInstance is IBackupService instance)
         {
+            if (isActiveProvider)
+            {
+                throw new NotSupportedException(
+                    "The stock backup service instance cannot be given the transaction-spanning PostgreSQL context factory.");
+            }
+
             return instance;
         }
 
         if (descriptor.ImplementationFactory is not null)
         {
+            if (isActiveProvider)
+            {
+                throw new NotSupportedException(
+                    "The stock backup service factory cannot be given the transaction-spanning PostgreSQL context factory.");
+            }
+
             return (IBackupService)descriptor.ImplementationFactory(serviceProvider);
         }
 
         if (descriptor.ImplementationType is not null)
         {
-            return (IBackupService)ActivatorUtilities.CreateInstance(serviceProvider, descriptor.ImplementationType);
+            return isActiveProvider
+                ? (IBackupService)ActivatorUtilities.CreateInstance(
+                    serviceProvider,
+                    descriptor.ImplementationType,
+                    serviceProvider.GetRequiredService<NpgsqlRestoreDbContextFactory>())
+                : (IBackupService)ActivatorUtilities.CreateInstance(serviceProvider, descriptor.ImplementationType);
         }
 
         throw new NotSupportedException("The stock IBackupService registration has an unsupported descriptor shape.");

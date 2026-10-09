@@ -100,9 +100,17 @@ internal static class NpgsqlDatabaseOperations
         JellyfinDbContext dbContext,
         string[]? requestedNames)
     {
-        if (dbContext.Database.CurrentTransaction is not null)
+        if (dbContext.Database.CurrentTransaction is null)
         {
-            throw new InvalidOperationException("Stock PostgreSQL restore unexpectedly entered PurgeDatabase with an existing transaction.");
+            throw new InvalidOperationException(
+                "Stock PostgreSQL restore has no decorator-owned transaction; refusing mutation before purge.");
+        }
+
+        if (!NpgsqlRestoreCoordinator.IsRegistered(dbContext)
+            && !NpgsqlRestoreScope.IsActive)
+        {
+            throw new InvalidOperationException(
+                "Stock PostgreSQL restore was not attached to its decorator-owned transaction before migration history mutation.");
         }
 
         if (NpgsqlRestoreScope.ArchivePath is { } archivePath)
@@ -141,27 +149,16 @@ internal static class NpgsqlDatabaseOperations
                 + $"Unknown: [{string.Join(", ", unknown)}]. The current lineage was repaired and application tables were not purged.");
         }
 
-        var transaction = await dbContext.Database.BeginTransactionAsync().ConfigureAwait(false);
-        try
-        {
-            // Stock enumerates only public DbSet properties. HomeSection is a
-            // separately mapped navigation table and must be purged with its
-            // owning DisplayPreferences rows to satisfy its foreign key.
-            var purgeSql = BuildPurgeSql(dbContext.Model, null)
-                ?? throw new InvalidOperationException("The audited Jellyfin model contains no tables to restore.");
-            purgeSql = purgeSql.Replace(
-                " RESTART IDENTITY",
-                $", {QuoteTableName("public", "__JellyfinTextNodes")} RESTART IDENTITY",
-                StringComparison.Ordinal);
-            await dbContext.Database.ExecuteSqlRawAsync(purgeSql).ConfigureAwait(false);
-            NpgsqlRestoreCoordinator.Register(dbContext, transaction);
-        }
-        catch
-        {
-            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
-            await transaction.DisposeAsync().ConfigureAwait(false);
-            throw;
-        }
+        // Stock enumerates only public DbSet properties. HomeSection is a
+        // separately mapped navigation table and must be purged with its
+        // owning DisplayPreferences rows to satisfy its foreign key.
+        var purgeSql = BuildPurgeSql(dbContext.Model, null)
+            ?? throw new InvalidOperationException("The audited Jellyfin model contains no tables to restore.");
+        purgeSql = purgeSql.Replace(
+            " RESTART IDENTITY",
+            $", {QuoteTableName("public", "__JellyfinTextNodes")} RESTART IDENTITY",
+            StringComparison.Ordinal);
+        await dbContext.Database.ExecuteSqlRawAsync(purgeSql).ConfigureAwait(false);
     }
 
     private static async Task RepairExpectedHistoryAsync(

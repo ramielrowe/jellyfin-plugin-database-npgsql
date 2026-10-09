@@ -287,12 +287,13 @@ public sealed class StockBackupRestoreIntegrationTests
                 var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
                 using (NpgsqlRestoreScope.Enter())
                 {
+                    await BeginCoordinatedRestoreAsync(context, cancellationToken);
                     await provider.PurgeDatabase(context, GetStockTableNames(context));
+                    var restored = SeedEveryIdentityWithExplicitIds(context, 900);
+                    await context.SaveChangesAsync(cancellationToken);
+                    Assert.Equal(900, restored.Id);
+                    await NpgsqlRestoreCoordinator.CommitCurrentAsync(cancellationToken);
                 }
-
-                var restored = SeedEveryIdentityWithExplicitIds(context, 900);
-                await context.SaveChangesAsync(cancellationToken);
-                Assert.Equal(900, restored.Id);
             }
 
             await using (var context = CreateContext(database.RuntimeConnectionString))
@@ -333,16 +334,16 @@ public sealed class StockBackupRestoreIntegrationTests
                 var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
                 using (NpgsqlRestoreScope.Enter())
                 {
+                    await BeginCoordinatedRestoreAsync(context, cancellationToken);
                     await provider.PurgeDatabase(context, GetStockTableNames(context));
+                    await context.Database.ExecuteSqlRawAsync(
+                        "INSERT INTO public.\"ActivityLogs\" (\"Id\", \"Name\", \"Type\", \"UserId\", \"DateCreated\", \"LogSeverity\", \"RowVersion\") VALUES (700, 'first', 'BackupRestore', '00000000-0000-0000-0000-000000000000', CURRENT_TIMESTAMP, 2, 1)",
+                        cancellationToken);
+                    var duplicate = new ActivityLog("duplicate", "BackupRestore", Guid.Empty);
+                    context.ActivityLogs.Add(duplicate);
+                    context.Entry(duplicate).Property(nameof(ActivityLog.Id)).CurrentValue = 700;
+                    await Assert.ThrowsAsync<DbUpdateException>(() => context.SaveChangesAsync(cancellationToken));
                 }
-
-                await context.Database.ExecuteSqlRawAsync(
-                    "INSERT INTO public.\"ActivityLogs\" (\"Id\", \"Name\", \"Type\", \"UserId\", \"DateCreated\", \"LogSeverity\", \"RowVersion\") VALUES (700, 'first', 'BackupRestore', '00000000-0000-0000-0000-000000000000', CURRENT_TIMESTAMP, 2, 1)",
-                    cancellationToken);
-                var duplicate = new ActivityLog("duplicate", "BackupRestore", Guid.Empty);
-                context.ActivityLogs.Add(duplicate);
-                context.Entry(duplicate).Property(nameof(ActivityLog.Id)).CurrentValue = 700;
-                await Assert.ThrowsAsync<DbUpdateException>(() => context.SaveChangesAsync(cancellationToken));
             }
 
             await using (var verification = CreateContext(database.RuntimeConnectionString))
@@ -457,13 +458,13 @@ public sealed class StockBackupRestoreIntegrationTests
                 var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
                 using (NpgsqlRestoreScope.Enter())
                 {
+                    await BeginCoordinatedRestoreAsync(context, cancellationToken);
                     await provider.PurgeDatabase(context, GetStockTableNames(context));
+                    context.ActivityLogs.Add(new ActivityLog("must roll back", "BackupRestore", Guid.Empty));
+                    using var canceled = new CancellationTokenSource();
+                    canceled.Cancel();
+                    await Assert.ThrowsAnyAsync<OperationCanceledException>(() => context.SaveChangesAsync(canceled.Token));
                 }
-
-                context.ActivityLogs.Add(new ActivityLog("must roll back", "BackupRestore", Guid.Empty));
-                using var canceled = new CancellationTokenSource();
-                canceled.Cancel();
-                await Assert.ThrowsAnyAsync<OperationCanceledException>(() => context.SaveChangesAsync(canceled.Token));
             }
 
             await using var verification = CreateContext(database.RuntimeConnectionString);
@@ -565,6 +566,73 @@ public sealed class StockBackupRestoreIntegrationTests
     }
 
     [Fact]
+    public async Task FailureAfterSuccessfulStockSaveRollsBackRowsHistoryAndSequences()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var scratch = Path.Combine(Path.GetTempPath(), ".jellyfin-npgsql-post-save-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            await using (var seed = CreateContext(database.RuntimeConnectionString))
+            {
+                await seed.GetService<IMigrator>().MigrateAsync(cancellationToken: cancellationToken);
+                await SeedHostHistoryAsync(seed, cancellationToken);
+                seed.ActivityLogs.Add(new ActivityLog("post-save sentinel", "BackupRestore", Guid.Empty));
+                await seed.SaveChangesAsync(cancellationToken);
+            }
+
+            var expectedHistory = await ReadHistoryAsync(database.RuntimeConnectionString, cancellationToken);
+            var expectedSequences = await ReadAllSequenceStatesAsync(database.RuntimeConnectionString, cancellationToken);
+            var archivePath = Path.Combine(scratch, "restore.zip");
+            await using (var modelContext = CreateContext(database.RuntimeConnectionString))
+            {
+                await CreateExactEmptyStockArchiveAsync(archivePath, modelContext, cancellationToken);
+            }
+
+            var baseFactory = new TestDbContextFactory(database.RuntimeConnectionString);
+            var restoreFactory = new NpgsqlRestoreDbContextFactory(
+                baseFactory,
+                NullLogger<JellyfinDbContext>.Instance,
+                new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance),
+                new Jellyfin.Database.Implementations.Locking.NoLockBehavior(
+                    NullLogger<Jellyfin.Database.Implementations.Locking.NoLockBehavior>.Instance));
+            var paths = new TestApplicationPaths(Path.Combine(scratch, "paths"));
+            paths.CreateDirectories();
+            var services = new ServiceCollection()
+                .AddSingleton<IDbContextFactory<JellyfinDbContext>>(restoreFactory)
+                .AddSingleton<IServerApplicationPaths>(paths)
+                .BuildServiceProvider();
+            await using (services.ConfigureAwait(false))
+            {
+                var inner = new PostSaveFailureRestoreService(restoreFactory);
+                var decorator = new NpgsqlBackupServiceDecorator(inner, true, services);
+                var failure = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => decorator.RestoreBackupAsync(archivePath));
+                Assert.Contains("after successful SaveChanges", failure.Message, StringComparison.Ordinal);
+            }
+
+            await using var verification = CreateContext(database.RuntimeConnectionString);
+            Assert.Equal(
+                ["post-save sentinel"],
+                await verification.ActivityLogs.Select(row => row.Name).ToArrayAsync(cancellationToken));
+            Assert.Equal(expectedHistory, await ReadHistoryAsync(database.RuntimeConnectionString, cancellationToken));
+            Assert.Equal(expectedSequences, await ReadAllSequenceStatesAsync(database.RuntimeConnectionString, cancellationToken));
+        }
+        finally
+        {
+            if (Directory.Exists(scratch))
+            {
+                Directory.Delete(scratch, true);
+            }
+
+            NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Fact]
     public async Task RestoreSupportsNegativeOnlyExplicitIdsAndRestartsAtLegalPositiveValues()
     {
         var options = PostgreSqlTestOptions.FromEnvironment();
@@ -580,11 +648,12 @@ public sealed class StockBackupRestoreIntegrationTests
             var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
             using (NpgsqlRestoreScope.Enter())
             {
+                await BeginCoordinatedRestoreAsync(context, cancellationToken);
                 await provider.PurgeDatabase(context, GetStockTableNames(context));
+                _ = SeedEveryIdentityWithExplicitIds(context, -900);
+                await context.SaveChangesAsync(cancellationToken);
+                await NpgsqlRestoreCoordinator.CommitCurrentAsync(cancellationToken);
             }
-
-            _ = SeedEveryIdentityWithExplicitIds(context, -900);
-            await context.SaveChangesAsync(cancellationToken);
 
             await using var verification = CreateContext(database.RuntimeConnectionString);
             var generatedIds = InsertEveryIdentity(verification);
@@ -643,6 +712,7 @@ public sealed class StockBackupRestoreIntegrationTests
             using (NpgsqlRestoreScope.Enter())
             {
                 var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
+                await BeginCoordinatedRestoreAsync(restore, cancellationToken);
                 await provider.PurgeDatabase(restore, GetStockTableNames(restore));
                 _ = SeedEveryIdentityWithExplicitIds(restore, 900);
                 var identityCount = NpgsqlDatabaseOperations.GetIdentityColumns(restore.Model).Count;
@@ -674,7 +744,11 @@ public sealed class StockBackupRestoreIntegrationTests
                     }
                 });
                 _ = await Assert.ThrowsAnyAsync<Exception>(
-                    () => restore.SaveChangesAsync(cancellationToken));
+                    async () =>
+                    {
+                        await restore.SaveChangesAsync(cancellationToken);
+                        await NpgsqlRestoreCoordinator.CommitCurrentAsync(cancellationToken);
+                    });
             }
 
             await using (var verification = CreateContext(database.RuntimeConnectionString))
@@ -716,11 +790,12 @@ public sealed class StockBackupRestoreIntegrationTests
             var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
             using (NpgsqlRestoreScope.Enter())
             {
+                await BeginCoordinatedRestoreAsync(context, cancellationToken);
                 await provider.PurgeDatabase(context, GetStockTableNames(context));
+                _ = SeedEveryIdentityWithExplicitIds(context, 900);
+                await context.SaveChangesAsync(cancellationToken);
+                await NpgsqlRestoreCoordinator.CommitCurrentAsync(cancellationToken);
             }
-
-            _ = SeedEveryIdentityWithExplicitIds(context, 900);
-            await context.SaveChangesAsync(cancellationToken);
 
             var state = (await ReadAllSequenceStatesAsync(database.RuntimeConnectionString, cancellationToken))
                 ["public.ActivityLogs_Id_seq"];
@@ -759,15 +834,16 @@ public sealed class StockBackupRestoreIntegrationTests
             var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
             using (NpgsqlRestoreScope.Enter())
             {
+                await BeginCoordinatedRestoreAsync(context, cancellationToken);
                 await provider.PurgeDatabase(context, GetStockTableNames(context));
-            }
+                if (negativeRows)
+                {
+                    _ = SeedEveryIdentityWithExplicitIds(context, -900);
+                }
 
-            if (negativeRows)
-            {
-                _ = SeedEveryIdentityWithExplicitIds(context, -900);
+                await context.SaveChangesAsync(cancellationToken);
+                await NpgsqlRestoreCoordinator.CommitCurrentAsync(cancellationToken);
             }
-
-            await context.SaveChangesAsync(cancellationToken);
             var state = (await ReadAllSequenceStatesAsync(database.RuntimeConnectionString, cancellationToken))
                 ["public.ActivityLogs_Id_seq"];
             Assert.Equal(-1000, state.Minimum);
@@ -870,6 +946,22 @@ public sealed class StockBackupRestoreIntegrationTests
             NullLogger<JellyfinDbContext>.Instance,
             provider,
             new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
+    }
+
+    private static async Task BeginCoordinatedRestoreAsync(
+        JellyfinDbContext context,
+        CancellationToken cancellationToken)
+    {
+        var transaction = await context.Database.BeginTransactionAsync(cancellationToken);
+        try
+        {
+            NpgsqlRestoreCoordinator.RegisterLegacy(context, transaction);
+        }
+        catch
+        {
+            await transaction.DisposeAsync();
+            throw;
+        }
     }
 
     private static async Task<SortedDictionary<string, SequenceState>> ReadAllSequenceStatesAsync(
@@ -1233,6 +1325,34 @@ public sealed class StockBackupRestoreIntegrationTests
                 default:
                     throw new InvalidOperationException("Unknown injected failure stage.");
             }
+        }
+
+        public void ScheduleRestoreAndRestartServer(string archivePath)
+            => throw new NotSupportedException();
+    }
+
+    private sealed class PostSaveFailureRestoreService(IDbContextFactory<JellyfinDbContext> factory) : IBackupService
+    {
+        public Task<BackupManifestDto> CreateBackupAsync(BackupOptionsDto backupOptions)
+            => throw new NotSupportedException();
+
+        public Task<BackupManifestDto[]> EnumerateBackups()
+            => Task.FromResult(Array.Empty<BackupManifestDto>());
+
+        public Task<BackupManifestDto?> GetBackupManifest(string archivePath)
+            => Task.FromResult<BackupManifestDto?>(null);
+
+        public async Task RestoreBackupAsync(string archivePath)
+        {
+            var context = await factory.CreateDbContextAsync().ConfigureAwait(false);
+            await using (context.ConfigureAwait(false))
+            {
+                var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
+                await provider.PurgeDatabase(context, GetStockTableNames(context)).ConfigureAwait(false);
+                await context.SaveChangesAsync().ConfigureAwait(false);
+            }
+
+            throw new InvalidOperationException("Injected failure after successful SaveChanges and context disposal.");
         }
 
         public void ScheduleRestoreAndRestartServer(string archivePath)

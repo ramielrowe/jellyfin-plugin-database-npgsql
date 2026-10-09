@@ -11,6 +11,7 @@ internal static class NpgsqlRestoreScope
     private const string BaggageValue = "v1";
     private const string ArchivePathBaggageKey = "jellyfin.plugin.database.npgsql.restore.archive";
     private const string IdentityRestartCheckpointKey = "jellyfin.plugin.database.npgsql.restore.identity-checkpoint";
+    private const string TransactionStateKey = "jellyfin.plugin.database.npgsql.restore.transaction-state";
 
     /// <summary>Gets a value indicating whether a preflighted stock restore is active.</summary>
     internal static bool IsActive
@@ -54,6 +55,32 @@ internal static class NpgsqlRestoreScope
             is Func<int, CancellationToken, Task> checkpoint
                 ? checkpoint(ordinal, cancellationToken)
                 : Task.CompletedTask;
+
+    /// <summary>Associates the provider-owned transaction state with this exact restore flow.</summary>
+    /// <param name="state">The transaction state.</param>
+    internal static void SetTransactionState(object state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        var activity = Activity.Current
+            ?? throw new InvalidOperationException("An active PostgreSQL restore scope is required.");
+        if (activity.GetCustomProperty(TransactionStateKey) is not null)
+        {
+            throw new InvalidOperationException("A PostgreSQL restore transaction is already active in this scope.");
+        }
+
+        activity.SetCustomProperty(TransactionStateKey, state);
+    }
+
+    /// <summary>Gets the provider-owned transaction state for this exact restore flow.</summary>
+    /// <typeparam name="T">The expected internal state type.</typeparam>
+    /// <returns>The state, or <see langword="null"/>.</returns>
+    internal static T? GetTransactionState<T>()
+        where T : class
+        => Activity.Current?.GetCustomProperty(TransactionStateKey) as T;
+
+    /// <summary>Removes the provider-owned transaction state from this restore flow.</summary>
+    internal static void ClearTransactionState()
+        => Activity.Current?.SetCustomProperty(TransactionStateKey, null);
 
     private sealed class Scope(Activity activity) : IDisposable
     {

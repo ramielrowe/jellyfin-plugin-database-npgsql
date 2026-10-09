@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -5,6 +6,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Jellyfin.Database.Implementations;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
@@ -43,6 +45,9 @@ internal static class NpgsqlBackupArchive
 
     /// <summary>Maximum accepted ZIP entry count.</summary>
     internal const int MaximumEntryCount = 20000;
+
+    /// <summary>Maximum accepted ZIP central-directory length.</summary>
+    internal const int MaximumCentralDirectoryBytes = 128 * 1024 * 1024;
 
     /// <summary>Maximum accepted total database row count.</summary>
     internal const long MaximumDatabaseRows = 10000000;
@@ -151,13 +156,14 @@ internal static class NpgsqlBackupArchive
         try
         {
             await CopyFileAsync(archivePath, temporaryPath, operationToken).ConfigureAwait(false);
+            await ValidateCentralDirectoryFileAsync(temporaryPath, operationToken).ConfigureAwait(false);
             using (var archive = await ZipFile.OpenAsync(
                 temporaryPath,
                 ZipArchiveMode.Update,
                 operationToken).ConfigureAwait(false))
             {
-                ValidateArchiveLimits(archive);
-                ValidateEntryNames(archive);
+                ValidateArchiveLimits(archive, operationToken);
+                ValidateEntryNames(archive, operationToken);
                 if (archive.GetEntry(MarkerEntryName) is not null)
                 {
                     throw new InvalidDataException($"The stock backup unexpectedly already contains '{MarkerEntryName}'.");
@@ -315,6 +321,7 @@ internal static class NpgsqlBackupArchive
         using var deadline = new CancellationTokenSource(RestoreDeadline);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token);
         var validationToken = linked.Token;
+        validationToken.ThrowIfCancellationRequested();
         var archiveInfo = new FileInfo(archivePath);
         if (!archiveInfo.Exists)
         {
@@ -334,10 +341,13 @@ internal static class NpgsqlBackupArchive
             131072,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
         await using (stream.ConfigureAwait(false))
-        using (var archive = new ZipArchive(stream, ZipArchiveMode.Read, false))
         {
-            ValidateArchiveLimits(archive);
-            ValidateEntryNames(archive);
+            await ValidateCentralDirectoryAsync(stream, validationToken).ConfigureAwait(false);
+            stream.Position = 0;
+            using var archive = new ZipArchive(stream, ZipArchiveMode.Read, false, Encoding.UTF8);
+            validationToken.ThrowIfCancellationRequested();
+            ValidateArchiveLimits(archive, validationToken);
+            ValidateEntryNames(archive, validationToken);
             var markerEntry = archive.GetEntry(MarkerEntryName)
                 ?? throw Unsupported("the provider binding is missing; SQLite, unknown-provider, and pre-binding archives cannot be restored");
             if (markerEntry.Length > MaximumMarkerBytes)
@@ -398,6 +408,72 @@ internal static class NpgsqlBackupArchive
             {
                 await ValidateDatabaseAbsenceAsync(archive).ConfigureAwait(false);
             }
+        }
+    }
+
+    private static async Task ValidateCentralDirectoryFileAsync(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            65536,
+            FileOptions.Asynchronous | FileOptions.RandomAccess);
+        await using (stream.ConfigureAwait(false))
+        {
+            await ValidateCentralDirectoryAsync(stream, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task ValidateCentralDirectoryAsync(Stream stream, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        const int maximumEndRecordSearch = ushort.MaxValue + 22;
+        var tailLength = (int)Math.Min(stream.Length, maximumEndRecordSearch);
+        var tail = new byte[tailLength];
+        stream.Position = stream.Length - tailLength;
+        await stream.ReadExactlyAsync(tail, cancellationToken).ConfigureAwait(false);
+        var endOffset = -1;
+        for (var index = tail.Length - 22; index >= 0; index--)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (BinaryPrimitives.ReadUInt32LittleEndian(tail.AsSpan(index, 4)) == 0x06054b50)
+            {
+                endOffset = index;
+                break;
+            }
+        }
+
+        if (endOffset < 0)
+        {
+            throw new InvalidDataException("The backup archive has no bounded ZIP central-directory record.");
+        }
+
+        var record = tail.AsSpan(endOffset);
+        var diskEntries = BinaryPrimitives.ReadUInt16LittleEndian(record[8..]);
+        var totalEntries = BinaryPrimitives.ReadUInt16LittleEndian(record[10..]);
+        var centralLength = BinaryPrimitives.ReadUInt32LittleEndian(record[12..]);
+        var centralOffset = BinaryPrimitives.ReadUInt32LittleEndian(record[16..]);
+        if (diskEntries == ushort.MaxValue
+            || totalEntries == ushort.MaxValue
+            || centralLength == uint.MaxValue
+            || centralOffset == uint.MaxValue)
+        {
+            throw new NotSupportedException("ZIP64 backup archives are disabled because stock restore does not provide a bounded central-directory reader.");
+        }
+
+        if (diskEntries != totalEntries || totalEntries > MaximumEntryCount)
+        {
+            throw new InvalidDataException("The backup archive exceeds the supported central-directory entry-count limit.");
+        }
+
+        if (centralLength > MaximumCentralDirectoryBytes
+            || checked((long)centralOffset + centralLength) > stream.Length)
+        {
+            throw new InvalidDataException("The backup archive exceeds the supported central-directory size.");
         }
     }
 
@@ -600,7 +676,7 @@ internal static class NpgsqlBackupArchive
                 property => $"Database/{property.Name}.json",
                 property => property.PropertyType.GetGenericArguments()[0],
                 StringComparer.Ordinal);
-        var state = new ModelValidationState(model);
+        using var state = new ModelValidationState(model, cancellationToken);
         long rows = 0;
         foreach (var path in ExpectedDatabaseEntries.Order(StringComparer.Ordinal))
         {
@@ -674,7 +750,7 @@ internal static class NpgsqlBackupArchive
                     ValidateJsonStrings(item, entry.FullName);
                     var entity = item.Deserialize(entityType.ClrType, SerializerOptions)
                         ?? throw new InvalidDataException($"Database backup entry '{entry.FullName}' contains a null entity.");
-                    state.AddEntity(entityType, item, entry.FullName);
+                    state.AddEntity(entityType, item, entry.FullName, cancellationToken);
                     rows++;
                     stream.ResetSegmentBudget();
                     if (rows > MaximumDatabaseRows)
@@ -823,12 +899,13 @@ internal static class NpgsqlBackupArchive
         }
     }
 
-    private static void ValidateEntryNames(ZipArchive archive)
+    private static void ValidateEntryNames(ZipArchive archive, CancellationToken cancellationToken)
     {
         var names = new HashSet<string>(StringComparer.Ordinal);
         var canonicalNames = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in archive.Entries)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!names.Add(entry.FullName))
             {
                 throw new InvalidDataException($"The backup contains duplicate entry '{entry.FullName}'.");
@@ -915,8 +992,9 @@ internal static class NpgsqlBackupArchive
         return true;
     }
 
-    private static void ValidateArchiveLimits(ZipArchive archive)
+    private static void ValidateArchiveLimits(ZipArchive archive, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (archive.Entries.Count > MaximumEntryCount)
         {
             throw new InvalidDataException("The backup archive exceeds the supported entry-count limit.");
@@ -925,6 +1003,7 @@ internal static class NpgsqlBackupArchive
         long expanded = 0;
         foreach (var entry in archive.Entries)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (entry.Length < 0 || entry.Length > MaximumEntryBytes)
             {
                 throw new InvalidDataException($"Backup entry '{entry.FullName}' exceeds the supported expanded-size limit.");
@@ -1068,8 +1147,14 @@ internal static class NpgsqlBackupArchive
 
     private sealed record StockManifest(bool DatabaseIncluded, BoundEntry Binding);
 
-    private sealed class ModelValidationState
+#pragma warning disable SA1204 // Validation helpers are kept beside the operations which use them.
+    private sealed class ModelValidationState : IDisposable
     {
+        private const int KeyKind = 0;
+        private const int UniqueKind = 1;
+        private const int ForeignKind = 2;
+        private const long BytesPerIndexedHashBudget = 128;
+
         private static readonly string[] PluginMigrationIds =
         [
             "20261009061101_InitialPostgreSqlBaseline",
@@ -1077,31 +1162,129 @@ internal static class NpgsqlBackupArchive
             "20261009113458_AddUuidMinMaxAggregates",
         ];
 
-        private readonly Dictionary<IKey, HashSet<string>> keys = new();
-        private readonly Dictionary<IIndex, HashSet<string>> uniqueIndexes = new();
-        private readonly Dictionary<IForeignKey, HashSet<string>> foreignKeys = new();
+        private readonly Dictionary<IKey, int> keys = new();
+        private readonly Dictionary<IIndex, int> uniqueIndexes = new();
+        private readonly Dictionary<IForeignKey, ForeignStore> foreignKeys = new();
         private readonly HashSet<string> histories = new(StringComparer.Ordinal);
         private readonly List<string> orderedHistories = new();
+        private readonly string scratchRoot;
+        private readonly string databasePath;
+        private readonly SqliteConnection connection;
+        private readonly SqliteTransaction transaction;
+        private readonly SqliteCommand insert;
+        private readonly long maximumLogicalBytes;
+        private long indexedHashes;
+        private bool disposed;
 
-        internal ModelValidationState(IModel model)
+        internal ModelValidationState(IModel model, CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            var maximumEntriesPerRow = model.GetEntityTypes()
+                .Select(entity => entity.GetKeys().Count()
+                    + entity.GetIndexes().Count(index => index.IsUnique)
+                    + entity.GetForeignKeys().Count())
+                .DefaultIfEmpty(1)
+                .Max();
+            this.maximumLogicalBytes = checked(MaximumDatabaseRows * maximumEntriesPerRow * BytesPerIndexedHashBudget);
+            if (this.maximumLogicalBytes > MaximumExpandedBytes)
+            {
+                throw new InvalidDataException(
+                    "The runtime model's strict restore-validation index budget exceeds the supported disk limit.");
+            }
+
+            this.scratchRoot = Path.Combine(
+                Path.GetTempPath(),
+                ".jellyfin-npgsql-validation-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(this.scratchRoot);
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(
+                    this.scratchRoot,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+            }
+
+            this.databasePath = Path.Combine(this.scratchRoot, "relationships.sqlite");
+            try
+            {
+                this.connection = new SqliteConnection(new SqliteConnectionStringBuilder
+                {
+                    DataSource = this.databasePath,
+                    Mode = SqliteOpenMode.ReadWriteCreate,
+                    Cache = SqliteCacheMode.Private,
+                    Pooling = false,
+                }.ToString());
+                this.connection.Open();
+                using (var setup = this.connection.CreateCommand())
+                {
+                    setup.CommandText = """
+                        PRAGMA journal_mode=OFF;
+                        PRAGMA synchronous=OFF;
+                        PRAGMA temp_store=FILE;
+                        PRAGMA cache_size=-4096;
+                        PRAGMA mmap_size=0;
+                        CREATE TABLE value_set (
+                            kind INTEGER NOT NULL,
+                            set_id INTEGER NOT NULL,
+                            hash BLOB NOT NULL,
+                            PRIMARY KEY (kind, set_id, hash)
+                        ) WITHOUT ROWID;
+                        """;
+                    setup.ExecuteNonQuery();
+                }
+
+                this.transaction = this.connection.BeginTransaction();
+                this.insert = this.connection.CreateCommand();
+                this.insert.Transaction = this.transaction;
+                this.insert.CommandText = "INSERT OR IGNORE INTO value_set (kind, set_id, hash) VALUES ($kind, $set, $hash)";
+                _ = this.insert.Parameters.Add("$kind", SqliteType.Integer);
+                _ = this.insert.Parameters.Add("$set", SqliteType.Integer);
+                _ = this.insert.Parameters.Add("$hash", SqliteType.Blob);
+                this.insert.Prepare();
+            }
+            catch
+            {
+                this.connection?.Dispose();
+                DeleteValidationScratch(this.scratchRoot);
+                throw;
+            }
+
+            var nextSet = 0;
             foreach (var entityType in model.GetEntityTypes())
             {
                 foreach (var key in entityType.GetKeys())
                 {
-                    this.keys.TryAdd(key, new HashSet<string>(StringComparer.Ordinal));
+                    this.keys.TryAdd(key, nextSet++);
                 }
 
                 foreach (var index in entityType.GetIndexes().Where(index => index.IsUnique))
                 {
-                    this.uniqueIndexes.TryAdd(index, new HashSet<string>(StringComparer.Ordinal));
-                }
-
-                foreach (var foreignKey in entityType.GetForeignKeys())
-                {
-                    this.foreignKeys.TryAdd(foreignKey, new HashSet<string>(StringComparer.Ordinal));
+                    this.uniqueIndexes.TryAdd(index, nextSet++);
                 }
             }
+
+            foreach (var entityType in model.GetEntityTypes())
+            {
+                foreach (var foreignKey in entityType.GetForeignKeys())
+                {
+                    this.foreignKeys.TryAdd(
+                        foreignKey,
+                        new ForeignStore(nextSet++, this.keys[foreignKey.PrincipalKey]));
+                }
+            }
+        }
+
+        public void Dispose()
+        {
+            if (this.disposed)
+            {
+                return;
+            }
+
+            this.disposed = true;
+            this.insert.Dispose();
+            this.transaction.Dispose();
+            this.connection.Dispose();
+            DeleteValidationScratch(this.scratchRoot);
         }
 
         internal void AddHistory(string migrationId, string productVersion)
@@ -1128,8 +1311,13 @@ internal static class NpgsqlBackupArchive
             this.orderedHistories.Add(migrationId);
         }
 
-        internal void AddEntity(IEntityType entityType, JsonElement json, string path)
+        internal void AddEntity(
+            IEntityType entityType,
+            JsonElement json,
+            string path,
+            CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var persistedValues = new Dictionary<IProperty, object?>();
             foreach (var property in entityType.GetProperties())
             {
@@ -1177,7 +1365,7 @@ internal static class NpgsqlBackupArchive
             foreach (var key in entityType.GetKeys())
             {
                 var hash = HashValues(key.Properties, persistedValues, allowNull: false, path);
-                if (!this.keys[key].Add(hash))
+                if (!this.TryInsert(KeyKind, this.keys[key], hash, cancellationToken))
                 {
                     throw new InvalidDataException(
                         $"Database backup entry '{path}' contains a duplicate key for '{entityType.ClrType.Name}'.");
@@ -1193,7 +1381,7 @@ internal static class NpgsqlBackupArchive
                 }
 
                 var hash = HashValues(values);
-                if (!this.uniqueIndexes[index].Add(hash))
+                if (!this.TryInsert(UniqueKind, this.uniqueIndexes[index], hash, cancellationToken))
                 {
                     throw new InvalidDataException(
                         $"Database backup entry '{path}' contains a duplicate unique value for '{entityType.ClrType.Name}'.");
@@ -1214,7 +1402,12 @@ internal static class NpgsqlBackupArchive
                         $"Database backup entry '{path}' contains a partially null relationship for '{entityType.ClrType.Name}'.");
                 }
 
-                this.foreignKeys[foreignKey].Add(HashValues(values));
+                _ = this.TryInsert(
+                    ForeignKind,
+                    this.foreignKeys[foreignKey].SetId,
+                    HashValues(values),
+                    cancellationToken,
+                    ignoreDuplicate: true);
             }
         }
 
@@ -1231,10 +1424,28 @@ internal static class NpgsqlBackupArchive
                     $"the migration history is not the exact supported ordered lineage; missing [{string.Join(", ", missing)}], unknown [{string.Join(", ", unknown)}]");
             }
 
-            foreach (var (foreignKey, references) in this.foreignKeys)
+            foreach (var (foreignKey, store) in this.foreignKeys)
             {
-                var principalKeys = this.keys[foreignKey.PrincipalKey];
-                if (references.Any(reference => !principalKeys.Contains(reference)))
+                using var query = this.connection.CreateCommand();
+                query.Transaction = this.transaction;
+                query.CommandText = """
+                    SELECT 1
+                    FROM value_set AS reference
+                    WHERE reference.kind = $foreign_kind
+                      AND reference.set_id = $foreign_set
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM value_set AS principal
+                          WHERE principal.kind = $key_kind
+                            AND principal.set_id = $principal_set
+                            AND principal.hash = reference.hash)
+                    LIMIT 1
+                    """;
+                _ = query.Parameters.AddWithValue("$foreign_kind", ForeignKind);
+                _ = query.Parameters.AddWithValue("$foreign_set", store.SetId);
+                _ = query.Parameters.AddWithValue("$key_kind", KeyKind);
+                _ = query.Parameters.AddWithValue("$principal_set", store.PrincipalSetId);
+                if (query.ExecuteScalar() is not null)
                 {
                     throw new InvalidDataException(
                         $"The database backup contains an unresolved relationship from '{foreignKey.DeclaringEntityType.ClrType.Name}' "
@@ -1243,7 +1454,46 @@ internal static class NpgsqlBackupArchive
             }
         }
 
-        private static string HashValues(
+        private static void DeleteValidationScratch(string path)
+        {
+            if (Directory.Exists(path))
+            {
+                Directory.Delete(path, true);
+            }
+        }
+
+        private bool TryInsert(
+            int kind,
+            int setId,
+            byte[] hash,
+            CancellationToken cancellationToken,
+            bool ignoreDuplicate = false)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            this.insert.Parameters["$kind"].Value = kind;
+            this.insert.Parameters["$set"].Value = setId;
+            this.insert.Parameters["$hash"].Value = hash;
+            try
+            {
+                var changed = this.insert.ExecuteNonQuery() != 0;
+                if (changed)
+                {
+                    this.indexedHashes = checked(this.indexedHashes + 1);
+                    if (checked(this.indexedHashes * BytesPerIndexedHashBudget) > this.maximumLogicalBytes)
+                    {
+                        throw new InvalidDataException("The restore validation index exceeded its strict disk budget.");
+                    }
+                }
+
+                return changed || ignoreDuplicate;
+            }
+            catch (SqliteException exception)
+            {
+                throw new InvalidDataException("The bounded restore validation index failed.", exception);
+            }
+        }
+
+        private static byte[] HashValues(
             IReadOnlyList<IProperty> properties,
             IReadOnlyDictionary<IProperty, object?> persistedValues,
             bool allowNull,
@@ -1296,7 +1546,7 @@ internal static class NpgsqlBackupArchive
             }).ToArray();
         }
 
-        private static string HashValues(IReadOnlyList<object?> values)
+        private static byte[] HashValues(IReadOnlyList<object?> values)
         {
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
             foreach (var value in values)
@@ -1315,7 +1565,7 @@ internal static class NpgsqlBackupArchive
                 hash.AppendData(valueBytes);
             }
 
-            return Convert.ToHexStringLower(hash.GetHashAndReset());
+            return hash.GetHashAndReset();
         }
 
         private static void ValidatePropertyJsonType(IProperty property, JsonElement value, string path)
@@ -1346,7 +1596,10 @@ internal static class NpgsqlBackupArchive
                     $"Database backup entry '{path}' has the wrong JSON type for '{property.DeclaringType.ClrType.Name}.{property.Name}'.");
             }
         }
+
+        private sealed record ForeignStore(int SetId, int PrincipalSetId);
     }
+#pragma warning restore SA1204
 
     private sealed class BoundedReadStream : Stream
     {

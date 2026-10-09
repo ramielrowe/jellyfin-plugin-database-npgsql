@@ -37,7 +37,7 @@ internal sealed class NpgsqlRestoreSaveChangesInterceptor : SaveChangesIntercept
     {
         if (eventData.Context is not null)
         {
-            await NpgsqlRestoreCoordinator.CompleteAsync(
+            await NpgsqlRestoreCoordinator.PrepareAsync(
                 eventData.Context,
                 cancellationToken).ConfigureAwait(false);
         }
