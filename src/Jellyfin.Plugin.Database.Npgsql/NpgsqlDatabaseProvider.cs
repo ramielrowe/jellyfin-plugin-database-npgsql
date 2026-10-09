@@ -30,6 +30,7 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     private readonly string? applicationDataPath;
     private string? backupRoot;
     private string? connectionString;
+    private object? restoreDataSource;
 
     /// <summary>Initializes a new instance of the <see cref="NpgsqlDatabaseProvider"/> class.</summary>
     /// <param name="logger">The host logger.</param>
@@ -102,6 +103,7 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
             customOptions.ConnectionString,
             customOptions.Options);
         this.connectionString = configured.ConnectionString;
+        this.restoreDataSource = NpgsqlRestoreDataSource.Create(configured);
 
         LogProviderLoaded(
             this.logger,
@@ -172,7 +174,7 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     }
 
     /// <inheritdoc />
-    public Task RunShutdownTask(CancellationToken cancellationToken)
+    public async Task RunShutdownTask(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var configuredConnectionString = this.connectionString;
@@ -183,7 +185,12 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
             NpgsqlDatabaseOperations.ClearPool(configuredConnectionString);
         }
 
-        return Task.CompletedTask;
+        if (this.restoreDataSource is not null)
+        {
+            await NpgsqlRestoreDataSource.DisposeAsync(this.restoreDataSource).ConfigureAwait(false);
+        }
+
+        this.restoreDataSource = null;
     }
 
     /// <inheritdoc />
@@ -201,8 +208,8 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc />
     public virtual async Task RestoreBackupFast(string key, CancellationToken cancellationToken)
     {
-        await NpgsqlMigrationBackup.RestoreAsync(
-            this.RequireConnectionString(),
+        await NpgsqlRestoreDataSource.RestoreAsync(
+            this.RequireDataSourceHandle(),
             this.RequireBackupRoot(),
             key,
             cancellationToken).ConfigureAwait(false);
@@ -355,6 +362,10 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     private string RequireConnectionString()
         => this.connectionString
             ?? throw new InvalidOperationException("The Npgsql provider has not been initialized; no migration backup operation was attempted.");
+
+    private object RequireDataSourceHandle()
+        => this.restoreDataSource
+            ?? throw new InvalidOperationException("The Npgsql provider has not been initialized; no migration restore operation was attempted.");
 
     private string RequireBackupRoot()
     {

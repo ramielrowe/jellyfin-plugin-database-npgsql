@@ -57,9 +57,12 @@ PostgreSQL may deadlock transactions which discover multiple entirely-new values
 in inverse order. The provider's bounded execution strategy retries whole EF
 operations for SQLSTATE `40P01` and `40001` at most five times with a maximum
 two-second delay. EF implicit `SaveChanges` transactions are replayed as a unit.
-Code which starts an explicit transaction must put the complete transaction body
-inside `Database.CreateExecutionStrategy().Execute[Async]`; retrying individual
-commands is unsupported and could duplicate effects.
+Jellyfin core also starts explicit transactions in several code migrations. The
+plugin detects a caller-owned transaction and disables retries for its lifetime,
+so ordinary queries and `SaveChanges` remain compatible instead of failing EF's
+stock retry-strategy transaction guard. A transient error aborts that explicit
+transaction and is returned to its owner; individual commands are never replayed
+inside it because doing so could duplicate effects.
 
 The initial PostgreSQL migration must install `NpgsqlTextInterning.InstallSql` in
 the same transaction which creates the owning tables, and must omit/drop the

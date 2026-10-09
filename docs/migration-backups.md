@@ -20,16 +20,20 @@ directories, and names outside that grammar are rejected.
 Creation holds a provider process gate and a PostgreSQL transaction advisory
 lock, then reads the database through a repeatable-read transaction. Each table
 is streamed with Npgsql's raw binary `COPY` API to a separate bounded file. The
-versioned JSON manifest records the plugin version, database name and OID, a
-credential-free endpoint/user binding, source plugin migration, every table and
-column definition, every sequence value, foreign-key characteristics, the
-complete schema fingerprint, file lengths, and SHA-256 checksums. A provider-
+versioned JSON manifest records the plugin version, database name and OID, the
+restricted-role-readable PostgreSQL system identifier, the server actually
+selected from a multi-host connection, source plugin migration, every table and
+column definition, complete sequence definition/ownership/value state,
+foreign-key characteristics, the complete schema fingerprint, file lengths, and
+SHA-256 checksums. A provider-
 generated restoration script is checksum-bound as data, not accepted from the
 caller.
 
 The manifest is written only after every stream has completed. A completion
-file binds its hash, and the `.partial` directory is atomically renamed to its
-final key last. Cancellation, I/O failure, or PostgreSQL failure removes only
+file binds its hash. Every table, schema, manifest, and completion file is forced
+to stable storage; the partial directory and parent are synchronized, the
+directory is atomically renamed, and the parent is synchronized again before the key is returned. Any flush,
+rename, disk-exhaustion, cancellation, I/O, or PostgreSQL failure removes only
 the uniquely named provider-owned partial directory. A later creation also
 scavenges marker-shaped crash remnants. No incomplete key can be restored.
 
@@ -39,22 +43,32 @@ Vanilla first startup seeds core code-migration rows before requesting its first
 provider backup, so the exact two-column history-only schema is separately
 recognized and streamed; every other object, key shape, or column length is
 rejected. A populated application database must match the exact supported
-Jellyfin model tables and columns and must contain the plugin baseline or
-successor migration. Unknown populated layouts fail before migration rather
-than receiving a false backup key.
+Jellyfin model tables, complete column types/facets, functions, triggers,
+constraints, indexes, owned identity sequences, policies/RLS, owners, grants,
+extensions, and schema properties and must contain the plugin baseline or
+successor migration. Extra views/materialized views/sequences and altered
+sequence definitions are rejected. Unknown or drifted populated layouts fail
+before migration rather than receiving a false backup key.
 
 ## Restore and cleanup
 
 Restore validates the key, path components, symlinks, format version, age,
-provider version, all checksums and lengths, database name/OID, and target
-binding before opening a destructive transaction. Npgsql pools are retired
-first. The old public schema is replaced and the provider-generated schema is
-replayed inside one serializable transaction. Foreign keys are temporarily
+provider version, all checksums and lengths, database name/OID, stable cluster
+binding, and the server endpoint actually selected from a multi-host data source
+before opening a destructive transaction. Validation streams
+every artifact once into a private provider-owned staging directory and restore
+consumes those same open staged handles, so path, hard-link, symlink, data-file,
+and manifest swaps cannot create a validation/use race. The old public schema is
+replaced and the provider-generated schema is replayed inside one serializable
+transaction. Foreign keys are temporarily
 made deferred, table streams are copied in dependency order, identity sequences
 are reset to their exact prior `last_value`/`is_called` pair, original foreign-
 key characteristics are restored, and the schema fingerprint must match before
-commit. Any SQL, COPY, constraint, checksum, or cancellation failure rolls the
-whole transaction back.
+commit. Restore has an internal deadline even when the vanilla host passes
+`CancellationToken.None`, bounded PostgreSQL lock/statement/command timeouts,
+and a pre-mutation active-session check; a leased transaction or table lock is
+reported rather than hanging. Any SQL, COPY, constraint, checksum, timeout, or
+cancellation failure rolls the whole transaction back.
 
 Deletion is idempotent and applies only to a completed key below the canonical
 backup root. A symbolic-link key is refused rather than traversed.

@@ -61,12 +61,13 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
         PostgreSqlClusterLease clusterLease,
         string? workerId,
         CancellationToken cancellationToken,
-        Action<TestResourceIdentity>? resourceCreated = null)
+        Action<TestResourceIdentity>? resourceCreated = null,
+        TestResourceIdentity? fixedIdentity = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(clusterLease);
         var administratorBuilder = ValidateAdministratorConnectionString(clusterLease.ConnectionString);
-        var identity = TestResourceNames.Create(workerId);
+        var identity = fixedIdentity ?? TestResourceNames.Create(workerId);
         var runtimePassword = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
         var leaseId = Guid.NewGuid().ToString("N");
         var ownerLease = AcquireOwnerLease(clusterLease.ClusterIdentity, leaseId);

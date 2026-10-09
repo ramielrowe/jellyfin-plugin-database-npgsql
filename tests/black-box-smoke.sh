@@ -388,7 +388,9 @@ cleanup() {
     local original_status=$?
     trap - EXIT
     set +e
-    terminate_host_group || original_status=1
+    if declare -F terminate_host_group >/dev/null; then
+        terminate_host_group || original_status=1
+    fi
 
     if [[ "$POSTGRES_CONTAINER_ID" =~ ^[0-9a-f]{64}$ ]]; then
         local inspected inspect_status
@@ -834,9 +836,27 @@ assert_log_origin() {
     local log_file=$1
     local role=$2
     local expected_path=$3
+    [[ "$expected_path" == "$RUN_ROOT/"* ]] \
+        || fail "$role expected assembly path is outside the owned run root"
+    local redacted_path="<redacted>/${expected_path#"$RUN_ROOT/"}"
     grep -F "Npgsql provider $role:" "$log_file" \
-        | grep -F " from $expected_path in load context Default" >/dev/null \
-        || fail "$role assembly did not load from $expected_path in the default load context"
+        | grep -F " from $redacted_path in load context Default" >/dev/null \
+        || fail "$role assembly did not load from the expected redacted run-root-relative path in the default load context"
+}
+
+assert_host_remains_healthy() {
+    local port=$1
+    local log_file=$2
+    for _ in $(seq 1 15); do
+        sleep 1
+        assert_host_owns_listener "$port"
+        curl --silent --show-error --fail "http://127.0.0.1:$port/health" >/dev/null \
+            || fail "vanilla Jellyfin stopped reporting healthy after startup"
+    done
+    if grep -F 'The configured execution strategy' "$log_file" \
+        | grep -F 'user-initiated transactions' >/dev/null; then
+        fail "vanilla Jellyfin hit the delayed retry-strategy/user-transaction incompatibility"
+    fi
 }
 
 wait_for_host_exit() {
@@ -926,6 +946,11 @@ psql_exec() {
         --env PGPASSFILE=/run/jellyfin-test-secrets/application.pgpass \
         "$POSTGRES_CONTAINER_ID" \
         psql --username jellyfin --dbname jellyfin --set ON_ERROR_STOP=1 --command "$1" >/dev/null
+}
+
+identity_sequence_state() {
+    local sequence_name=$1
+    psql_value "SELECT last_value::text || '|' || is_called::text FROM $sequence_name"
 }
 
 mkdir -p -m 700 \
@@ -1360,6 +1385,7 @@ fi
 
 wait_for_health "$HTTP_PORT" || fail "vanilla Jellyfin 12.2 did not become healthy"
 assert_loopback_listener "$HTTP_PORT"
+assert_host_remains_healthy "$HTTP_PORT" "$RUN_ROOT/first-start.log"
 grep -q 'Npgsql database provider 0.1.0.0 loaded.*in Default' "$RUN_ROOT/first-start.log" \
     || fail "provider was not loaded in the default load context"
 assert_log_origin "$RUN_ROOT/first-start.log" "provider" "$PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.dll"
@@ -1405,7 +1431,7 @@ wait_for_health "$HTTP_PORT" || fail "vanilla Jellyfin did not survive the later
 grep -F 'Registering whitelisted assemblies for plugin "Npgsql Database"' "$RUN_ROOT/active-scan.log" >/dev/null \
     || fail "normal plugin loading did not exercise the provider assembly allowlist"
 grep -F "Loaded assembly Jellyfin.Plugin.Database.Npgsql" "$RUN_ROOT/active-scan.log" \
-    | grep -F " from $PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.dll" >/dev/null \
+    | grep -F " from <redacted>/runtime/data/plugins/$PLUGIN_FOLDER_NAME/Jellyfin.Plugin.Database.Npgsql.dll" >/dev/null \
     || fail "normal PluginLoadContext scan did not report the provider's canonical assembly origin"
 if grep -E 'Failed to load assembly .*Jellyfin.Plugin.Database.Npgsql|Error creating .*Npgsql' "$RUN_ROOT/active-scan.log" >/dev/null; then
     fail "normal PluginLoadContext scanning reported a type or context failure"
@@ -1423,6 +1449,21 @@ MALFORMED_TOKEN=$(authenticate "$HTTP_PORT" "npgsql-malformed-metadata")
 [ -n "$MALFORMED_TOKEN" ] || fail "persisted user could not authenticate after malformed metadata recovery"
 stop_host "$HTTP_PORT" "$MALFORMED_TOKEN" || fail "malformed-metadata host did not stop cleanly"
 cp "$PLUGIN_ROOT/meta.json" "$PLUGIN_FOLDER/meta.json"
+
+mapfile -t SEQUENCE_PROBES < <(psql_value "SELECT format('%I.%I', schemaname, sequencename) FROM pg_catalog.pg_sequences WHERE schemaname = 'public' ORDER BY sequencename LIMIT 4")
+[ "${#SEQUENCE_PROBES[@]}" -eq 4 ] || fail "supported schema did not expose four identity sequences for rollback state probes"
+psql_exec "SELECT setval('${SEQUENCE_PROBES[0]}'::regclass, 900, true)"
+psql_exec "SELECT setval('${SEQUENCE_PROBES[1]}'::regclass, 1, true)"
+psql_exec "SELECT setval('${SEQUENCE_PROBES[2]}'::regclass, 1, false)"
+psql_exec "SELECT setval('${SEQUENCE_PROBES[3]}'::regclass, 37, false)"
+ADVANCED_SEQUENCE_STATE=$(identity_sequence_state "${SEQUENCE_PROBES[0]}")
+DELETED_SEQUENCE_STATE=$(identity_sequence_state "${SEQUENCE_PROBES[1]}")
+EMPTY_SEQUENCE_STATE=$(identity_sequence_state "${SEQUENCE_PROBES[2]}")
+FALSE_SEQUENCE_STATE=$(identity_sequence_state "${SEQUENCE_PROBES[3]}")
+[ "$ADVANCED_SEQUENCE_STATE" = "900|true" ] || fail "advanced sequence fixture was not established"
+[ "$DELETED_SEQUENCE_STATE" = "1|true" ] || fail "called sequence fixture was not established"
+[ "$EMPTY_SEQUENCE_STATE" = "1|false" ] || fail "never-called sequence fixture was not established"
+[ "$FALSE_SEQUENCE_STATE" = "37|false" ] || fail "explicit false-state sequence fixture was not established"
 
 cp "$RUN_ROOT/failure-plugin/Jellyfin.Plugin.Database.Npgsql.dll" "$PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.dll"
 start_host "$RUN_ROOT/forced-failure.log"
@@ -1449,6 +1490,14 @@ terminate_host_group || fail "forced-failure host process group could not be ter
     || fail "restore left a backup schema behind"
 [ "$(psql_value "SELECT COUNT(*) FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = '20261008160000_ForcedNonTransactionalFailure'")" = "0" ] \
     || fail "failed migration was recorded as applied"
+[ "$(identity_sequence_state "${SEQUENCE_PROBES[0]}")" = "$ADVANCED_SEQUENCE_STATE" ] \
+    || fail "restore changed an identity sequence advanced beyond its table maximum"
+[ "$(identity_sequence_state "${SEQUENCE_PROBES[1]}")" = "$DELETED_SEQUENCE_STATE" ] \
+    || fail "restore changed a called identity sequence"
+[ "$(identity_sequence_state "${SEQUENCE_PROBES[2]}")" = "$EMPTY_SEQUENCE_STATE" ] \
+    || fail "restore changed a never-called identity sequence"
+[ "$(identity_sequence_state "${SEQUENCE_PROBES[3]}")" = "$FALSE_SEQUENCE_STATE" ] \
+    || fail "restore changed an explicitly advanced identity sequence with is_called=false"
 cp "$PLUGIN_ROOT/artifacts/package/Jellyfin.Plugin.Database.Npgsql.dll" "$PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.dll"
 start_host "$RUN_ROOT/recovery.log"
 wait_for_health "$HTTP_PORT" || fail "normal package did not recover after the forced failure"

@@ -238,10 +238,8 @@ public sealed class TestInfrastructureTests
                 TestContext.Current.CancellationToken);
             Assert.Contains("<redacted>", collectedLog, StringComparison.Ordinal);
             Assert.DoesNotContain(LogSecret, collectedLog, StringComparison.Ordinal);
-            Assert.DoesNotContain(
-                Directory.GetParent(PluginRepository.FindRoot(AppContext.BaseDirectory))!.FullName,
-                publish.DirectoryPath,
-                StringComparison.Ordinal);
+            Assert.Equal(Path.GetFullPath(destination), publish.DirectoryPath);
+            Assert.NotEqual(Path.GetFullPath(source), publish.DirectoryPath);
             await publish.VerifyUnchangedAsync(TestContext.Current.CancellationToken);
         }
         finally

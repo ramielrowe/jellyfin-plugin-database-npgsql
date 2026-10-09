@@ -57,10 +57,8 @@ internal static class NpgsqlOptionsBootstrap
             {
                 npgsql.MigrationsAssembly(Assembly.GetExecutingAssembly().GetName().Name);
                 npgsql.CommandTimeout(configured.CommandTimeout);
-                npgsql.EnableRetryOnFailure(
-                    maxRetryCount: 5,
-                    maxRetryDelay: TimeSpan.FromSeconds(2),
-                    errorCodesToAdd: ["40P01", "40001"]);
+                npgsql.ExecutionStrategy(
+                    dependencies => new NpgsqlHostCompatibleRetryingExecutionStrategy(dependencies));
                 if (configured.ConfigureDataSource is not null)
                 {
                     npgsql.ConfigureDataSource(configured.ConfigureDataSource);

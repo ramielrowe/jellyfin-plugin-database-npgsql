@@ -92,12 +92,14 @@ public sealed class PostgreSqlTestEnvironment : IAsyncDisposable
 
     public Task<PostgreSqlTestDatabase> CreateDatabaseAsync(
         CancellationToken cancellationToken,
-        Action<TestResourceIdentity>? resourceCreated = null)
+        Action<TestResourceIdentity>? resourceCreated = null,
+        TestResourceIdentity? fixedIdentity = null)
         => PostgreSqlTestDatabase.CreateAsync(
             _clusterLease,
             Options.WorkerId,
             cancellationToken,
-            resourceCreated);
+            resourceCreated,
+            fixedIdentity);
 
     public Task<PostgreSqlTestDatabase[]> CreateDatabasesAsync(
         System.Collections.Generic.IEnumerable<string> workerIds,

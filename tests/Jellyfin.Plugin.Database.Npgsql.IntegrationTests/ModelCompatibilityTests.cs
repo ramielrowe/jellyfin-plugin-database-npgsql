@@ -496,6 +496,36 @@ public sealed class ModelCompatibilityTests
     }
 
     [Fact]
+    public async Task HostManagedTransaction_AllowsOrdinaryQueriesAndSaveChangesWithoutRetryStrategyFailure()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await CreateSchemaAsync(database.RuntimeConnectionString, cancellationToken);
+            var value = "host-transaction-" + Guid.NewGuid().ToString("N");
+            await using (var context = CreateContext(database.RuntimeConnectionString))
+            await using (var transaction = await context.Database.BeginTransactionAsync(cancellationToken))
+            {
+                context.ItemValues.Add(CreateItemValue(value));
+                await context.SaveChangesAsync(cancellationToken);
+                Assert.Equal(1, await context.ItemValues.CountAsync(item => item.Value == value, cancellationToken));
+                await transaction.CommitAsync(cancellationToken);
+            }
+
+            await using var verification = CreateContext(database.RuntimeConnectionString);
+            Assert.Equal(1, await verification.ItemValues.CountAsync(item => item.Value == value, cancellationToken));
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Fact]
     public async Task LikeExpressions_MatchSQLiteForWildcardsEscapesAsciiUnicodeAndNulls()
     {
         var options = PostgreSqlTestOptions.FromEnvironment();

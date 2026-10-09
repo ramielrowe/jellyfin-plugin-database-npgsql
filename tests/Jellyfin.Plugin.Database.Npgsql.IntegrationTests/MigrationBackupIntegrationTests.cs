@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -150,6 +151,18 @@ public sealed class MigrationBackupIntegrationTests
 #pragma warning restore CA1416
             }
 
+            var dataFile = Directory.EnumerateFiles(directory, "*.copy").First(path => new FileInfo(path).Length > 16);
+            if (!OperatingSystem.IsWindows())
+            {
+                var symlinkTarget = Path.Combine(scratch, "symlink-target.copy");
+                File.Move(dataFile, symlinkTarget);
+                File.CreateSymbolicLink(dataFile, symlinkTarget);
+                await Assert.ThrowsAsync<InvalidDataException>(
+                    () => NpgsqlMigrationBackup.RestoreAsync(source.RuntimeConnectionString, scratch, key, cancellationToken));
+                File.Delete(dataFile);
+                File.Move(symlinkTarget, dataFile);
+            }
+
             await RewriteManifestAsync(
                 directory,
                 manifest => manifest["createdUtc"] = DateTimeOffset.UtcNow.Subtract(TimeSpan.FromDays(8)),
@@ -171,7 +184,6 @@ public sealed class MigrationBackupIntegrationTests
                 Assert.Equal(0L, await command.ExecuteScalarAsync(cancellationToken));
             }
 
-            var dataFile = Directory.EnumerateFiles(directory, "*.copy").First(path => new FileInfo(path).Length > 16);
             await using (var stream = new FileStream(dataFile, FileMode.Open, FileAccess.Write, FileShare.None, 4096, FileOptions.Asynchronous))
             {
                 stream.Position = 12;
@@ -314,12 +326,294 @@ public sealed class MigrationBackupIntegrationTests
         }
     }
 
+    [Theory]
+    [InlineData("flush-table-0000")]
+    [InlineData("flush-schema")]
+    [InlineData("flush-manifest")]
+    [InlineData("flush-completion")]
+    [InlineData("flush-partial-directory")]
+    [InlineData("flush-root-before-rename")]
+    [InlineData("before-rename")]
+    [InlineData("after-rename")]
+    [InlineData("flush-root-after-rename")]
+    public async Task PublicationFailure_NeverReturnsAKeyAndLeavesNoPublishedOrPartialSnapshot(string failurePoint)
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var scratch = Path.Combine(repositoryRoot, ".artifacts", "backup-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            var factory = new TestContextFactory(database.RuntimeConnectionString);
+            await using (var context = factory.CreateDbContext())
+            {
+                await context.GetService<IMigrator>().MigrateAsync(Successor, cancellationToken);
+                context.ActivityLogs.Add(new ActivityLog("disk-full", "MigrationBackup", Guid.NewGuid()));
+                await context.SaveChangesAsync(cancellationToken);
+            }
+
+            using var faults = NpgsqlBackupFileSystem.InjectFaults(point =>
+            {
+                if (string.Equals(point, failurePoint, StringComparison.Ordinal))
+                {
+                    throw new IOException("Injected no-space-left or durable-publication failure.");
+                }
+            });
+            await Assert.ThrowsAsync<IOException>(
+                () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
+            Assert.Empty(Directory.EnumerateFileSystemEntries(scratch));
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+            if (Directory.Exists(scratch))
+            {
+                Directory.Delete(scratch, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task PopulatedSnapshot_RejectsExtraObjectsColumnDriftAndAlteredIdentitySequenceBeforePublication()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var scratch = Path.Combine(repositoryRoot, ".artifacts", "backup-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            var factory = new TestContextFactory(database.RuntimeConnectionString);
+            await using var context = factory.CreateDbContext();
+            await context.GetService<IMigrator>().MigrateAsync(Successor, cancellationToken);
+
+            await context.Database.ExecuteSqlRawAsync("CREATE VIEW public.\"UnexpectedView\" AS SELECT 1 AS \"Value\"", cancellationToken);
+            await Assert.ThrowsAsync<NotSupportedException>(
+                () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
+            await context.Database.ExecuteSqlRawAsync("DROP VIEW public.\"UnexpectedView\"", cancellationToken);
+
+            await context.Database.ExecuteSqlRawAsync("CREATE TYPE public.\"UnexpectedType\" AS ENUM ('unexpected')", cancellationToken);
+            await Assert.ThrowsAsync<NotSupportedException>(
+                () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
+            await context.Database.ExecuteSqlRawAsync("DROP TYPE public.\"UnexpectedType\"", cancellationToken);
+
+            await context.Database.ExecuteSqlRawAsync("CREATE SEQUENCE public.\"UnexpectedSequence\"", cancellationToken);
+            await Assert.ThrowsAsync<NotSupportedException>(
+                () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
+            await context.Database.ExecuteSqlRawAsync("DROP SEQUENCE public.\"UnexpectedSequence\"", cancellationToken);
+
+            await context.Database.ExecuteSqlRawAsync("ALTER TABLE public.\"ActivityLogs\" ALTER COLUMN \"Overview\" TYPE character varying(1024)", cancellationToken);
+            await Assert.ThrowsAsync<NotSupportedException>(
+                () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
+            await context.Database.ExecuteSqlRawAsync("ALTER TABLE public.\"ActivityLogs\" ALTER COLUMN \"Overview\" TYPE text", cancellationToken);
+
+            await context.Database.ExecuteSqlRawAsync("GRANT SELECT (\"Overview\") ON TABLE public.\"ActivityLogs\" TO PUBLIC", cancellationToken);
+            await Assert.ThrowsAsync<NotSupportedException>(
+                () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
+            await context.Database.ExecuteSqlRawAsync("REVOKE SELECT (\"Overview\") ON TABLE public.\"ActivityLogs\" FROM PUBLIC", cancellationToken);
+
+            await context.Database.ExecuteSqlRawAsync("ALTER SEQUENCE public.\"ActivityLogs_Id_seq\" CACHE 2", cancellationToken);
+            await Assert.ThrowsAsync<NotSupportedException>(
+                () => NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken));
+            Assert.Empty(Directory.EnumerateFileSystemEntries(scratch));
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+            if (Directory.Exists(scratch))
+            {
+                Directory.Delete(scratch, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Restore_ConsumesImmutableStagedBytesAndRejectsActiveLeasedTransactionsWithoutHanging()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var scratch = Path.Combine(repositoryRoot, ".artifacts", "backup-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            var factory = new TestContextFactory(database.RuntimeConnectionString);
+            await using (var context = factory.CreateDbContext())
+            {
+                await context.GetService<IMigrator>().MigrateAsync(Successor, cancellationToken);
+                context.ActivityLogs.Add(new ActivityLog("immutable-stage", "MigrationBackup", Guid.NewGuid()));
+                await context.SaveChangesAsync(cancellationToken);
+            }
+
+            var key = await NpgsqlMigrationBackup.CreateAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken);
+            var directory = Path.Combine(scratch, key);
+            var dataFile = Directory.EnumerateFiles(directory, "*.copy").First();
+            string? hardLink = null;
+            if (!OperatingSystem.IsWindows())
+            {
+                hardLink = Path.Combine(scratch, "hardlink-copy");
+                Assert.Equal(0, CreateHardLinkUnix(dataFile, hardLink));
+            }
+
+            await using (var blocker = new global::Npgsql.NpgsqlConnection(database.RuntimeConnectionString))
+            {
+                await blocker.OpenAsync(cancellationToken);
+                await using var blockedTransaction = await blocker.BeginTransactionAsync(cancellationToken);
+                await using var lockCommand = new global::Npgsql.NpgsqlCommand("LOCK TABLE public.\"ActivityLogs\" IN ACCESS EXCLUSIVE MODE", blocker, blockedTransaction);
+                await lockCommand.ExecuteNonQueryAsync(cancellationToken);
+                var started = DateTime.UtcNow;
+                await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => NpgsqlMigrationBackup.RestoreAsync(database.RuntimeConnectionString, scratch, key, CancellationToken.None));
+                Assert.True(DateTime.UtcNow - started < TimeSpan.FromSeconds(10));
+                await blockedTransaction.RollbackAsync(cancellationToken);
+            }
+
+            var replacementManifest = Path.Combine(scratch, "replacement-manifest");
+            var replacementData = Path.Combine(scratch, "replacement-data");
+            await File.WriteAllTextAsync(replacementManifest, "atomically swapped after validation", cancellationToken);
+            await File.WriteAllTextAsync(replacementData, "atomically swapped after validation", cancellationToken);
+            using (NpgsqlBackupFileSystem.InjectFaults(point =>
+            {
+                if (!string.Equals(point, "validated-immutable-stage-ready", StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                File.Move(replacementManifest, Path.Combine(directory, "manifest.json"), overwrite: true);
+                File.Move(replacementData, dataFile, overwrite: true);
+                if (hardLink is not null)
+                {
+                    File.WriteAllText(hardLink, "hard-linked source changed after validation");
+                }
+            }))
+            {
+                await NpgsqlMigrationBackup.RestoreAsync(database.RuntimeConnectionString, scratch, key, cancellationToken);
+            }
+
+            await using (var context = factory.CreateDbContext())
+            {
+                Assert.Equal("immutable-stage", (await context.ActivityLogs.SingleAsync(cancellationToken)).Name);
+            }
+
+            await NpgsqlMigrationBackup.DeleteAsync(scratch, key);
+            if (hardLink is not null)
+            {
+                File.Delete(hardLink);
+            }
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+            if (Directory.Exists(scratch))
+            {
+                Directory.Delete(scratch, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Restore_RejectsSameNameAndOidOnADifferentPostgreSqlSystem()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        Assert.SkipUnless(options.UseContainer, "The cross-cluster identity proof requires two harness-owned disposable containers.");
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var identity = TestResourceNames.Create("binding");
+        await using var sourceEnvironment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var targetEnvironment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var source = await sourceEnvironment.CreateDatabaseAsync(cancellationToken, fixedIdentity: identity);
+        await using var target = await targetEnvironment.CreateDatabaseAsync(cancellationToken, fixedIdentity: identity);
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var scratch = Path.Combine(repositoryRoot, ".artifacts", "backup-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            var sourceFactory = new TestContextFactory(source.RuntimeConnectionString);
+            var targetFactory = new TestContextFactory(target.RuntimeConnectionString);
+            await using (var context = sourceFactory.CreateDbContext())
+            {
+                await context.GetService<IMigrator>().MigrateAsync(Successor, cancellationToken);
+                context.ActivityLogs.Add(new ActivityLog("source-system", "MigrationBackup", Guid.NewGuid()));
+                await context.SaveChangesAsync(cancellationToken);
+            }
+
+            await using (var context = targetFactory.CreateDbContext())
+            {
+                await context.GetService<IMigrator>().MigrateAsync(Successor, cancellationToken);
+                context.ActivityLogs.Add(new ActivityLog("target-system", "MigrationBackup", Guid.NewGuid()));
+                await context.SaveChangesAsync(cancellationToken);
+            }
+
+            var sourceIdentity = await ReadServerIdentityAsync(source.RuntimeConnectionString, cancellationToken);
+            var targetIdentity = await ReadServerIdentityAsync(target.RuntimeConnectionString, cancellationToken);
+            Assert.Equal(source.DatabaseName, target.DatabaseName);
+            Assert.Equal(sourceIdentity.DatabaseOid, targetIdentity.DatabaseOid);
+            Assert.NotEqual(sourceIdentity.SystemIdentifier, targetIdentity.SystemIdentifier);
+
+            var key = await NpgsqlMigrationBackup.CreateAsync(
+                sourceFactory,
+                source.RuntimeConnectionString,
+                scratch,
+                cancellationToken);
+            await Assert.ThrowsAsync<InvalidDataException>(
+                () => NpgsqlMigrationBackup.RestoreAsync(target.RuntimeConnectionString, scratch, key, cancellationToken));
+            await using (var context = targetFactory.CreateDbContext())
+            {
+                Assert.Equal("target-system", (await context.ActivityLogs.SingleAsync(cancellationToken)).Name);
+            }
+
+            await RewriteManifestAsync(
+                Path.Combine(scratch, key),
+                manifest => manifest["selectedServer"] = "127.0.0.254:1",
+                cancellationToken);
+            await Assert.ThrowsAsync<InvalidDataException>(
+                () => NpgsqlMigrationBackup.RestoreAsync(source.RuntimeConnectionString, scratch, key, cancellationToken));
+            await using (var context = sourceFactory.CreateDbContext())
+            {
+                Assert.Equal("source-system", (await context.ActivityLogs.SingleAsync(cancellationToken)).Name);
+            }
+
+            await NpgsqlMigrationBackup.DeleteAsync(scratch, key);
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+            if (Directory.Exists(scratch))
+            {
+                Directory.Delete(scratch, recursive: true);
+            }
+        }
+    }
+
     private static async Task<bool> IndexExistsAsync(JellyfinDbContext context, CancellationToken cancellationToken)
     {
         var result = await context.Database.SqlQueryRaw<bool>(
             "SELECT to_regclass('public.\"IX_ActivityLogs_Npgsql_Type_DateCreated\"') IS NOT NULL AS \"Value\"")
             .SingleAsync(cancellationToken);
         return result;
+    }
+
+    private static async Task<(long DatabaseOid, string SystemIdentifier)> ReadServerIdentityAsync(
+        string connectionString,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new global::Npgsql.NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT database.oid::bigint, control.system_identifier::text FROM pg_catalog.pg_database database CROSS JOIN pg_catalog.pg_control_system() control WHERE database.datname = current_database()";
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        Assert.True(await reader.ReadAsync(cancellationToken));
+        return (reader.GetInt64(0), reader.GetString(1));
     }
 
     private static async Task RewriteManifestAsync(
@@ -343,6 +637,13 @@ public sealed class MigrationBackupIntegrationTests
             File.SetUnixFileMode(completionPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
         }
     }
+
+#pragma warning disable CA2101 // Unix test paths are explicitly marshalled as UTF-8.
+    [DllImport("libc", EntryPoint = "link", SetLastError = true)]
+    private static extern int CreateHardLinkUnix(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string existingPath,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string newPath);
+#pragma warning restore CA2101
 
     private sealed class TestContextFactory(string connectionString) : IDbContextFactory<JellyfinDbContext>
     {
