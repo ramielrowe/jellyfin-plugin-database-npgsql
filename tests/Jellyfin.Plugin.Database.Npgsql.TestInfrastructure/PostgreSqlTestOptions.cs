@@ -9,6 +9,7 @@ public sealed record PostgreSqlTestOptions
     public const string RequiredEnvironmentVariable = "JELLYFIN_NPGSQL_TEST_REQUIRED";
     public const string WorkerEnvironmentVariable = "JELLYFIN_NPGSQL_TEST_WORKER";
     public const string ContainerImageEnvironmentVariable = "JELLYFIN_NPGSQL_TEST_POSTGRES_IMAGE";
+    public const string ExternalExclusiveEnvironmentVariable = "JELLYFIN_NPGSQL_TEST_EXTERNAL_EXCLUSIVE";
     // Docker Official Image postgres:16.6 multi-platform manifest. The fixture
     // additionally verifies the running server; the digest is not treated as a
     // version assertion by itself.
@@ -23,6 +24,8 @@ public sealed record PostgreSqlTestOptions
     public string? WorkerId { get; init; }
 
     public string ContainerImage { get; init; } = DefaultContainerImage;
+
+    public bool ExternalExclusive { get; init; }
 
     public bool IsConfigured => UseContainer || !string.IsNullOrWhiteSpace(AdministratorConnectionString);
 
@@ -39,13 +42,20 @@ public sealed record PostgreSqlTestOptions
             UseContainer = IsTrue(Environment.GetEnvironmentVariable(UseContainerEnvironmentVariable)),
             Required = IsTrue(Environment.GetEnvironmentVariable(RequiredEnvironmentVariable)),
             WorkerId = Environment.GetEnvironmentVariable(WorkerEnvironmentVariable),
-            ContainerImage = Environment.GetEnvironmentVariable(ContainerImageEnvironmentVariable) ?? DefaultContainerImage
+            ContainerImage = Environment.GetEnvironmentVariable(ContainerImageEnvironmentVariable) ?? DefaultContainerImage,
+            ExternalExclusive = IsTrue(Environment.GetEnvironmentVariable(ExternalExclusiveEnvironmentVariable))
         };
 
         if (options.UseContainer && !string.IsNullOrWhiteSpace(options.AdministratorConnectionString))
         {
             throw new InvalidOperationException(
                 $"Set only one of {AdministratorConnectionEnvironmentVariable} and {UseContainerEnvironmentVariable}; the fixture will never guess which server may be modified.");
+        }
+
+        if (options.UseContainer && options.ExternalExclusive)
+        {
+            throw new InvalidOperationException(
+                $"{ExternalExclusiveEnvironmentVariable} applies only to an explicitly supplied external administrator connection.");
         }
 
         if (options.UseContainer && !IsDigestPinnedImage(options.ContainerImage))

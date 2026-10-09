@@ -200,10 +200,11 @@ public sealed class PostgreSqlTestContainer : IAsyncDisposable
         {
             try
             {
+                await using var scopeLease = await AcquireScopeLeaseAsync(scope, CancellationToken.None).ConfigureAwait(false);
                 containerId ??= await FindContainerIdByLeaseAsync(scope, leaseId).ConfigureAwait(false);
                 if (containerId is not null)
                 {
-                    await RemoveAsync(containerId, identity.ContainerName, redactor, ownerPid, ownerStartTicks, scope, leaseId).ConfigureAwait(false);
+                    await RemoveUnderScopeAsync(containerId, identity.ContainerName, redactor, ownerPid, ownerStartTicks, scope, leaseId).ConfigureAwait(false);
                 }
             }
             finally
@@ -226,7 +227,8 @@ public sealed class PostgreSqlTestContainer : IAsyncDisposable
         _disposed = true;
         try
         {
-            await RemoveAsync(_containerId, ContainerName, _redactor, _ownerPid, _ownerStartTicks, _scope, _leaseId).ConfigureAwait(false);
+            await using var scopeLease = await AcquireScopeLeaseAsync(_scope, CancellationToken.None).ConfigureAwait(false);
+            await RemoveUnderScopeAsync(_containerId, ContainerName, _redactor, _ownerPid, _ownerStartTicks, _scope, _leaseId).ConfigureAwait(false);
         }
         finally
         {
@@ -236,7 +238,7 @@ public sealed class PostgreSqlTestContainer : IAsyncDisposable
         GC.SuppressFinalize(this);
     }
 
-    private static async Task RemoveAsync(
+    private static async Task RemoveUnderScopeAsync(
         string containerId,
         string expectedContainerName,
         SensitiveDataRedactor redactor,
@@ -274,7 +276,8 @@ public sealed class PostgreSqlTestContainer : IAsyncDisposable
         if (!string.Equals(inspect.StandardOutput.Trim(), expectedLabels, StringComparison.Ordinal))
         {
             throw new InvalidOperationException(
-                $"Refusing to remove test container '{expectedContainerName}' because its immutable ID, name, or ownership labels do not match this run.");
+                $"Refusing to remove test container name '{expectedContainerName}' with immutable ID '{containerId}' because its ID, name, or ownership labels do not match. "
+                + $"Inspect that exact ID and remove it manually only after confirming it is disposable: docker inspect {containerId}; docker rm --force {containerId}");
         }
 
         var result = await ExternalCommand.RunAsync(
@@ -287,14 +290,12 @@ public sealed class PostgreSqlTestContainer : IAsyncDisposable
         {
             result.EnsureSuccess("Removing the test-only PostgreSQL container", redactor);
         }
-        else if (result.ExitCode != 0)
-        {
-            throw new InvalidOperationException("Docker could not confirm removal of the exact test container ID.");
-        }
+        // A container which disappeared after exact-ID revalidation was already reclaimed.
     }
 
     private static async Task ReclaimStaleContainersAsync(string scope, CancellationToken cancellationToken)
     {
+        await using var scopeLease = await AcquireScopeLeaseAsync(scope, cancellationToken).ConfigureAwait(false);
         var result = await ExternalCommand.RunAsync(
             "docker",
             new[]
@@ -305,6 +306,7 @@ public sealed class PostgreSqlTestContainer : IAsyncDisposable
             TimeSpan.FromSeconds(30),
             cancellationToken).ConfigureAwait(false);
         result.EnsureSuccess("Discovering stale Npgsql test containers", new SensitiveDataRedactor());
+        var candidates = new List<(string ReportedId, string Name, string LeaseId, int OwnerPid, long OwnerStart)>();
         foreach (var line in result.StandardOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             var fields = line.Split('|');
@@ -317,13 +319,29 @@ public sealed class PostgreSqlTestContainer : IAsyncDisposable
                 || !int.TryParse(fields[3], NumberStyles.None, CultureInfo.InvariantCulture, out var ownerPid)
                 || !long.TryParse(fields[4], NumberStyles.None, CultureInfo.InvariantCulture, out var ownerStart))
             {
-                continue;
+                throw new InvalidOperationException(
+                    $"A managed container in test scope '{scope}' has malformed ownership metadata ('{line}'); refusing to touch any scoped container.");
             }
 
+            candidates.Add((fields[0], fields[1], fields[2], ownerPid, ownerStart));
+        }
+
+        var duplicateLease = candidates.GroupBy(candidate => candidate.LeaseId, StringComparer.Ordinal)
+            .FirstOrDefault(group => group.Count() != 1);
+        if (duplicateLease is not null)
+        {
+            var identities = string.Join(", ", duplicateLease.Select(candidate => $"ID '{candidate.ReportedId}' name '{candidate.Name}'"));
+            throw new InvalidOperationException(
+                $"Multiple managed containers claim lease '{duplicateLease.Key}': {identities}. "
+                + "No container was touched; inspect and remove only the exact disposable IDs.");
+        }
+
+        foreach (var candidate in candidates)
+        {
             FileStream? staleLease = null;
             try
             {
-                staleLease = AcquireOwnerLease(fields[2]);
+                staleLease = AcquireOwnerLease(candidate.LeaseId);
             }
             catch (IOException)
             {
@@ -332,12 +350,47 @@ public sealed class PostgreSqlTestContainer : IAsyncDisposable
 
             using (staleLease)
             {
-                var fullId = await ResolveFullContainerIdAsync(fields[0], cancellationToken).ConfigureAwait(false);
-                await RemoveAsync(fullId, fields[1], new SensitiveDataRedactor(), ownerPid, ownerStart, scope, fields[2]).ConfigureAwait(false);
+                var fullId = await ResolveFullContainerIdAsync(candidate.ReportedId, cancellationToken).ConfigureAwait(false);
+                if (fullId is null)
+                {
+                    DeleteSecretDirectory(Path.Combine(PluginRepository.FindRoot(AppContext.BaseDirectory), ".artifacts", "container-secrets", candidate.LeaseId));
+                    continue;
+                }
+
+                await RemoveUnderScopeAsync(
+                    fullId,
+                    candidate.Name,
+                    new SensitiveDataRedactor(),
+                    candidate.OwnerPid,
+                    candidate.OwnerStart,
+                    scope,
+                    candidate.LeaseId).ConfigureAwait(false);
             }
 
-            DeleteSecretDirectory(Path.Combine(PluginRepository.FindRoot(AppContext.BaseDirectory), ".artifacts", "container-secrets", fields[2]));
+            DeleteSecretDirectory(Path.Combine(PluginRepository.FindRoot(AppContext.BaseDirectory), ".artifacts", "container-secrets", candidate.LeaseId));
         }
+    }
+
+    private static async Task<FileStream> AcquireScopeLeaseAsync(string scope, CancellationToken cancellationToken)
+    {
+        var path = Path.Combine(
+            PluginRepository.FindRoot(AppContext.BaseDirectory),
+            ".artifacts",
+            "container-reclaim",
+            scope + ".lock");
+        for (var attempt = 0; attempt < 600; attempt++)
+        {
+            try
+            {
+                return SecureFileSystem.OpenLease(path);
+            }
+            catch (IOException) when (attempt < 599)
+            {
+                await Task.Delay(50, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        throw new IOException($"Could not acquire the stable container-reclamation lock for test scope '{scope}'.");
     }
 
     private static long GetProcessStartTicks(int processId)
@@ -361,13 +414,19 @@ public sealed class PostgreSqlTestContainer : IAsyncDisposable
     private static string GetLeasePath(string leaseId)
         => Path.Combine(PluginRepository.FindRoot(AppContext.BaseDirectory), ".artifacts", "container-leases", leaseId + ".lock");
 
-    private static async Task<string> ResolveFullContainerIdAsync(string containerId, CancellationToken cancellationToken)
+    private static async Task<string?> ResolveFullContainerIdAsync(string containerId, CancellationToken cancellationToken)
     {
         var result = await ExternalCommand.RunAsync(
             "docker",
             new[] { "inspect", "--format", "{{.Id}}", containerId },
             TimeSpan.FromSeconds(30),
             cancellationToken).ConfigureAwait(false);
+        if (result.ExitCode != 0
+            && result.StandardError.Contains("No such", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
         result.EnsureSuccess("Resolving an immutable stale test container ID", new SensitiveDataRedactor());
         var fullId = result.StandardOutput.Trim();
         if (fullId.Length != 64 || !fullId.All(character => char.IsAsciiHexDigit(character) && !char.IsUpper(character)))
@@ -388,23 +447,32 @@ public sealed class PostgreSqlTestContainer : IAsyncDisposable
                 "--filter", "label=" + ManagedLabel + "=true",
                 "--filter", "label=" + ScopeLabel + "=" + scope,
                 "--filter", "label=" + LeaseLabel + "=" + leaseId,
-                "--format", "{{.ID}}"
+                "--format", "{{.ID}}|{{.Names}}"
             },
             TimeSpan.FromSeconds(30),
             CancellationToken.None).ConfigureAwait(false);
         result.EnsureSuccess("Finding a partially-created test container by its exact lease labels", new SensitiveDataRedactor());
-        var ids = result.StandardOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (ids.Length == 0)
+        var identities = result.StandardOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (identities.Length == 0)
         {
             return null;
         }
 
-        if (ids.Length != 1)
+        if (identities.Length != 1)
         {
-            throw new InvalidOperationException("More than one Docker container reported the unique test lease; refusing cleanup.");
+            throw new InvalidOperationException(
+                $"More than one Docker container reported unique test lease '{leaseId}' in scope '{scope}' (ID|name: {string.Join(", ", identities)}). "
+                + "No container was touched; inspect those exact IDs and remove only confirmed disposable containers.");
         }
 
-        return await ResolveFullContainerIdAsync(ids[0], CancellationToken.None).ConfigureAwait(false);
+        var fields = identities[0].Split('|');
+        if (fields.Length != 2 || !TestResourceNames.IsOwnedContainer(fields[1]))
+        {
+            throw new InvalidOperationException(
+                $"Container lease '{leaseId}' resolved to malformed ID/name identity '{identities[0]}'; no container was touched.");
+        }
+
+        return await ResolveFullContainerIdAsync(fields[0], CancellationToken.None).ConfigureAwait(false);
     }
 
     private static void DeleteSecretDirectory(string path)

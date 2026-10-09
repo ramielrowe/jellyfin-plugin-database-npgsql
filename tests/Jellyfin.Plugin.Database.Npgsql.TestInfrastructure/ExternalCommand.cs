@@ -115,20 +115,7 @@ public static class ExternalCommand
             if (OperatingSystem.IsLinux())
             {
                 var verifiedIdentity = identity ?? LinuxProcessIdentity.Capture(process.Id);
-                var descendants = LinuxProcessIdentity.CaptureDescendants(verifiedIdentity.ProcessId);
-                verifiedIdentity.TerminateGroup(TerminationGracePeriod);
-                foreach (var descendant in descendants)
-                {
-                    if (descendant.IsCurrent())
-                    {
-                        using var descendantProcess = Process.GetProcessById(descendant.ProcessId);
-                        descendantProcess.Kill(entireProcessTree: true);
-                        if (!descendantProcess.WaitForExit(5_000))
-                        {
-                            throw new InvalidOperationException("A detached external-command descendant could not be confirmed terminated.");
-                        }
-                    }
-                }
+                verifiedIdentity.TerminateTree(TerminationGracePeriod);
             }
             else
             {

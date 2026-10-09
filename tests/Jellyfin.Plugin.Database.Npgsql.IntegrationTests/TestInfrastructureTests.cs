@@ -84,6 +84,21 @@ public sealed class TestInfrastructureTests
     }
 
     [Fact]
+    public async Task ExternalPostgreSqlWithoutExclusiveContract_FailsBeforeConnectionOrMutation()
+    {
+        var options = new PostgreSqlTestOptions
+        {
+            AdministratorConnectionString = "Host=203.0.113.1;Database=jellyfin_npgsql_test_admin;Username=test;Password=not-used",
+            ExternalExclusive = false
+        };
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PostgreSqlTestEnvironment.CreateAsync(options, TestContext.Current.CancellationToken));
+        Assert.Contains(PostgreSqlTestOptions.ExternalExclusiveEnvironmentVariable, exception.Message, StringComparison.Ordinal);
+        Assert.Contains("No connection or mutation", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task PristinePublishAndPluginInstall_AreRelocatableAndIntegrityChecked()
     {
         var tempRoot = CreateTemporaryDirectory();
@@ -321,6 +336,25 @@ public sealed class TestInfrastructureTests
     public void HostRequests_AcceptRelativeTargets()
         => Assert.True(JellyfinHostProcess.IsSafeRelativeRequestTarget("Startup/User"));
 
+    [Fact]
+    public void ListenerParser_AcceptsOnlyOneExactLoopbackListener()
+    {
+        const int Port = 8096;
+        const string Loopback4 = " 0: 0100007F:1FA0 00000000:0000 0A 0:0 00:00000000 00000000 1000 0 12345";
+        const string Wildcard4 = " 0: 00000000:1FA0 00000000:0000 0A 0:0 00:00000000 00000000 1000 0 12346";
+        const string NonLoopback4 = " 0: 0200007F:1FA0 00000000:0000 0A 0:0 00:00000000 00000000 1000 0 12347";
+        const string Loopback6 = " 0: 00000000000000000000000001000000:1FA0 00000000000000000000000000000000:0000 0A 0:0 00:00000000 00000000 1000 0 12348";
+
+        Assert.True(JellyfinHostProcess.TryFindSingleLoopbackListenerInode([Loopback4], [], Port, out var ipv4Inode));
+        Assert.Equal("12345", ipv4Inode);
+        Assert.True(JellyfinHostProcess.TryFindSingleLoopbackListenerInode([], [Loopback6], Port, out var ipv6Inode));
+        Assert.Equal("12348", ipv6Inode);
+        Assert.False(JellyfinHostProcess.TryFindSingleLoopbackListenerInode([Wildcard4], [], Port, out _));
+        Assert.False(JellyfinHostProcess.TryFindSingleLoopbackListenerInode([NonLoopback4], [], Port, out _));
+        Assert.False(JellyfinHostProcess.TryFindSingleLoopbackListenerInode([Loopback4, Wildcard4], [], Port, out _));
+        Assert.False(JellyfinHostProcess.TryFindSingleLoopbackListenerInode([Loopback4], [Loopback6], Port, out _));
+    }
+
     [Theory]
     [InlineData("0")]
     [InlineData("65536")]
@@ -337,6 +371,18 @@ public sealed class TestInfrastructureTests
             TimeSpan.FromSeconds(5),
             TestContext.Current.CancellationToken);
         Assert.NotEqual(0, result.ExitCode);
+    }
+
+    [Fact]
+    public async Task SmokeShellCleanup_TerminatesDetachedProcessGroupAndInheritedPipes()
+    {
+        var root = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var result = await ExternalCommand.RunAsync(
+            "/bin/bash",
+            new[] { Path.Combine(root, "tests", "black-box-smoke.sh"), "--test-detached-cleanup" },
+            TimeSpan.FromSeconds(20),
+            TestContext.Current.CancellationToken);
+        result.EnsureSuccess("Running the detached-child shell cleanup regression", new SensitiveDataRedactor());
     }
 
     [Fact]
@@ -383,6 +429,82 @@ public sealed class TestInfrastructureTests
         Assert.Equal(0, result.ExitCode);
         Assert.InRange(result.StandardOutput.Length, 1, 1024 * 1024);
         Assert.InRange(result.StandardError.Length, 1, 1024 * 1024);
+    }
+
+    [Fact]
+    public async Task HostOutputStreaming_BoundsNewlineFreeFloodAndRedactsAcrossChunks()
+    {
+        const string Secret = "cross-chunk-host-secret";
+        var root = CreateTemporaryDirectory();
+        try
+        {
+            var sourcePath = Path.Combine(root, "stdout-flood.log");
+            var destinationPath = Path.Combine(root, "sanitized.log");
+            await using (var source = new FileStream(sourcePath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                var flood = Enumerable.Repeat((byte)'x', 8192).ToArray();
+                await source.WriteAsync(flood.AsMemory(0, 4090), TestContext.Current.CancellationToken);
+                await source.WriteAsync(Encoding.UTF8.GetBytes(Secret), TestContext.Current.CancellationToken);
+                for (var index = 0; index < 2048; index++)
+                {
+                    await source.WriteAsync(flood, TestContext.Current.CancellationToken);
+                }
+            }
+
+            using var input = new StreamReader(sourcePath, Encoding.UTF8, false, 4096);
+            await using var outputStream = new FileStream(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+            await using var output = new StreamWriter(outputStream, new UTF8Encoding(false), 4096, leaveOpen: true);
+            await JellyfinHostProcess.CopySanitizedOutputAsync(input, output, new SensitiveDataRedactor(Secret), 1024 * 1024);
+            Assert.InRange(outputStream.Length, 1, 1024 * 1024);
+            var sanitized = await File.ReadAllTextAsync(destinationPath, TestContext.Current.CancellationToken);
+            Assert.Contains("<redacted>", sanitized, StringComparison.Ordinal);
+            Assert.DoesNotContain(Secret, sanitized, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task LogCollection_StreamsHugeFilesWithinPerFileLimit()
+    {
+        const string Secret = "cross-chunk-log-secret";
+        var tempRoot = CreateTemporaryDirectory();
+        try
+        {
+            var source = Path.Combine(tempRoot, "source");
+            Directory.CreateDirectory(source);
+            await File.WriteAllTextAsync(Path.Combine(source, "jellyfin.dll"), "host", TestContext.Current.CancellationToken);
+            var hash = await PristineJellyfinPublish.HashDirectoryAsync(source, TestContext.Current.CancellationToken);
+            var publish = await PristineJellyfinPublish.CreateAsync(
+                new PristineJellyfinPublishOptions { PublishDirectory = source, Sha256 = hash },
+                Path.Combine(tempRoot, "publish"),
+                TestContext.Current.CancellationToken);
+            var layout = JellyfinHostLayout.Create(Path.Combine(tempRoot, "artifacts"), publish);
+            var log = Path.Combine(layout.LogDirectory, "huge.log");
+            await using (var stream = new FileStream(log, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                var chunk = Enumerable.Repeat((byte)'z', 8192).ToArray();
+                await stream.WriteAsync(chunk.AsMemory(0, 4090), TestContext.Current.CancellationToken);
+                await stream.WriteAsync(Encoding.UTF8.GetBytes(Secret), TestContext.Current.CancellationToken);
+                for (var index = 0; index < 2048; index++)
+                {
+                    await stream.WriteAsync(chunk, TestContext.Current.CancellationToken);
+                }
+            }
+
+            layout.CollectSanitizedLogs(new SensitiveDataRedactor(Secret));
+            var retained = Assert.Single(Directory.EnumerateFiles(layout.CollectedLogDirectory));
+            Assert.InRange(new FileInfo(retained).Length, 1, 4 * 1024 * 1024);
+            var retainedText = await File.ReadAllTextAsync(retained, TestContext.Current.CancellationToken);
+            Assert.Contains("<redacted>", retainedText, StringComparison.Ordinal);
+            Assert.DoesNotContain(Secret, retainedText, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
     }
 
     [Fact]

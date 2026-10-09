@@ -204,9 +204,7 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             {
                 // One request timed out; the bounded readiness deadline still applies.
             }
-            catch (InvalidOperationException) when (
-                _processIdentity.IsCurrent()
-                && GetListenerProcessGroups(BaseAddress.Port).Count == 0)
+            catch (ListenerNotReadyException) when (_processIdentity.IsCurrent())
             {
                 // The verified process is alive but has not opened its listener yet.
             }
@@ -346,13 +344,26 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
 
     private void EnsureOwnsEndpoint()
     {
-        var listenerGroups = GetListenerProcessGroups(BaseAddress.Port);
-        if (_process.HasExited
-            || !_processIdentity.IsCurrent()
-            || !listenerGroups.Contains(_processIdentity.ProcessGroupId))
+        var status = InspectListener(BaseAddress.Port, out var inode);
+        if (status == ListenerStatus.Missing && !_process.HasExited && _processIdentity.IsCurrent())
+        {
+            throw new ListenerNotReadyException();
+        }
+
+        var listenerGroups = status == ListenerStatus.Valid ? GetListenerProcessGroups(inode!) : [];
+        if (status == ListenerStatus.Valid
+            && listenerGroups.Count == 0
+            && !_process.HasExited
+            && _processIdentity.IsCurrent())
+        {
+            throw new ListenerNotReadyException();
+        }
+
+        if (_process.HasExited || !_processIdentity.IsCurrent() || !listenerGroups.Contains(_processIdentity.ProcessGroupId))
         {
             throw new InvalidOperationException(
-                "The launched Jellyfin process no longer owns its leased endpoint; refusing to issue an API request. "
+                "The launched Jellyfin process does not own one exact loopback listener on its leased endpoint; refusing to issue an API request. "
+                + $"Listener validation: {status}. "
                 + $"Expected process group {_processIdentity.ProcessGroupId}; observed listener groups: "
                 + (listenerGroups.Count == 0 ? "none" : string.Join(',', listenerGroups)) + ".");
         }
@@ -366,8 +377,7 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             throw new PlatformNotSupportedException("Process-owned listener verification currently requires Linux /proc.");
         }
 
-        var inode = FindLoopbackListenerInode(port);
-        if (inode is null)
+        if (InspectListener(port, out var inode) != ListenerStatus.Valid)
         {
             return false;
         }
@@ -393,12 +403,16 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
 
     private static HashSet<int> GetListenerProcessGroups(int port)
     {
-        var inode = FindLoopbackListenerInode(port);
-        if (inode is null)
+        if (InspectListener(port, out var inode) != ListenerStatus.Valid)
         {
             return [];
         }
 
+        return GetListenerProcessGroups(inode!);
+    }
+
+    private static HashSet<int> GetListenerProcessGroups(string inode)
+    {
         var processGroups = new HashSet<int>();
         foreach (var processDirectory in Directory.EnumerateDirectories("/proc"))
         {
@@ -428,29 +442,93 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         return processGroups;
     }
 
-    private static string? FindLoopbackListenerInode(int port)
+    private static ListenerStatus InspectListener(int port, out string? inode)
     {
-        var expectedPort = port.ToString("X4", System.Globalization.CultureInfo.InvariantCulture);
-        foreach (var table in new[] { "/proc/net/tcp", "/proc/net/tcp6" })
+        var ipv4 = File.Exists("/proc/net/tcp") ? File.ReadLines("/proc/net/tcp").Skip(1).ToArray() : [];
+        var ipv6 = File.Exists("/proc/net/tcp6") ? File.ReadLines("/proc/net/tcp6").Skip(1).ToArray() : [];
+        if (TryFindSingleLoopbackListenerInode(ipv4, ipv6, port, out inode))
         {
-            if (!File.Exists(table))
-            {
-                continue;
-            }
+            return ListenerStatus.Valid;
+        }
 
-            foreach (var line in File.ReadLines(table).Skip(1))
+        return ContainsListeningPort(ipv4, port) || ContainsListeningPort(ipv6, port)
+            ? ListenerStatus.Rejected
+            : ListenerStatus.Missing;
+    }
+
+    public static bool TryFindSingleLoopbackListenerInode(
+        IEnumerable<string> ipv4Lines,
+        IEnumerable<string> ipv6Lines,
+        int port,
+        out string? inode)
+    {
+        ValidatePort(port, nameof(port));
+        ArgumentNullException.ThrowIfNull(ipv4Lines);
+        ArgumentNullException.ThrowIfNull(ipv6Lines);
+        var expectedPort = port.ToString("X4", System.Globalization.CultureInfo.InvariantCulture);
+        var listeners = new List<(string Address, string Inode, bool Ipv6)>();
+        AddListeners(ipv4Lines, ipv6: false);
+        AddListeners(ipv6Lines, ipv6: true);
+        if (listeners.Count != 1)
+        {
+            inode = null;
+            return false;
+        }
+
+        var listener = listeners[0];
+        var loopback = listener.Ipv6
+            ? string.Equals(listener.Address, "00000000000000000000000001000000", StringComparison.OrdinalIgnoreCase)
+            : string.Equals(listener.Address, "0100007F", StringComparison.OrdinalIgnoreCase);
+        inode = loopback ? listener.Inode : null;
+        return loopback;
+
+        void AddListeners(IEnumerable<string> lines, bool ipv6)
+        {
+            foreach (var line in lines)
             {
                 var fields = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-                if (fields.Length > 9
-                    && fields[1].EndsWith(":" + expectedPort, StringComparison.OrdinalIgnoreCase)
-                    && string.Equals(fields[3], "0A", StringComparison.Ordinal))
+                if (fields.Length <= 9 || !string.Equals(fields[3], "0A", StringComparison.Ordinal))
                 {
-                    return fields[9];
+                    continue;
+                }
+
+                var endpoint = fields[1].Split(':', StringSplitOptions.None);
+                if (endpoint.Length == 2 && string.Equals(endpoint[1], expectedPort, StringComparison.OrdinalIgnoreCase))
+                {
+                    listeners.Add((endpoint[0], fields[9], ipv6));
+                }
+            }
+        }
+    }
+
+    private static bool ContainsListeningPort(IEnumerable<string> lines, int port)
+    {
+        var expectedPort = port.ToString("X4", System.Globalization.CultureInfo.InvariantCulture);
+        foreach (var line in lines)
+        {
+            var fields = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            if (fields.Length > 3 && string.Equals(fields[3], "0A", StringComparison.Ordinal))
+            {
+                var endpoint = fields[1].Split(':', StringSplitOptions.None);
+                if (endpoint.Length == 2 && string.Equals(endpoint[1], expectedPort, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
                 }
             }
         }
 
-        return null;
+        return false;
+    }
+
+    private enum ListenerStatus
+    {
+        Missing,
+        Valid,
+        Rejected
+    }
+
+    private sealed class ListenerNotReadyException : InvalidOperationException
+    {
     }
 
     private static async Task CopySanitizedAsync(
@@ -461,25 +539,37 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         string streamName,
         OutputBudget outputBudget)
     {
-        string? line;
+        var streamingRedactor = redactor.CreateStreamingRedactor();
+        var buffer = new char[4096];
+        var wrotePrefix = false;
         try
         {
-            while ((line = await source.ReadLineAsync().ConfigureAwait(false)) is not null)
+            while (true)
             {
-                var sanitized = $"[{streamName}] {redactor.Redact(line)}{Environment.NewLine}";
-                if (!outputBudget.TryReserve(Encoding.UTF8.GetByteCount(sanitized)))
+                var count = await source.ReadAsync(buffer).ConfigureAwait(false);
+                var sanitized = streamingRedactor.Redact(buffer.AsSpan(0, count), final: count == 0);
+                if (!wrotePrefix)
                 {
-                    continue;
+                    sanitized = $"[{streamName}] " + sanitized;
+                    wrotePrefix = true;
                 }
 
-                await outputLock.WaitAsync().ConfigureAwait(false);
-                try
+                if (sanitized.Length != 0 && outputBudget.TryReserve(Encoding.UTF8.GetByteCount(sanitized)))
                 {
-                    await destination.WriteAsync(sanitized).ConfigureAwait(false);
+                    await outputLock.WaitAsync().ConfigureAwait(false);
+                    try
+                    {
+                        await destination.WriteAsync(sanitized).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        outputLock.Release();
+                    }
                 }
-                finally
+
+                if (count == 0)
                 {
-                    outputLock.Release();
+                    break;
                 }
             }
         }
@@ -487,6 +577,26 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         {
             // Bounded shutdown closes inherited pipes retained by descendants.
         }
+    }
+
+    public static async Task CopySanitizedOutputAsync(
+        StreamReader source,
+        StreamWriter destination,
+        SensitiveDataRedactor redactor,
+        int maximumBytes,
+        string streamName = "test")
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(destination);
+        ArgumentNullException.ThrowIfNull(redactor);
+        if (maximumBytes < 1 || maximumBytes > 16 * 1024 * 1024)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maximumBytes));
+        }
+
+        using var outputLock = new SemaphoreSlim(1, 1);
+        await CopySanitizedAsync(source, destination, outputLock, redactor, streamName, new OutputBudget(maximumBytes)).ConfigureAwait(false);
+        await destination.FlushAsync().ConfigureAwait(false);
     }
 
     private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
@@ -566,6 +676,11 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
                 var remaining = Volatile.Read(ref _remainingBytes);
                 if (bytes > remaining)
                 {
+                    if (Interlocked.CompareExchange(ref _remainingBytes, 0, remaining) != remaining)
+                    {
+                        continue;
+                    }
+
                     return false;
                 }
 

@@ -17,7 +17,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
 {
     private const int RuntimeConnectionLimit = 6;
     private const string OwnershipMarkerPrefix = "jellyfin-npgsql-test-owner|";
-    private readonly string _administratorConnectionString;
+    private readonly PostgreSqlClusterLease _clusterLease;
     private readonly NpgsqlDataSource _runtimeDataSource;
     private readonly string _leaseId;
     private readonly FileStream _ownerLease;
@@ -26,7 +26,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
     private bool _disposed;
 
     private PostgreSqlTestDatabase(
-        string administratorConnectionString,
+        PostgreSqlClusterLease clusterLease,
         string runtimeConnectionString,
         TestResourceIdentity identity,
         NpgsqlDataSource runtimeDataSource,
@@ -35,7 +35,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
         uint roleOid,
         FileStream ownerLease)
     {
-        _administratorConnectionString = administratorConnectionString;
+        _clusterLease = clusterLease;
         RuntimeConnectionString = runtimeConnectionString;
         Identity = identity;
         _runtimeDataSource = runtimeDataSource;
@@ -58,14 +58,14 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
     public static string TestScope => GetScope();
 
     public static async Task<PostgreSqlTestDatabase> CreateAsync(
-        string administratorConnectionString,
+        PostgreSqlClusterLease clusterLease,
         string? workerId,
         CancellationToken cancellationToken,
         Action<TestResourceIdentity>? resourceCreated = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var administratorBuilder = ValidateAdministratorConnectionString(administratorConnectionString);
-        var normalizedAdministratorConnection = administratorBuilder.ConnectionString;
+        ArgumentNullException.ThrowIfNull(clusterLease);
+        var administratorBuilder = ValidateAdministratorConnectionString(clusterLease.ConnectionString);
         var identity = TestResourceNames.Create(workerId);
         var runtimePassword = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
         var leaseId = Guid.NewGuid().ToString("N");
@@ -79,45 +79,37 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
 
         try
         {
-            await using (var administratorDataSource = NpgsqlDataSource.Create(normalizedAdministratorConnection))
-            await using (var connection = await administratorDataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false))
-            await using (var command = connection.CreateCommand())
+            await clusterLease.RunAsync(async (connection, token) =>
             {
-                command.CommandText = "SELECT rolsuper OR (rolcreatedb AND rolcreaterole) FROM pg_catalog.pg_roles WHERE rolname = current_user";
-                if (await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not true)
-                {
-                    throw new InvalidOperationException(
-                        "The explicit PostgreSQL test administrator must have CREATEDB and CREATEROLE (or be the isolated container administrator).");
-                }
-
+                await using var command = connection.CreateCommand();
                 command.CommandText = "CREATE ROLE " + QuoteOwnedRole(identity.RoleName)
                     + " LOGIN PASSWORD " + QuoteLiteral(runtimePassword)
                     + " NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS CONNECTION LIMIT "
                     + RuntimeConnectionLimit;
-                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
                 roleCreated = true;
                 command.CommandText = "COMMENT ON ROLE " + QuoteOwnedRole(identity.RoleName)
                     + " IS " + QuoteLiteral(CurrentOwnershipMarker(leaseId));
-                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
                 command.CommandText = "SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1";
                 command.Parameters.AddWithValue(identity.RoleName);
-                roleOid = (uint)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+                roleOid = (uint)(await command.ExecuteScalarAsync(token).ConfigureAwait(false))!;
                 command.Parameters.Clear();
 
                 command.CommandText = "CREATE DATABASE " + QuoteOwnedDatabase(identity.DatabaseName)
                     + " OWNER " + QuoteOwnedRole(identity.RoleName)
                     + " CONNECTION LIMIT = 8";
-                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
                 databaseCreated = true;
                 command.CommandText = "COMMENT ON DATABASE " + QuoteOwnedDatabase(identity.DatabaseName)
                     + " IS " + QuoteLiteral(CurrentOwnershipMarker(leaseId));
-                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                await command.ExecuteNonQueryAsync(token).ConfigureAwait(false);
                 command.CommandText = "SELECT oid FROM pg_catalog.pg_database WHERE datname = $1 AND datdba::bigint = $2";
                 command.Parameters.AddWithValue(identity.DatabaseName);
                 command.Parameters.AddWithValue((long)roleOid.Value);
-                databaseOid = (uint)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+                databaseOid = (uint)(await command.ExecuteScalarAsync(token).ConfigureAwait(false))!;
                 command.Parameters.Clear();
-            }
+            }, cancellationToken).ConfigureAwait(false);
 
             resourceCreated?.Invoke(identity);
             cancellationToken.ThrowIfCancellationRequested();
@@ -154,13 +146,13 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
             }
 
             var result = new PostgreSqlTestDatabase(
-                normalizedAdministratorConnection,
+                clusterLease,
                 runtimeConnectionString,
                 identity,
                 runtimeDataSource,
                 leaseId,
-                databaseOid.Value,
-                roleOid.Value,
+                databaseOid.GetValueOrDefault(),
+                roleOid.GetValueOrDefault(),
                 ownerLease);
             ownershipTransferred = true;
             return result;
@@ -168,7 +160,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
         catch (OperationCanceledException)
         {
             await CleanupFailedCreationAsync(
-                normalizedAdministratorConnection,
+                clusterLease,
                 runtimeDataSource,
                 identity,
                 databaseCreated,
@@ -181,7 +173,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
         catch (Exception ex) when (ex is NpgsqlException or TimeoutException)
         {
             await CleanupFailedCreationAsync(
-                normalizedAdministratorConnection,
+                clusterLease,
                 runtimeDataSource,
                 identity,
                 databaseCreated,
@@ -199,7 +191,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
         catch
         {
             await CleanupFailedCreationAsync(
-                normalizedAdministratorConnection,
+                clusterLease,
                 runtimeDataSource,
                 identity,
                 databaseCreated,
@@ -219,13 +211,13 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
     }
 
     public static async Task<PostgreSqlTestDatabase[]> CreateManyAsync(
-        string administratorConnectionString,
+        PostgreSqlClusterLease clusterLease,
         IEnumerable<string> workerIds,
         CancellationToken cancellationToken,
         Action<string, TestResourceIdentity>? resourceCreated = null)
     {
         var tasks = workerIds.Select(workerId => CreateAsync(
-            administratorConnectionString,
+            clusterLease,
             workerId,
             cancellationToken,
             identity => resourceCreated?.Invoke(workerId, identity))).ToArray();
@@ -332,88 +324,88 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
     }
 
     public static async Task ReclaimStaleResourcesAsync(
-        string administratorConnectionString,
+        PostgreSqlClusterLease clusterLease,
         CancellationToken cancellationToken)
     {
-        var builder = ValidateAdministratorConnectionString(administratorConnectionString);
-        await using var reclaimLease = await AcquireReclaimLeaseAsync(cancellationToken).ConfigureAwait(false);
-        var staleResources = new List<(TestResourceIdentity Identity, string LeaseId, uint DatabaseOid, uint RoleOid)>();
-        var staleRoles = new List<(string RoleName, string LeaseId, uint RoleOid)>();
-        await using (var connection = new NpgsqlConnection(builder.ConnectionString))
+        ArgumentNullException.ThrowIfNull(clusterLease);
+        await clusterLease.RunAsync(async (connection, token) =>
         {
-            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-            await using var command = connection.CreateCommand();
-            command.CommandText = "SELECT d.datname, r.rolname, shobj_description(d.oid, 'pg_database'), "
-                + "shobj_description(r.oid, 'pg_authid'), d.oid, r.oid FROM pg_catalog.pg_database d "
-                + "JOIN pg_catalog.pg_roles r ON r.oid = d.datdba "
-                + "WHERE d.datname LIKE 'jellyfin_test_db_%' AND r.rolname LIKE 'jellyfin_test_role_%'";
-            await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+            var staleResources = new List<(TestResourceIdentity Identity, string LeaseId, uint DatabaseOid, uint RoleOid)>();
+            var staleRoles = new List<(string RoleName, string LeaseId, uint RoleOid)>();
+            await using (var command = connection.CreateCommand())
             {
-                while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                command.CommandText = "SELECT d.datname, r.rolname, shobj_description(d.oid, 'pg_database'), "
+                    + "shobj_description(r.oid, 'pg_authid'), d.oid, r.oid FROM pg_catalog.pg_database d "
+                    + "JOIN pg_catalog.pg_roles r ON r.oid = d.datdba "
+                    + "WHERE d.datname LIKE 'jellyfin_test_db_%' AND r.rolname LIKE 'jellyfin_test_role_%'";
+                await using (var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false))
                 {
-                    var name = reader.GetString(0);
-                    var role = reader.GetString(1);
-                    var databaseMarker = reader.IsDBNull(2) ? null : reader.GetString(2);
-                    var roleMarker = reader.IsDBNull(3) ? null : reader.GetString(3);
-                    var suffix = name[TestResourceNames.DatabasePrefix.Length..];
-                    if (TestResourceNames.IsOwnedDatabase(name)
-                        && TestResourceNames.IsOwnedRole(role)
-                        && string.Equals(role, TestResourceNames.RolePrefix + suffix, StringComparison.Ordinal)
-                        && string.Equals(databaseMarker, roleMarker, StringComparison.Ordinal)
-                        && IsStaleOwnershipMarker(databaseMarker, out var leaseId))
+                    while (await reader.ReadAsync(token).ConfigureAwait(false))
                     {
-                        staleResources.Add((
-                            new TestResourceIdentity(name, role, TestResourceNames.ContainerPrefix + Guid.NewGuid().ToString("N")),
-                            leaseId,
-                            reader.GetFieldValue<uint>(4),
-                            reader.GetFieldValue<uint>(5)));
+                        var name = reader.GetString(0);
+                        var role = reader.GetString(1);
+                        var databaseMarker = reader.IsDBNull(2) ? null : reader.GetString(2);
+                        var roleMarker = reader.IsDBNull(3) ? null : reader.GetString(3);
+                        var suffix = name[TestResourceNames.DatabasePrefix.Length..];
+                        if (TestResourceNames.IsOwnedDatabase(name)
+                            && TestResourceNames.IsOwnedRole(role)
+                            && string.Equals(role, TestResourceNames.RolePrefix + suffix, StringComparison.Ordinal)
+                            && string.Equals(databaseMarker, roleMarker, StringComparison.Ordinal)
+                            && IsStaleOwnershipMarker(databaseMarker, out var leaseId))
+                        {
+                            staleResources.Add((
+                                new TestResourceIdentity(name, role, TestResourceNames.ContainerPrefix + Guid.NewGuid().ToString("N")),
+                                leaseId,
+                                reader.GetFieldValue<uint>(4),
+                                reader.GetFieldValue<uint>(5)));
+                        }
+                    }
+                }
+
+                command.CommandText = "SELECT r.rolname, shobj_description(r.oid, 'pg_authid'), r.oid "
+                    + "FROM pg_catalog.pg_roles r LEFT JOIN pg_catalog.pg_database d ON d.datdba = r.oid "
+                    + "WHERE r.rolname LIKE 'jellyfin_test_role_%' AND d.oid IS NULL";
+                await using var roleReader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+                while (await roleReader.ReadAsync(token).ConfigureAwait(false))
+                {
+                    var roleName = roleReader.GetString(0);
+                    var marker = roleReader.IsDBNull(1) ? null : roleReader.GetString(1);
+                    if (TestResourceNames.IsOwnedRole(roleName) && IsStaleOwnershipMarker(marker, out var leaseId))
+                    {
+                        staleRoles.Add((roleName, leaseId, roleReader.GetFieldValue<uint>(2)));
                     }
                 }
             }
 
-            command.CommandText = "SELECT r.rolname, shobj_description(r.oid, 'pg_authid'), r.oid "
-                + "FROM pg_catalog.pg_roles r LEFT JOIN pg_catalog.pg_database d ON d.datdba = r.oid "
-                + "WHERE r.rolname LIKE 'jellyfin_test_role_%' AND d.oid IS NULL";
-            await using var roleReader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-            while (await roleReader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            foreach (var stale in staleResources)
             {
-                var roleName = roleReader.GetString(0);
-                var marker = roleReader.IsDBNull(1) ? null : roleReader.GetString(1);
-                if (TestResourceNames.IsOwnedRole(roleName) && IsStaleOwnershipMarker(marker, out var leaseId))
-                {
-                    staleRoles.Add((roleName, leaseId, roleReader.GetFieldValue<uint>(2)));
-                }
+                using var staleLease = AcquireOwnerLease(stale.LeaseId);
+                await DropResourcesUnderLeaseAsync(
+                    connection,
+                    stale.Identity,
+                    true,
+                    true,
+                    stale.LeaseId,
+                    stale.DatabaseOid,
+                    stale.RoleOid).ConfigureAwait(false);
             }
-        }
 
-        foreach (var stale in staleResources)
-        {
-            using var staleLease = AcquireOwnerLease(stale.LeaseId);
-            await DropResourcesAsync(
-                builder.ConnectionString,
-                stale.Identity,
-                true,
-                true,
-                stale.LeaseId,
-                stale.DatabaseOid,
-                stale.RoleOid).ConfigureAwait(false);
-        }
-
-        foreach (var staleRole in staleRoles)
-        {
-            using var staleLease = AcquireOwnerLease(staleRole.LeaseId);
-            await DropResourcesAsync(
-                builder.ConnectionString,
-                new TestResourceIdentity(
-                    TestResourceNames.DatabasePrefix + Guid.NewGuid().ToString("N"),
-                    staleRole.RoleName,
-                    TestResourceNames.ContainerPrefix + Guid.NewGuid().ToString("N")),
-                false,
-                true,
-                staleRole.LeaseId,
-                null,
-                staleRole.RoleOid).ConfigureAwait(false);
-        }
+            foreach (var staleRole in staleRoles)
+            {
+                using var staleLease = AcquireOwnerLease(staleRole.LeaseId);
+                await DropResourcesUnderLeaseAsync(
+                    connection,
+                    new TestResourceIdentity(
+                        TestResourceNames.DatabasePrefix + Guid.NewGuid().ToString("N"),
+                        staleRole.RoleName,
+                        TestResourceNames.ContainerPrefix + Guid.NewGuid().ToString("N")),
+                    false,
+                    true,
+                    staleRole.LeaseId,
+                    null,
+                    staleRole.RoleOid).ConfigureAwait(false);
+            }
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     public static async Task ValidateServerVersionAsync(
@@ -445,7 +437,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
         try
         {
             await _runtimeDataSource.DisposeAsync().ConfigureAwait(false);
-            await DropResourcesAsync(_administratorConnectionString, Identity, true, true, _leaseId, _databaseOid, _roleOid).ConfigureAwait(false);
+            await DropResourcesAsync(_clusterLease, Identity, true, true, _leaseId, _databaseOid, _roleOid).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is NpgsqlException or TimeoutException)
         {
@@ -513,25 +505,6 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
         return SecureFileSystem.OpenLease(path);
     }
 
-    private static async Task<FileStream> AcquireReclaimLeaseAsync(CancellationToken cancellationToken)
-    {
-        var path = GetLeasePath("database-reclaim", GetScope() + ".lock");
-        SecureFileSystem.CreateDirectory(Path.GetDirectoryName(path)!);
-        for (var attempt = 0; attempt < 100; attempt++)
-        {
-            try
-            {
-                return SecureFileSystem.OpenLease(path);
-            }
-            catch (IOException) when (attempt < 99)
-            {
-                await Task.Delay(50, cancellationToken).ConfigureAwait(false);
-            }
-        }
-
-        throw new IOException("Could not acquire the scoped stale-database reclamation lease.");
-    }
-
     private static string GetLeasePath(string category, string name)
         => Path.Combine(PluginRepository.FindRoot(AppContext.BaseDirectory), ".artifacts", category, name);
 
@@ -542,7 +515,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
     }
 
     private static async Task CleanupFailedCreationAsync(
-        string administratorConnectionString,
+        PostgreSqlClusterLease clusterLease,
         NpgsqlDataSource? runtimeDataSource,
         TestResourceIdentity identity,
         bool dropDatabase,
@@ -566,7 +539,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
         try
         {
             await DropResourcesAsync(
-                administratorConnectionString,
+                clusterLease,
                 identity,
                 dropDatabase,
                 dropRole,
@@ -583,7 +556,7 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
     }
 
     private static async Task DropResourcesAsync(
-        string administratorConnectionString,
+        PostgreSqlClusterLease clusterLease,
         TestResourceIdentity identity,
         bool dropDatabase,
         bool dropRole,
@@ -593,86 +566,109 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
     {
         TestResourceNames.EnsureOwnedDatabase(identity.DatabaseName);
         TestResourceNames.EnsureOwnedRole(identity.RoleName);
-        await using var connection = new NpgsqlConnection(administratorConnectionString);
-        await connection.OpenAsync(CancellationToken.None).ConfigureAwait(false);
+        await clusterLease.RunAsync(
+            (connection, _) => DropResourcesUnderLeaseAsync(
+                connection,
+                identity,
+                dropDatabase,
+                dropRole,
+                leaseId,
+                expectedDatabaseOid,
+                expectedRoleOid),
+            CancellationToken.None).ConfigureAwait(false);
+    }
+
+    private static async Task DropResourcesUnderLeaseAsync(
+        NpgsqlConnection connection,
+        TestResourceIdentity identity,
+        bool dropDatabase,
+        bool dropRole,
+        string leaseId,
+        uint? expectedDatabaseOid,
+        uint? expectedRoleOid)
+    {
+        TestResourceNames.EnsureOwnedDatabase(identity.DatabaseName);
+        TestResourceNames.EnsureOwnedRole(identity.RoleName);
         var expectedMarker = CurrentOwnershipMarker(leaseId);
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT d.oid, d.datdba, shobj_description(d.oid, 'pg_database'), r.oid, "
-            + "shobj_description(r.oid, 'pg_authid') FROM pg_catalog.pg_database d "
-            + "JOIN pg_catalog.pg_roles r ON r.oid = d.datdba WHERE d.datname = $1 AND r.rolname = $2";
+        command.CommandText = "SELECT oid, datdba, shobj_description(oid, 'pg_database') "
+            + "FROM pg_catalog.pg_database WHERE datname = $1";
         command.Parameters.AddWithValue(identity.DatabaseName);
-        command.Parameters.AddWithValue(identity.RoleName);
-        uint databaseOid;
-        uint roleOid;
+        uint? databaseOid = null;
+        uint? databaseOwnerOid = null;
+        string? databaseMarker = null;
         await using (var reader = await command.ExecuteReaderAsync(CancellationToken.None).ConfigureAwait(false))
         {
-            if (!await reader.ReadAsync(CancellationToken.None).ConfigureAwait(false))
-            {
-                if (dropDatabase)
-                {
-                    return;
-                }
-
-                databaseOid = 0;
-                roleOid = 0;
-            }
-            else
+            if (await reader.ReadAsync(CancellationToken.None).ConfigureAwait(false))
             {
                 databaseOid = reader.GetFieldValue<uint>(0);
-                var ownerOid = reader.GetFieldValue<uint>(1);
-                roleOid = reader.GetFieldValue<uint>(3);
-                if (ownerOid != roleOid
-                    || (expectedDatabaseOid.HasValue && databaseOid != expectedDatabaseOid.Value)
-                    || (expectedRoleOid.HasValue && roleOid != expectedRoleOid.Value)
-                    || reader.IsDBNull(2)
-                    || reader.IsDBNull(4)
-                    || !string.Equals(reader.GetString(2), expectedMarker, StringComparison.Ordinal)
-                    || !string.Equals(reader.GetString(4), expectedMarker, StringComparison.Ordinal))
-                {
-                    throw new InvalidOperationException("Refusing PostgreSQL cleanup because the exact lease marker and paired owner identity no longer match.");
-                }
+                databaseOwnerOid = reader.GetFieldValue<uint>(1);
+                databaseMarker = reader.IsDBNull(2) ? null : reader.GetString(2);
             }
         }
 
         command.Parameters.Clear();
-        if (!dropDatabase && dropRole && roleOid == 0)
+        command.CommandText = "SELECT oid, shobj_description(oid, 'pg_authid') FROM pg_catalog.pg_roles WHERE rolname = $1";
+        command.Parameters.AddWithValue(identity.RoleName);
+        uint? roleOid = null;
+        string? roleMarker = null;
+        await using (var reader = await command.ExecuteReaderAsync(CancellationToken.None).ConfigureAwait(false))
         {
-            command.CommandText = "SELECT oid, shobj_description(oid, 'pg_authid') FROM pg_catalog.pg_roles WHERE rolname = $1";
-            command.Parameters.AddWithValue(identity.RoleName);
-            await using (var reader = await command.ExecuteReaderAsync(CancellationToken.None).ConfigureAwait(false))
+            if (await reader.ReadAsync(CancellationToken.None).ConfigureAwait(false))
             {
-                if (!await reader.ReadAsync(CancellationToken.None).ConfigureAwait(false))
-                {
-                    return;
-                }
-
                 roleOid = reader.GetFieldValue<uint>(0);
-                if ((expectedRoleOid.HasValue && roleOid != expectedRoleOid.Value)
-                    || reader.IsDBNull(1)
-                    || !string.Equals(reader.GetString(1), expectedMarker, StringComparison.Ordinal))
-                {
-                    throw new InvalidOperationException("Refusing PostgreSQL role cleanup because its exact lease marker no longer matches.");
-                }
+                roleMarker = reader.IsDBNull(1) ? null : reader.GetString(1);
             }
         }
 
+        if (databaseOid.HasValue
+            && (!roleOid.HasValue
+                || databaseOwnerOid != roleOid
+                || (expectedDatabaseOid.HasValue && databaseOid != expectedDatabaseOid)
+                || (expectedRoleOid.HasValue && roleOid != expectedRoleOid)
+                || !string.Equals(databaseMarker, expectedMarker, StringComparison.Ordinal)
+                || !string.Equals(roleMarker, expectedMarker, StringComparison.Ordinal)))
+        {
+            throw new InvalidOperationException(
+                $"Refusing cleanup of PostgreSQL database '{identity.DatabaseName}' and role '{identity.RoleName}': "
+                + "their exact OIDs, paired ownership, and lease markers do not match this harness lease.");
+        }
+
+        if (!databaseOid.HasValue
+            && roleOid.HasValue
+            && ((expectedRoleOid.HasValue && roleOid != expectedRoleOid)
+                || !string.Equals(roleMarker, expectedMarker, StringComparison.Ordinal)))
+        {
+            throw new InvalidOperationException(
+                $"Refusing cleanup of PostgreSQL role '{identity.RoleName}': its exact OID and lease marker do not match this harness lease.");
+        }
+
         command.Parameters.Clear();
-        if (dropDatabase && databaseOid != 0)
+        if (dropDatabase && databaseOid.HasValue)
         {
             var tombstone = TestResourceNames.Create("drop").DatabaseName;
             command.CommandText = "ALTER DATABASE " + QuoteOwnedDatabase(identity.DatabaseName) + " RENAME TO " + QuoteOwnedDatabase(tombstone);
             await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
-            command.CommandText = "SELECT datdba, shobj_description(oid, 'pg_database') FROM pg_catalog.pg_database WHERE datname = $1 AND oid::bigint = $2";
+            command.CommandText = "SELECT d.datdba, shobj_description(d.oid, 'pg_database'), r.oid, "
+                + "shobj_description(r.oid, 'pg_authid') FROM pg_catalog.pg_database d "
+                + "JOIN pg_catalog.pg_roles r ON r.oid = d.datdba "
+                + "WHERE d.datname = $1 AND d.oid::bigint = $2 AND r.rolname = $3";
             command.Parameters.AddWithValue(tombstone);
-            command.Parameters.AddWithValue((long)databaseOid);
+            command.Parameters.AddWithValue((long)databaseOid.Value);
+            command.Parameters.AddWithValue(identity.RoleName);
             await using (var reader = await command.ExecuteReaderAsync(CancellationToken.None).ConfigureAwait(false))
             {
                 if (!await reader.ReadAsync(CancellationToken.None).ConfigureAwait(false)
                     || reader.GetFieldValue<uint>(0) != roleOid
                     || reader.IsDBNull(1)
-                    || !string.Equals(reader.GetString(1), expectedMarker, StringComparison.Ordinal))
+                    || !string.Equals(reader.GetString(1), expectedMarker, StringComparison.Ordinal)
+                    || reader.GetFieldValue<uint>(2) != roleOid
+                    || reader.IsDBNull(3)
+                    || !string.Equals(reader.GetString(3), expectedMarker, StringComparison.Ordinal))
                 {
-                    throw new InvalidOperationException("Refusing to drop a claimed PostgreSQL database because its immutable identity changed.");
+                    throw new InvalidOperationException(
+                        $"Refusing to drop claimed PostgreSQL database '{tombstone}' (originally '{identity.DatabaseName}'): "
+                        + "its exact OID, owner, or lease marker changed.");
                 }
             }
 
@@ -681,18 +677,33 @@ public sealed class PostgreSqlTestDatabase : IAsyncDisposable
             await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
         }
 
-        if (dropRole && roleOid != 0)
+        if (dropRole && roleOid.HasValue)
         {
             var roleTombstone = TestResourceNames.Create("drop").RoleName;
+            command.Parameters.Clear();
+            command.CommandText = "SELECT shobj_description(oid, 'pg_authid') FROM pg_catalog.pg_roles "
+                + "WHERE rolname = $1 AND oid::bigint = $2";
+            command.Parameters.AddWithValue(identity.RoleName);
+            command.Parameters.AddWithValue((long)roleOid.Value);
+            var currentMarker = await command.ExecuteScalarAsync(CancellationToken.None).ConfigureAwait(false) as string;
+            if (!string.Equals(currentMarker, expectedMarker, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Refusing to claim PostgreSQL role '{identity.RoleName}': its exact OID or lease marker changed.");
+            }
+
+            command.Parameters.Clear();
             command.CommandText = "ALTER ROLE " + QuoteOwnedRole(identity.RoleName) + " RENAME TO " + QuoteOwnedRole(roleTombstone);
             await command.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
             command.CommandText = "SELECT shobj_description(oid, 'pg_authid') FROM pg_catalog.pg_roles WHERE rolname = $1 AND oid::bigint = $2";
             command.Parameters.AddWithValue(roleTombstone);
-            command.Parameters.AddWithValue((long)roleOid);
+            command.Parameters.AddWithValue((long)roleOid.Value);
             var marker = await command.ExecuteScalarAsync(CancellationToken.None).ConfigureAwait(false) as string;
             if (!string.Equals(marker, expectedMarker, StringComparison.Ordinal))
             {
-                throw new InvalidOperationException("Refusing to drop a claimed PostgreSQL role because its immutable identity changed.");
+                throw new InvalidOperationException(
+                    $"Refusing to drop claimed PostgreSQL role '{roleTombstone}' (originally '{identity.RoleName}'): "
+                    + "its exact OID or lease marker changed.");
             }
 
             command.Parameters.Clear();

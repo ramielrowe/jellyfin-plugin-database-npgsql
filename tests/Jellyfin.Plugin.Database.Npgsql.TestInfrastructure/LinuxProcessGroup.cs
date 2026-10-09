@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -146,6 +147,83 @@ internal sealed record LinuxProcessIdentity(int ProcessId, int ParentProcessId, 
             {
                 throw new InvalidOperationException("Could not send KILL to the verified test process group.");
             }
+        }
+    }
+
+    public void TerminateTree(TimeSpan gracePeriod)
+    {
+        if (!IsCurrent() || ProcessGroupId != ProcessId)
+        {
+            throw new InvalidOperationException("Refusing to terminate a process tree whose root identity changed.");
+        }
+
+        var identities = new List<LinuxProcessIdentity> { this };
+        identities.AddRange(CaptureDescendants(ProcessId));
+        var groups = identities.GroupBy(identity => identity.ProcessGroupId).ToArray();
+        foreach (var group in groups)
+        {
+            var leader = group.FirstOrDefault(identity => identity.ProcessId == group.Key);
+            if (leader is not null && leader.IsCurrent())
+            {
+                SignalVerifiedGroup(leader, 15);
+            }
+            else
+            {
+                foreach (var identity in group.Where(identity => identity.IsCurrent()))
+                {
+                    SignalVerifiedProcess(identity, 15);
+                }
+            }
+        }
+
+        var deadline = DateTime.UtcNow + gracePeriod;
+        while (DateTime.UtcNow < deadline && identities.Exists(identity => identity.IsCurrent()))
+        {
+            Thread.Sleep(50);
+        }
+
+        foreach (var identity in identities.Where(identity => identity.IsCurrent()))
+        {
+            SignalVerifiedProcess(identity, 9);
+        }
+
+        deadline = DateTime.UtcNow + gracePeriod;
+        while (DateTime.UtcNow < deadline && identities.Exists(identity => identity.IsCurrent()))
+        {
+            Thread.Sleep(50);
+        }
+
+        var survivor = identities.FirstOrDefault(identity => identity.IsCurrent());
+        if (survivor is not null)
+        {
+            throw new InvalidOperationException(
+                $"Could not confirm termination of external-command descendant PID {survivor.ProcessId} with start time {survivor.StartTime}.");
+        }
+    }
+
+    private static void SignalVerifiedGroup(LinuxProcessIdentity leader, int signal)
+    {
+        if (!leader.IsCurrent() || leader.ProcessId != leader.ProcessGroupId)
+        {
+            throw new InvalidOperationException("Refusing to signal a process group whose leader identity changed.");
+        }
+
+        if (kill(-leader.ProcessGroupId, signal) != 0 && Marshal.GetLastPInvokeError() != 3)
+        {
+            throw new InvalidOperationException($"Could not send signal {signal} to a verified test process group.");
+        }
+    }
+
+    private static void SignalVerifiedProcess(LinuxProcessIdentity identity, int signal)
+    {
+        if (!identity.IsCurrent())
+        {
+            return;
+        }
+
+        if (kill(identity.ProcessId, signal) != 0 && Marshal.GetLastPInvokeError() != 3)
+        {
+            throw new InvalidOperationException($"Could not send signal {signal} to verified test-process PID {identity.ProcessId}.");
         }
     }
 

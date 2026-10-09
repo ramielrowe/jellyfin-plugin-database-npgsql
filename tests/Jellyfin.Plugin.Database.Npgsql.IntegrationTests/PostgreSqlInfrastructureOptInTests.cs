@@ -1,9 +1,9 @@
 using System;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
-using Npgsql;
 using Xunit;
 
 namespace Jellyfin.Plugin.Database.Npgsql.IntegrationTests;
@@ -23,12 +23,9 @@ public sealed class PostgreSqlInfrastructureOptInTests
         var orphanIdentity = TestResourceNames.Create("orphan");
         var staleMarker = "jellyfin-npgsql-test-owner|" + PostgreSqlTestDatabase.TestScope + "|00000000000000000000000000000000";
         var decoyMarker = "jellyfin-npgsql-test-owner|" + PostgreSqlTestDatabase.TestScope + "|11111111111111111111111111111111";
-        await using (var connection = new NpgsqlConnection(environment.AdministratorConnectionString))
-        {
-            await connection.OpenAsync(cancellationToken);
-            await using var command = connection.CreateCommand();
-            foreach (var statement in new[]
-                     {
+        await environment.ExecuteAdministrativeControlsAsync(
+            new[]
+            {
                          $"CREATE ROLE \"{crashedIdentity.RoleName}\" NOLOGIN",
                          $"COMMENT ON ROLE \"{crashedIdentity.RoleName}\" IS '{staleMarker}'",
                          $"CREATE DATABASE \"{crashedIdentity.DatabaseName}\" OWNER \"{crashedIdentity.RoleName}\"",
@@ -39,14 +36,10 @@ public sealed class PostgreSqlInfrastructureOptInTests
                          $"COMMENT ON DATABASE \"{markerDecoyIdentity.DatabaseName}\" IS '{decoyMarker}'",
                          $"CREATE ROLE \"{orphanIdentity.RoleName}\" NOLOGIN",
                          $"COMMENT ON ROLE \"{orphanIdentity.RoleName}\" IS '{staleMarker}'"
-                     })
-            {
-                command.CommandText = statement;
-                await command.ExecuteNonQueryAsync(cancellationToken);
-            }
-        }
+            },
+            cancellationToken);
 
-        await PostgreSqlTestDatabase.ReclaimStaleResourcesAsync(environment.AdministratorConnectionString, cancellationToken);
+        await environment.ReclaimStaleResourcesAsync(cancellationToken);
         Assert.False(await PostgreSqlTestDatabase.DatabaseExistsAsync(
             environment.AdministratorConnectionString,
             crashedIdentity.DatabaseName,
@@ -63,15 +56,11 @@ public sealed class PostgreSqlInfrastructureOptInTests
             environment.AdministratorConnectionString,
             markerDecoyIdentity.DatabaseName,
             cancellationToken));
-        await using (var connection = new NpgsqlConnection(environment.AdministratorConnectionString))
-        {
-            await connection.OpenAsync(cancellationToken);
-            await using var command = connection.CreateCommand();
-            command.CommandText = $"COMMENT ON DATABASE \"{markerDecoyIdentity.DatabaseName}\" IS '{staleMarker}'";
-            await command.ExecuteNonQueryAsync(cancellationToken);
-        }
+        await environment.ExecuteAdministrativeControlAsync(
+            $"COMMENT ON DATABASE \"{markerDecoyIdentity.DatabaseName}\" IS '{staleMarker}'",
+            cancellationToken);
 
-        await PostgreSqlTestDatabase.ReclaimStaleResourcesAsync(environment.AdministratorConnectionString, cancellationToken);
+        await environment.ReclaimStaleResourcesAsync(cancellationToken);
         Assert.False(await PostgreSqlTestDatabase.DatabaseExistsAsync(
             environment.AdministratorConnectionString,
             markerDecoyIdentity.DatabaseName,
@@ -80,6 +69,48 @@ public sealed class PostgreSqlInfrastructureOptInTests
             environment.AdministratorConnectionString,
             markerDecoyIdentity.RoleName,
             cancellationToken));
+
+        var competingLeaseError = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => PostgreSqlClusterLease.AcquireAsync(
+                environment.AdministratorConnectionString,
+                harnessOwnsContainer: options.UseContainer,
+                externalExclusiveOptIn: options.ExternalExclusive,
+                cancellationToken));
+        Assert.Contains("mutation lease", competingLeaseError.Message, StringComparison.Ordinal);
+
+        TestResourceIdentity? replacedIdentity = null;
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => environment.CreateDatabasesAsync(
+                new[] { "replacement-race" },
+                cancellationToken,
+                (_, identity) =>
+                {
+                    replacedIdentity = identity;
+                    environment.ExecuteAdministrativeControlsAsync(
+                            new[]
+                            {
+                                $"DROP DATABASE \"{identity.DatabaseName}\" WITH (FORCE)",
+                                $"DROP ROLE \"{identity.RoleName}\"",
+                                $"CREATE ROLE \"{identity.RoleName}\" NOLOGIN",
+                                $"CREATE DATABASE \"{identity.DatabaseName}\" OWNER \"{identity.RoleName}\""
+                            },
+                            CancellationToken.None)
+                        .GetAwaiter()
+                        .GetResult();
+                }));
+        Assert.NotNull(replacedIdentity);
+        Assert.True(await PostgreSqlTestDatabase.DatabaseExistsAsync(
+            environment.AdministratorConnectionString,
+            replacedIdentity.DatabaseName,
+            cancellationToken));
+        await environment.ExecuteAdministrativeControlsAsync(
+            new[]
+            {
+                $"DROP DATABASE \"{replacedIdentity.DatabaseName}\" WITH (FORCE)",
+                $"DROP ROLE \"{replacedIdentity.RoleName}\""
+            },
+            cancellationToken);
+
         if (options.UseContainer)
         {
             var stale = TestResourceNames.Create("stale").ContainerName;
@@ -122,16 +153,106 @@ public sealed class PostgreSqlInfrastructureOptInTests
                     .Where(id => !string.IsNullOrWhiteSpace(id))
                     .Select(id => id!)
                     .ToArray();
-                _ = await ExternalCommand.RunAsync(
-                    "docker",
-                    new[] { "rm", "--force" }.Concat(immutableIds),
-                    TimeSpan.FromSeconds(30),
-                    CancellationToken.None);
+                if (immutableIds.Length != 0)
+                {
+                    var removal = await ExternalCommand.RunAsync(
+                        "docker",
+                        new[] { "rm", "--force" }.Concat(immutableIds),
+                        TimeSpan.FromSeconds(30),
+                        CancellationToken.None);
+                    removal.EnsureSuccess("Removing stale-container test controls", new SensitiveDataRedactor());
+                }
+            }
+
+            var duplicateLease = "22222222222222222222222222222222";
+            var duplicateNames = new[]
+            {
+                TestResourceNames.Create("duplicate-a").ContainerName,
+                TestResourceNames.Create("duplicate-b").ContainerName
+            };
+            var duplicateIds = new System.Collections.Generic.List<string>();
+            try
+            {
+                foreach (var duplicateName in duplicateNames)
+                {
+                    var create = await ExternalCommand.RunAsync(
+                        "docker",
+                        new[]
+                        {
+                            "create", "--name", duplicateName,
+                            "--label", "org.jellyfin.database-npgsql.test-managed=true",
+                            "--label", "org.jellyfin.database-npgsql.test-scope=" + PostgreSqlTestContainer.TestScope,
+                            "--label", "org.jellyfin.database-npgsql.owner-lease=" + duplicateLease,
+                            "--label", "org.jellyfin.database-npgsql.owner-pid=2147483647",
+                            "--label", "org.jellyfin.database-npgsql.owner-start=0",
+                            options.ContainerImage
+                        },
+                        TimeSpan.FromMinutes(2),
+                        cancellationToken);
+                    create.EnsureSuccess("Creating duplicate-lease container controls", new SensitiveDataRedactor());
+                    duplicateIds.Add(create.StandardOutput.Trim());
+                }
+
+                var duplicateError = await Assert.ThrowsAsync<InvalidOperationException>(
+                    () => PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken));
+                Assert.Contains(duplicateLease, duplicateError.Message, StringComparison.Ordinal);
+                foreach (var duplicateId in duplicateIds)
+                {
+                    Assert.True(await DockerContainerExistsAsync(duplicateId, cancellationToken));
+                }
+            }
+            finally
+            {
+                if (duplicateIds.Count != 0)
+                {
+                    var removal = await ExternalCommand.RunAsync(
+                        "docker",
+                        new[] { "rm", "--force" }.Concat(duplicateIds),
+                        TimeSpan.FromSeconds(30),
+                        CancellationToken.None);
+                    removal.EnsureSuccess("Removing duplicate-lease container controls", new SensitiveDataRedactor());
+                }
+            }
+
+            var root = PluginRepository.FindRoot(AppContext.BaseDirectory);
+            var targetFrameworkDirectory = new DirectoryInfo(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar));
+            var configuration = targetFrameworkDirectory.Parent?.Name
+                ?? throw new InvalidOperationException("Could not resolve the current test build configuration.");
+            var helper = Path.Combine(
+                root,
+                "tests",
+                "Jellyfin.Plugin.Database.Npgsql.TestHarness",
+                "bin",
+                configuration,
+                "net10.0",
+                "Jellyfin.Plugin.Database.Npgsql.TestHarness.dll");
+            var childEnvironment = new System.Collections.Generic.Dictionary<string, string?>
+            {
+                [PostgreSqlTestOptions.UseContainerEnvironmentVariable] = "true",
+                [PostgreSqlTestOptions.AdministratorConnectionEnvironmentVariable] = null,
+                [PostgreSqlTestOptions.RequiredEnvironmentVariable] = "true",
+                [PostgreSqlTestOptions.ContainerImageEnvironmentVariable] = options.ContainerImage
+            };
+            var childA = ExternalCommand.RunAsync(
+                "dotnet",
+                new[] { helper, "container-cycle", "process-a" },
+                TimeSpan.FromMinutes(3),
+                cancellationToken,
+                childEnvironment);
+            var childB = ExternalCommand.RunAsync(
+                "dotnet",
+                new[] { helper, "container-cycle", "process-b" },
+                TimeSpan.FromMinutes(3),
+                cancellationToken,
+                childEnvironment);
+            var childResults = await Task.WhenAll(childA, childB);
+            foreach (var child in childResults)
+            {
+                child.EnsureSuccess("Running a true parallel container-backed worker", new SensitiveDataRedactor());
             }
         }
 
-        var databases = await PostgreSqlTestDatabase.CreateManyAsync(
-            environment.AdministratorConnectionString,
+        var databases = await environment.CreateDatabasesAsync(
             new[] { "worker-a", "worker-b" },
             cancellationToken);
         var first = databases[0];
@@ -173,8 +294,7 @@ public sealed class PostgreSqlInfrastructureOptInTests
 
         var partialIdentities = new System.Collections.Concurrent.ConcurrentDictionary<string, TestResourceIdentity>();
         await Assert.ThrowsAsync<InvalidOperationException>(
-            () => PostgreSqlTestDatabase.CreateManyAsync(
-                environment.AdministratorConnectionString,
+            () => environment.CreateDatabasesAsync(
                 new[] { "partial-success", "partial-failure" },
                 cancellationToken,
                 (worker, identity) =>
@@ -201,9 +321,7 @@ public sealed class PostgreSqlInfrastructureOptInTests
         TestResourceIdentity? failedIdentity = null;
         const string FailureMessage = "deliberate setup callback failure";
         var failure = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => PostgreSqlTestDatabase.CreateAsync(
-                environment.AdministratorConnectionString,
-                "worker-failure",
+            () => environment.CreateDatabaseAsync(
                 cancellationToken,
                 identity =>
                 {
@@ -224,9 +342,7 @@ public sealed class PostgreSqlInfrastructureOptInTests
         using var cancellationSource = new CancellationTokenSource();
         TestResourceIdentity? cancelledIdentity = null;
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => PostgreSqlTestDatabase.CreateAsync(
-                environment.AdministratorConnectionString,
-                "worker-cancelled",
+            () => environment.CreateDatabaseAsync(
                 cancellationSource.Token,
                 identity =>
                 {

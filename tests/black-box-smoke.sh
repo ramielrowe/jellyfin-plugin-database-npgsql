@@ -3,6 +3,8 @@ set -euo pipefail
 umask 077
 
 PLUGIN_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=process-tree-cleanup.sh
+source "$PLUGIN_ROOT/tests/process-tree-cleanup.sh"
 
 docker() {
     command timeout --foreground 65s docker "$@"
@@ -27,6 +29,33 @@ if [ "${1:-}" = "--validate-port" ]; then
     exit
 fi
 
+if [ "${1:-}" = "--test-detached-cleanup" ]; then
+    test_root=$(mktemp -d)
+    pid_file="$test_root/detached.pid"
+    setsid --wait sh -c "setsid sh -c 'trap \"\" TERM; echo \$\$ > \"$pid_file\"; sleep 30' & sleep 30" &
+    test_pid=$!
+    for _ in $(seq 1 100); do
+        [ -s "$pid_file" ] && break
+        sleep 0.01
+    done
+    read -r test_pgid test_start < <(python3 - "$test_pid" <<'PY'
+import pathlib, sys
+data = pathlib.Path('/proc', sys.argv[1], 'stat').read_text()
+fields = data[data.rfind(')') + 2:].split()
+print(fields[2], fields[19])
+PY
+)
+    terminate_recorded_process_tree "$test_pid" "$test_pgid" "$test_start"
+    wait "$test_pid" 2>/dev/null || true
+    detached_pid=$(cat "$pid_file")
+    if [ -r "/proc/$detached_pid/stat" ]; then
+        echo "FAIL: detached-child cleanup regression left PID $detached_pid alive" >&2
+        exit 1
+    fi
+    rm -rf "$test_root"
+    exit 0
+fi
+
 HOST_INPUT_MODE=""
 HOST_REPOSITORY=""
 HOST_PUBLISH=""
@@ -46,6 +75,7 @@ else
     exit 1
 fi
 SMOKE_ID="$(date -u +%Y%m%d%H%M%S)-$$-$(tr -d '-' </proc/sys/kernel/random/uuid)"
+SMOKE_SCOPE=$(printf '%s' "$PLUGIN_ROOT" | sha256sum | cut -d' ' -f1)
 RUN_ROOT="$PLUGIN_ROOT/.artifacts/smoke-$SMOKE_ID"
 POSTGRES_CONTAINER="jellyfin-npgsql-smoke-$SMOKE_ID"
 CONTAINER_LEASE_ROOT="$PLUGIN_ROOT/.artifacts/container-leases"
@@ -53,6 +83,12 @@ mkdir -p -m 700 "$CONTAINER_LEASE_ROOT"
 chmod 700 "$CONTAINER_LEASE_ROOT"
 exec {CONTAINER_LEASE_FD}>"$CONTAINER_LEASE_ROOT/$SMOKE_ID.lock"
 flock -n "$CONTAINER_LEASE_FD" || { echo "FAIL: could not acquire this smoke run's container lease" >&2; exit 1; }
+CONTAINER_SCOPE_LOCK_ROOT="$PLUGIN_ROOT/.artifacts/container-reclaim"
+mkdir -p -m 700 "$CONTAINER_SCOPE_LOCK_ROOT"
+chmod 700 "$CONTAINER_SCOPE_LOCK_ROOT"
+exec {CONTAINER_SCOPE_LOCK_FD}>"$CONTAINER_SCOPE_LOCK_ROOT/$SMOKE_SCOPE.lock"
+chmod 600 "$CONTAINER_SCOPE_LOCK_ROOT/$SMOKE_SCOPE.lock"
+flock "$CONTAINER_SCOPE_LOCK_FD" || { echo "FAIL: could not acquire the stable scope-wide container lock" >&2; exit 1; }
 PORT_LEASE_ROOT="$PLUGIN_ROOT/.artifacts/port-leases"
 mkdir -p -m 700 "$PORT_LEASE_ROOT"
 chmod 700 "$PORT_LEASE_ROOT"
@@ -115,7 +151,6 @@ HOST_START=""
 HOST_PGID=""
 POSTGRES_CONTAINER_ID=""
 OWNER_START=$(awk '{print $22}' "/proc/$$/stat")
-SMOKE_SCOPE=$(printf '%s' "$PLUGIN_ROOT" | sha256sum | cut -d' ' -f1)
 export NUGET_PACKAGES NUGET_HTTP_CACHE_PATH
 mkdir -p -m 700 "$RUN_ROOT"
 chmod 700 "$RUN_ROOT"
@@ -126,10 +161,24 @@ cleanup() {
     set +e
     terminate_host_group || original_status=1
 
-    if [[ "$POSTGRES_CONTAINER_ID" =~ ^[0-9a-f]{64}$ ]] \
-        && [ "$(docker inspect --format '{{.Id}}|{{.Name}}|{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-managed"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-scope"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-lease"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-pid"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-start"}}' "$POSTGRES_CONTAINER_ID" 2>/dev/null || true)" = "$POSTGRES_CONTAINER_ID|/$POSTGRES_CONTAINER|true|$SMOKE_SCOPE|$SMOKE_ID|$$|$OWNER_START" ]; then
-        docker rm --force "$POSTGRES_CONTAINER_ID" >/dev/null 2>&1 || original_status=1
+    if [[ "$POSTGRES_CONTAINER_ID" =~ ^[0-9a-f]{64}$ ]]; then
+        local inspected inspect_status
+        inspected=$(docker inspect --format '{{.Id}}|{{.Name}}|{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-managed"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-scope"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-lease"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-pid"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-start"}}' "$POSTGRES_CONTAINER_ID" 2>&1)
+        inspect_status=$?
+        if [ "$inspect_status" -eq 0 ]; then
+            if [ "$inspected" != "$POSTGRES_CONTAINER_ID|/$POSTGRES_CONTAINER|true|$SMOKE_SCOPE|$SMOKE_ID|$$|$OWNER_START" ]; then
+                echo "FAIL: container cleanup identity mismatch for exact ID '$POSTGRES_CONTAINER_ID' and expected name '$POSTGRES_CONTAINER'. No removal attempted. Inspect with: docker inspect $POSTGRES_CONTAINER_ID" >&2
+                original_status=1
+            elif ! docker rm --force "$POSTGRES_CONTAINER_ID" >/dev/null; then
+                echo "FAIL: could not remove exact test container ID '$POSTGRES_CONTAINER_ID' (name '$POSTGRES_CONTAINER'); retry: docker rm --force $POSTGRES_CONTAINER_ID" >&2
+                original_status=1
+            fi
+        elif [[ "$inspected" != *"No such"* ]]; then
+            echo "FAIL: could not inspect exact test container ID '$POSTGRES_CONTAINER_ID' (name '$POSTGRES_CONTAINER'): $inspected" >&2
+            original_status=1
+        fi
     fi
+    eval "exec ${CONTAINER_SCOPE_LOCK_FD}>&-"
     eval "exec ${CONTAINER_LEASE_FD}>&-"
     eval "exec ${POSTGRES_PORT_LEASE_FD}>&-"
     eval "exec ${HTTP_PORT_LEASE_FD}>&-"
@@ -153,25 +202,58 @@ import pathlib, sys
 source, retained, secret_file = sys.argv[1:]
 source, retained = pathlib.Path(source), pathlib.Path(retained)
 secrets = sorted((item.encode() for item in pathlib.Path(secret_file).read_text().splitlines() if item), key=len, reverse=True)
+private_key = b"PRIVATE KEY-----"
+maximum_pattern = max([len(private_key), *(len(item) for item in secrets)])
 files = list(source.glob("*.log"))
 evidence = source / "evidence.txt"
 if evidence.exists():
     files.append(evidence)
 unsafe = False
 for path in files:
-    data = path.read_bytes()
-    if b"PRIVATE KEY-----" in data:
-        unsafe = True
-        continue
-    for secret in secrets:
-        data = data.replace(secret, b"<redacted>")
     destination = retained / path.name
-    destination.write_bytes(data[:4 * 1024 * 1024])
+    pending = b""
+    private_tail = b""
+    written = 0
+    with path.open("rb") as input_file, destination.open("xb") as output_file:
+        while written < 4 * 1024 * 1024:
+            chunk = input_file.read(65536)
+            final = not chunk
+            private_window = private_tail + chunk
+            if private_key in private_window:
+                unsafe = True
+                break
+            private_tail = b"" if final else private_window[-(len(private_key) - 1):]
+            combined = pending + chunk
+            process_limit = len(combined) if final else max(0, len(combined) - maximum_pattern + 1)
+            output = bytearray()
+            position = 0
+            while position < process_limit:
+                match = next((secret for secret in secrets if combined.startswith(secret, position)), None)
+                if match is None:
+                    output.append(combined[position])
+                    position += 1
+                else:
+                    output.extend(b"<redacted>")
+                    position += len(match)
+            pending = combined[position:]
+            if final:
+                output.extend(pending)
+                pending = b""
+            kept = output[:4 * 1024 * 1024 - written]
+            output_file.write(kept)
+            written += len(kept)
+            if final:
+                break
     destination.chmod(0o600)
 for path in retained.iterdir():
-    data = path.read_bytes()
-    if any(secret in data for secret in secrets) or b"PRIVATE KEY-----" in data:
-        unsafe = True
+    tails = {pattern: b"" for pattern in [private_key, *secrets]}
+    with path.open("rb") as retained_file:
+        while chunk := retained_file.read(65536):
+            for pattern in tails:
+                window = tails[pattern] + chunk
+                if pattern in window:
+                    unsafe = True
+                tails[pattern] = window[-(len(pattern) - 1):] if len(pattern) > 1 else b""
 if unsafe:
     for path in retained.iterdir():
         path.unlink()
@@ -324,7 +406,7 @@ launch_host_process() {
     local environment_file=$1
     local log_file=$2
     shift 2
-    setsid --wait python3 -c 'import os, pathlib, signal, subprocess, sys
+    setsid --wait python3 -c 'import os, pathlib, subprocess, sys
 environment_path, log_path, *command = sys.argv[1:]
 for name in ("PGUSER", "PGPASSWORD", "PGPASSFILE", "PGSSLCERT", "PGSSLKEY", "PGSSLROOTCERT", "PGCLIENTENCODING", "PGTZ", "PGOPTIONS", "PGTARGETSESSIONATTRS", "PGSSLNEGOTIATION", "PGGSSENCMODE", "PGREQUIREAUTH", "PGAPPNAME"):
     os.environ.pop(name, None)
@@ -335,7 +417,6 @@ for item in open(environment_path, "rb").read().split(b"\0"):
 os.unlink(environment_path)
 limit = 16 * 1024 * 1024
 written = 0
-signal.signal(signal.SIGTERM, lambda _signum, _frame: None)
 with pathlib.Path(log_path).open("xb") as output:
     os.chmod(log_path, 0o600)
     child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=os.environ)
@@ -370,35 +451,8 @@ terminate_host_group() {
     fi
 
     assert_host_identity
-    kill -TERM -- "-$HOST_PGID" || return 1
-    for _ in $(seq 1 100); do
-        kill -0 -- "-$HOST_PGID" 2>/dev/null || break
-        sleep 0.1
-    done
-    if kill -0 -- "-$HOST_PGID" 2>/dev/null; then
-        local stat member_pid member_pgid member_start current_start
-        for stat in /proc/[0-9]*/stat; do
-            [ -r "$stat" ] || continue
-            read -r member_pid member_pgid member_start < <(awk '{print $1, $5, $22}' "$stat") || continue
-            [ "$member_pgid" = "$HOST_PGID" ] && [ "$member_pid" != "$HOST_PID" ] || continue
-            current_start=$(awk '{print $22}' "$stat" 2>/dev/null || true)
-            [ "$current_start" = "$member_start" ] || continue
-            kill -KILL "$member_pid" 2>/dev/null || true
-        done
-        for _ in $(seq 1 50); do
-            kill -0 "$HOST_PID" 2>/dev/null || break
-            sleep 0.1
-        done
-        if kill -0 "$HOST_PID" 2>/dev/null; then
-            assert_host_identity
-            kill -KILL "$HOST_PID" || return 1
-        fi
-    fi
+    terminate_recorded_process_tree "$HOST_PID" "$HOST_PGID" "$HOST_START" || return 1
     wait "$HOST_PID" 2>/dev/null || true
-    if kill -0 -- "-$HOST_PGID" 2>/dev/null; then
-        echo "FAIL: could not confirm termination of the Jellyfin process group" >&2
-        return 1
-    fi
     HOST_PID="" HOST_START="" HOST_PGID=""
 }
 
@@ -444,7 +498,16 @@ assert_log_redacted() {
         [ -n "$sensitive" ] || continue
         if printf '%s' "$sensitive" | python3 -c 'import pathlib, sys
 secret = sys.stdin.buffer.read()
-raise SystemExit(0 if secret and secret in pathlib.Path(sys.argv[1]).read_bytes() else 1)' "$log_file"; then
+tail = b""
+found = False
+with pathlib.Path(sys.argv[1]).open("rb") as stream:
+    while chunk := stream.read(65536):
+        window = tail + chunk
+        if secret and secret in window:
+            found = True
+            break
+        tail = window[-(len(secret) - 1):] if len(secret) > 1 else b""
+raise SystemExit(0 if found else 1)' "$log_file"; then
             fail "startup log exposed sensitive configuration from $log_file"
         fi
     done

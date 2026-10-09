@@ -131,36 +131,23 @@ public sealed class JellyfinHostLayout
                      .Concat(Directory.EnumerateFiles(RunRoot, "process*.log", SearchOption.TopDirectoryOnly)))
         {
             var relative = Path.GetRelativePath(RunRoot, source);
-            var sourceBytes = File.ReadAllBytes(source);
-            if (sourceBytes.Length > MaximumEvidenceFileBytes)
-            {
-                Array.Resize(ref sourceBytes, MaximumEvidenceFileBytes);
-            }
-
-            var sourceText = Encoding.UTF8.GetString(sourceBytes);
-            if (sourceText.Contains("PRIVATE KEY-----", StringComparison.Ordinal))
-            {
-                DeleteCollectedEvidence();
-                throw new InvalidOperationException("A private key was detected in test output; no failure artifacts were retained.");
-            }
-
-            var sanitized = redactor.Redact(sourceText);
-            if (redactor.ContainsKnownSecret(sanitized))
-            {
-                DeleteCollectedEvidence();
-                throw new InvalidOperationException("A generated secret survived redaction; no failure artifacts were retained.");
-            }
-
-            var bytes = Encoding.UTF8.GetByteCount(sanitized);
-            if (retainedBytes + bytes > MaximumEvidenceBytes)
+            var remaining = Math.Min(MaximumEvidenceFileBytes, MaximumEvidenceBytes - retainedBytes);
+            if (remaining <= 0)
             {
                 break;
             }
 
-            retainedBytes += bytes;
             var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(relative))).ToLowerInvariant()[..16];
             var safeName = new string(Path.GetFileName(source).Select(character => char.IsAsciiLetterOrDigit(character) || character is '.' or '-' ? character : '_').ToArray());
-            SecureFileSystem.WriteAllTextAtomic(Path.Combine(CollectedLogDirectory, hash + "-" + safeName), sanitized);
+            try
+            {
+                retainedBytes += CopySanitizedLog(source, Path.Combine(CollectedLogDirectory, hash + "-" + safeName), redactor, remaining);
+            }
+            catch
+            {
+                DeleteCollectedEvidence();
+                throw;
+            }
         }
     }
 
@@ -203,17 +190,75 @@ public sealed class JellyfinHostLayout
 
         foreach (var evidence in Directory.EnumerateFiles(CollectedLogDirectory, "*", SearchOption.AllDirectories))
         {
-            var contents = File.ReadAllText(evidence);
-            if (redactor.ContainsKnownSecret(contents))
-            {
-                File.Delete(evidence);
-                DeleteCollectedEvidence();
-                throw new InvalidOperationException("Sanitized test evidence still contains a generated secret.");
-            }
-
             if (!OperatingSystem.IsWindows())
             {
                 File.SetUnixFileMode(evidence, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+        }
+    }
+
+    private static int CopySanitizedLog(string source, string destination, SensitiveDataRedactor redactor, int maximumBytes)
+    {
+        var temporary = destination + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        var streamingRedactor = redactor.CreateStreamingRedactor();
+        var privateKeyMatcher = new StreamingTextMatcher("PRIVATE KEY-----");
+        var secretMatchers = redactor.CreateSecretMatchers();
+        var written = 0;
+        try
+        {
+            using var input = new StreamReader(
+                new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 4096, FileOptions.SequentialScan),
+                Encoding.UTF8,
+                detectEncodingFromByteOrderMarks: true,
+                bufferSize: 4096,
+                leaveOpen: false);
+            using var outputStream = SecureFileSystem.CreateFile(temporary);
+            using var output = new StreamWriter(outputStream, new UTF8Encoding(false), 4096, leaveOpen: false);
+            var buffer = new char[4096];
+            while (true)
+            {
+                var count = input.Read(buffer, 0, buffer.Length);
+                var final = count == 0;
+                if (privateKeyMatcher.Contains(buffer.AsSpan(0, count), final))
+                {
+                    throw new InvalidOperationException("A private key was detected in test output; no failure artifacts were retained.");
+                }
+
+                var sanitized = streamingRedactor.Redact(buffer.AsSpan(0, count), final);
+                if (secretMatchers.Any(matcher => matcher.Contains(sanitized, final)))
+                {
+                    throw new InvalidOperationException("A generated secret survived streaming redaction; no failure artifacts were retained.");
+                }
+
+                var bytes = Encoding.UTF8.GetByteCount(sanitized);
+                if (written + bytes > maximumBytes)
+                {
+                    break;
+                }
+
+                output.Write(sanitized);
+                written += bytes;
+                if (final)
+                {
+                    break;
+                }
+            }
+
+            output.Flush();
+            outputStream.Flush(flushToDisk: true);
+            File.Move(temporary, destination, overwrite: true);
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(destination, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            }
+
+            return written;
+        }
+        finally
+        {
+            if (File.Exists(temporary))
+            {
+                File.Delete(temporary);
             }
         }
     }

@@ -20,15 +20,33 @@ given to Jellyfin.
 Use either an explicit, test-only administrator:
 
 ```sh
+# Provision this marker once, while no other client is connected:
+# COMMENT ON DATABASE jellyfin_npgsql_test_admin IS 'jellyfin-npgsql-exclusive-test-cluster-v1';
 export JELLYFIN_NPGSQL_TEST_ADMIN_CONNECTION_STRING='Host=127.0.0.1;Port=5432;Database=jellyfin_npgsql_test_admin;Username=test_admin;Password=...'
+export JELLYFIN_NPGSQL_TEST_EXTERNAL_EXCLUSIVE=true
 export JELLYFIN_NPGSQL_TEST_REQUIRED=true
 dotnet test --project tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests.csproj \
   --filter 'FullyQualifiedName~PostgreSqlInfrastructureOptInTests'
 ```
 
-The administrator database name must contain `jellyfin_npgsql_test_admin`, and
-the administrator must have `CREATEDB` and `CREATEROLE`. This explicit safety
-marker is intentional; do not point the fixture at a production cluster.
+External automatic creation and cleanup is deliberately unavailable unless the
+operator opts in, the administrator database is named exactly
+`jellyfin_npgsql_test_admin`, and that database has the exact exclusivity comment
+shown above. The administrator must have `CREATEDB` and `CREATEROLE`. The harness
+also requires its PostgreSQL advisory lock and refuses to start while another
+privileged client session is present. The operator contract is that this is a
+dedicated disposable cluster and no other privileged actor will connect for the
+entire test. Do not point the fixture at a shared, development, or production
+cluster.
+
+PostgreSQL `DROP DATABASE` is name-based, nontransactional, and cannot be
+atomically tied to a previously observed OID. The harness serializes all of its
+actors, tombstones names, and revalidates names, OIDs, owners, and paired lease
+markers immediately before destructive statements. A malicious or merely
+non-cooperating superuser can ignore the advisory lock and defeat these checks;
+that is why external use requires the exclusive-cluster contract. The
+harness-created container satisfies that contract automatically.
+
 Both the external fixture and controlled container require the exact numeric
 `server_version_num` value `160006`.
 
