@@ -135,11 +135,13 @@ nullable ordering, and every replacement index.
 
 A separate inverse-order test uses ordinary tracked `SaveChangesAsync` calls. A
 test-only trigger deterministically creates one `40P01` deadlock after the real
-interning trigger, while a nontransactional sequence proves the failed operation
-was replayed. A second trigger raises `40001` once. Both saves complete through the
-provider's automatic execution strategy; returned shadow IDs, tracker states,
-canonical node counts, and exact persisted rows prove retries have no duplicate
-side effects.
+interning trigger. Explicit per-session roles acquire opposing, database-namespaced
+advisory locks, and a bounded `pg_locks` barrier proves both first locks are held
+before either blocking request. Nontransactional global and per-role sequences
+prove exactly one failed operation was replayed. A second trigger raises `40001`
+once. Both saves complete through the provider's automatic execution strategy;
+returned shadow IDs, tracker states, canonical node counts, and exact persisted
+rows prove retries have no duplicate side effects.
 
 The full-host model test uses a separate test-only provider assembly and a wholly
 disposable database to bridge the unfinished backup bead. It first lets an

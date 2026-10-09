@@ -300,22 +300,59 @@ public sealed class ModelCompatibilityTests
                 await setup.Database.ExecuteSqlRawAsync(
                     """
                     CREATE SEQUENCE public."__jellyfin_test_deadlock_sequence";
+                    CREATE SEQUENCE public."__jellyfin_test_deadlock_role_one_sequence";
+                    CREATE SEQUENCE public."__jellyfin_test_deadlock_role_two_sequence";
                     CREATE OR REPLACE FUNCTION public."__jellyfin_test_force_deadlock"()
                     RETURNS trigger LANGUAGE plpgsql
                     SET search_path = pg_catalog, public
                     AS $jellyfin$
                     DECLARE
                         invocation bigint := nextval('public."__jellyfin_test_deadlock_sequence"');
+                        test_role text := current_setting('jellyfin.test_deadlock_role', true);
+                        role_invocation bigint;
+                        lock_namespace bigint := (
+                            SELECT oid::bigint << 2
+                            FROM pg_catalog.pg_database
+                            WHERE datname = current_database());
+                        own_lock bigint;
+                        opposing_lock bigint;
+                        barrier_deadline timestamp with time zone := clock_timestamp() + interval '10 seconds';
                     BEGIN
-                        IF invocation = 1 THEN
-                            PERFORM pg_advisory_xact_lock(2147481001);
-                            PERFORM pg_sleep(2);
-                            PERFORM pg_advisory_xact_lock(2147481002);
-                        ELSIF invocation = 2 THEN
-                            PERFORM pg_advisory_xact_lock(2147481002);
-                            PERFORM pg_sleep(2);
-                            PERFORM pg_advisory_xact_lock(2147481001);
+                        IF test_role = 'one' THEN
+                            role_invocation := nextval('public."__jellyfin_test_deadlock_role_one_sequence"');
+                            own_lock := lock_namespace + 1;
+                            opposing_lock := lock_namespace + 2;
+                        ELSIF test_role = 'two' THEN
+                            role_invocation := nextval('public."__jellyfin_test_deadlock_role_two_sequence"');
+                            own_lock := lock_namespace + 2;
+                            opposing_lock := lock_namespace + 1;
+                        ELSE
+                            RAISE EXCEPTION 'missing deterministic deadlock test role'
+                                USING ERRCODE = '22023';
                         END IF;
+
+                        IF role_invocation <> 1 THEN
+                            RETURN NEW;
+                        END IF;
+
+                        PERFORM pg_advisory_xact_lock(own_lock);
+                        LOOP
+                            EXIT WHEN EXISTS (
+                                SELECT 1
+                                FROM pg_catalog.pg_locks
+                                WHERE locktype = 'advisory'
+                                    AND granted
+                                    AND pid <> pg_backend_pid()
+                                    AND classid = (opposing_lock >> 32)::oid
+                                    AND objid = (opposing_lock & 4294967295)::oid
+                                    AND objsubid = 1);
+                            IF clock_timestamp() >= barrier_deadline THEN
+                                RAISE EXCEPTION 'timed out waiting for opposing test advisory lock'
+                                    USING ERRCODE = '57014';
+                            END IF;
+                            PERFORM pg_sleep(0.01);
+                        END LOOP;
+                        PERFORM pg_advisory_xact_lock(opposing_lock);
                         RETURN NEW;
                     END;
                     $jellyfin$;
@@ -330,17 +367,25 @@ public sealed class ModelCompatibilityTests
             await using var reverseContext = CreateContext(database.RuntimeConnectionString);
             await forwardContext.Database.OpenConnectionAsync(cancellationToken);
             await reverseContext.Database.OpenConnectionAsync(cancellationToken);
-            var firstValue = "save-race-a-" + Guid.NewGuid().ToString("N");
-            var secondValue = "save-race-b-" + Guid.NewGuid().ToString("N");
+            await forwardContext.Database.ExecuteSqlRawAsync(
+                "SET jellyfin.test_deadlock_role = 'one'",
+                cancellationToken);
+            await reverseContext.Database.ExecuteSqlRawAsync(
+                "SET jellyfin.test_deadlock_role = 'two'",
+                cancellationToken);
+            var forwardFirstValue = "save-race-forward-a-" + Guid.NewGuid().ToString("N");
+            var forwardSecondValue = "save-race-forward-b-" + Guid.NewGuid().ToString("N");
+            var reverseFirstValue = "save-race-reverse-a-" + Guid.NewGuid().ToString("N");
+            var reverseSecondValue = "save-race-reverse-b-" + Guid.NewGuid().ToString("N");
             var forwardEntries = new[]
             {
-                forwardContext.ItemValues.Add(CreateItemValue(firstValue, ItemValueType.Genre)),
-                forwardContext.ItemValues.Add(CreateItemValue(secondValue, ItemValueType.Genre))
+                forwardContext.ItemValues.Add(CreateItemValue(forwardFirstValue, ItemValueType.Genre)),
+                forwardContext.ItemValues.Add(CreateItemValue(forwardSecondValue, ItemValueType.Genre))
             };
             var reverseEntries = new[]
             {
-                reverseContext.ItemValues.Add(CreateItemValue(secondValue, ItemValueType.Studios)),
-                reverseContext.ItemValues.Add(CreateItemValue(firstValue, ItemValueType.Studios))
+                reverseContext.ItemValues.Add(CreateItemValue(reverseFirstValue, ItemValueType.Studios)),
+                reverseContext.ItemValues.Add(CreateItemValue(reverseSecondValue, ItemValueType.Studios))
             };
             var start = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             var forwardSave = SaveAfterSignalWithoutHandlingAsync(forwardContext, start.Task, cancellationToken);
@@ -356,8 +401,15 @@ public sealed class ModelCompatibilityTests
 
             await using (var verification = CreateContext(database.RuntimeConnectionString))
             {
+                var expectedValues = new[]
+                {
+                    forwardFirstValue,
+                    forwardSecondValue,
+                    reverseFirstValue,
+                    reverseSecondValue
+                };
                 var rows = await verification.ItemValues
-                    .Where(value => value.Value == firstValue || value.Value == secondValue)
+                    .Where(value => expectedValues.Contains(value.Value))
                     .Select(value => new
                     {
                         value.Type,
@@ -366,15 +418,10 @@ public sealed class ModelCompatibilityTests
                     })
                     .ToArrayAsync(cancellationToken);
                 Assert.Equal(4, rows.Length);
-                Assert.All(
-                    rows.GroupBy(row => row.Value),
-                    group =>
-                    {
-                        Assert.Equal(2, group.Count());
-                        Assert.Single(group.Select(row => row.InternId).Distinct());
-                    });
+                Assert.Equal(expectedValues.Order(), rows.Select(row => row.Value).Order());
+                Assert.Equal(4, rows.Select(row => row.InternId).Distinct().Count());
                 Assert.Equal(
-                    4,
+                    8,
                     await ScalarAsync<long>(
                         verification,
                         "SELECT count(*) FROM public.\"__JellyfinTextNodes\"",
@@ -385,6 +432,18 @@ public sealed class ModelCompatibilityTests
                         verification,
                         "SELECT last_value FROM public.\"__jellyfin_test_deadlock_sequence\"",
                         cancellationToken));
+                var roleInvocations = new[]
+                {
+                    await ScalarAsync<long>(
+                        verification,
+                        "SELECT last_value FROM public.\"__jellyfin_test_deadlock_role_one_sequence\"",
+                        cancellationToken),
+                    await ScalarAsync<long>(
+                        verification,
+                        "SELECT last_value FROM public.\"__jellyfin_test_deadlock_role_two_sequence\"",
+                        cancellationToken)
+                };
+                Assert.Equal([2L, 3L], roleInvocations.Order());
 
                 await verification.Database.ExecuteSqlRawAsync(
                     """
