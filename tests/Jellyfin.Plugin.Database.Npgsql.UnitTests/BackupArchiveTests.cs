@@ -1,4 +1,5 @@
 using System.IO.Compression;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -8,8 +9,10 @@ using Jellyfin.Database.Implementations.Entities.Security;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Database.Implementations.Locking;
 using Jellyfin.Server.Implementations.SystemBackupService;
+using MediaBrowser.Controller;
 using MediaBrowser.Controller.SystemBackupService;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
@@ -146,6 +149,130 @@ public sealed class BackupArchiveTests : IDisposable
     }
 
     [Fact]
+    public async Task Validation_RequiresExactAgreementBetweenMarkerManifestAndDatabaseEntries()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var included = this.CreateStockArchive();
+        await NpgsqlBackupArchive.BindAsync(included, true, cancellationToken);
+        await ReplaceEntryAsync(
+            included,
+            NpgsqlBackupArchive.MarkerEntryName,
+            value => value.Replace("\"DatabaseIncluded\":true", "\"DatabaseIncluded\":false", StringComparison.Ordinal),
+            cancellationToken);
+        var falseMarker = await Assert.ThrowsAsync<NotSupportedException>(
+            () => NpgsqlBackupArchive.ValidateAsync(included, cancellationToken));
+        Assert.Contains("binding and stock manifest disagree", falseMarker.Message, StringComparison.Ordinal);
+
+        var excluded = this.CreateStockArchive(databaseIncluded: false);
+        await NpgsqlBackupArchive.BindAsync(excluded, false, cancellationToken);
+        await ReplaceEntryAsync(
+            excluded,
+            NpgsqlBackupArchive.MarkerEntryName,
+            value => value.Replace("\"DatabaseIncluded\":false", "\"DatabaseIncluded\":true", StringComparison.Ordinal),
+            cancellationToken);
+        var trueMarker = await Assert.ThrowsAsync<NotSupportedException>(
+            () => NpgsqlBackupArchive.ValidateAsync(excluded, cancellationToken));
+        Assert.Contains("binding and stock manifest disagree", trueMarker.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("missing")]
+    [InlineData("duplicate-entry")]
+    [InlineData("duplicate-options")]
+    [InlineData("duplicate-database")]
+    [InlineData("wrong-type")]
+    public async Task Validation_RejectsMissingDuplicateOrAmbiguousStockManifest(string corruption)
+    {
+        var path = this.CreateStockArchive();
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using (var archive = await ZipFile.OpenAsync(path, ZipArchiveMode.Update, cancellationToken))
+        {
+            var manifest = archive.GetEntry("manifest.json")!;
+            if (corruption is "missing")
+            {
+                manifest.Delete();
+            }
+            else if (corruption is "duplicate-entry")
+            {
+                var duplicate = archive.CreateEntry("manifest.json");
+                await using var writer = new StreamWriter(await duplicate.OpenAsync(cancellationToken));
+                await writer.WriteAsync("{}".AsMemory(), cancellationToken);
+            }
+            else
+            {
+                manifest.Delete();
+                var replacement = archive.CreateEntry("manifest.json");
+                await using var writer = new StreamWriter(await replacement.OpenAsync(cancellationToken));
+                await writer.WriteAsync((corruption switch
+                {
+                    "duplicate-options" => "{\"Options\":{\"Database\":true},\"Options\":{\"Database\":true}}",
+                    "duplicate-database" => "{\"Options\":{\"Database\":true,\"Database\":true}}",
+                    "wrong-type" => "{\"Options\":{\"Database\":\"true\"}}",
+                    _ => throw new InvalidOperationException(),
+                }).AsMemory(), cancellationToken);
+            }
+        }
+
+        await Assert.ThrowsAnyAsync<Exception>(
+            () => NpgsqlBackupArchive.BindAsync(path, true, cancellationToken));
+    }
+
+    public static TheoryData<string> UnsafeZipNames => new()
+    {
+        "Config/a",
+        "Config//a",
+        "Config/./a",
+        "Config\\a",
+        "Config/a:stream",
+        "Config/a. ",
+    };
+
+    [Theory]
+    [MemberData(nameof(UnsafeZipNames))]
+    public async Task Binding_RejectsStockExtractionAliasesBeforeMutation(string alias)
+    {
+        var path = this.CreateStockArchive();
+        using (var archive = ZipFile.Open(path, ZipArchiveMode.Update))
+        {
+            _ = archive.CreateEntry("Config/a");
+            _ = archive.CreateEntry(alias);
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlBackupArchive.BindAsync(path, true, TestContext.Current.CancellationToken));
+        Assert.Contains(
+            alias == "Config/a" ? "duplicate entry" : "unsafe entry name",
+            exception.Message,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Binding_RejectsCaseUnicodeAndFileDirectoryAliasesBeforeMutation()
+    {
+        var aliases = new[]
+        {
+            new[] { "Config/Case.json", "config/case.json" },
+            new[] { "Config/caf\u00e9.json", "Config/cafe\u0301.json" },
+            new[] { "Config/node", "Config/node/child.json" },
+        };
+        foreach (var pair in aliases)
+        {
+            var path = this.CreateStockArchive();
+            using (var archive = ZipFile.Open(path, ZipArchiveMode.Update))
+            {
+                _ = archive.CreateEntry(pair[0]);
+                _ = archive.CreateEntry(pair[1]);
+            }
+
+            var exception = await Assert.ThrowsAsync<InvalidDataException>(
+                () => NpgsqlBackupArchive.BindAsync(path, true, TestContext.Current.CancellationToken));
+            Assert.True(
+                exception.Message.Contains("collision", StringComparison.OrdinalIgnoreCase)
+                || exception.Message.Contains("alias", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    [Fact]
     public async Task Validation_RejectsTruncationAndCancellationLeavesNoScratchFile()
     {
         var path = this.CreateStockArchive();
@@ -173,7 +300,18 @@ public sealed class BackupArchiveTests : IDisposable
     public async Task ValidatedSnapshot_IsMarkerOwnedAndDeletesOnlyItsOwnFile()
     {
         var path = this.CreateStockArchive();
+        UnixFileMode? originalMode = null;
+        if (!OperatingSystem.IsWindows())
+        {
+            originalMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead;
+            File.SetUnixFileMode(path, originalMode.Value);
+        }
+
         await NpgsqlBackupArchive.BindAsync(path, true, TestContext.Current.CancellationToken);
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.Equal(originalMode, File.GetUnixFileMode(path));
+        }
 
         string snapshotPath;
         using (var snapshot = await NpgsqlBackupArchive.CreateValidatedSnapshotAsync(
@@ -185,6 +323,12 @@ public sealed class BackupArchiveTests : IDisposable
             Assert.StartsWith(".jellyfin-npgsql-restore-", Path.GetFileName(snapshotPath), StringComparison.Ordinal);
             Assert.True(File.Exists(snapshotPath));
             Assert.True(File.Exists(path));
+            if (!OperatingSystem.IsWindows())
+            {
+                Assert.Equal(
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite,
+                    File.GetUnixFileMode(snapshotPath));
+            }
         }
 
         Assert.False(File.Exists(snapshotPath));
@@ -207,6 +351,109 @@ public sealed class BackupArchiveTests : IDisposable
     }
 
     [Fact]
+    public async Task RestoreFilesystemSnapshot_CompensatesExactFilesModesAndCreatedDirectories()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var paths = new TestApplicationPaths(Path.Combine(this.testRoot, "filesystem"));
+        paths.CreateDirectories();
+        var existing = Path.Combine(paths.ConfigurationDirectoryPath, "system.xml");
+        await File.WriteAllTextAsync(existing, "before", cancellationToken);
+        UnixFileMode? originalMode = null;
+        if (!OperatingSystem.IsWindows())
+        {
+            originalMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead;
+            File.SetUnixFileMode(existing, originalMode.Value);
+        }
+
+        var archivePath = Path.Combine(this.testRoot, "filesystem.zip");
+        using (var archive = ZipFile.Open(archivePath, ZipArchiveMode.Create))
+        {
+            _ = archive.CreateEntry("Config/system.xml");
+            _ = archive.CreateEntry("Data/new/created.json");
+            _ = archive.CreateEntry("Root/root.json");
+            _ = archive.CreateEntry("Data/metadata/internal.json");
+            _ = archive.CreateEntry("Data/metadata-default/default.json");
+        }
+
+        await using (var snapshot = await NpgsqlRestoreFileSnapshot.CaptureAsync(
+            archivePath,
+            paths,
+            cancellationToken))
+        {
+            await File.WriteAllTextAsync(existing, "after", cancellationToken);
+            Directory.CreateDirectory(Path.Combine(paths.DataPath, "new"));
+            await File.WriteAllTextAsync(Path.Combine(paths.DataPath, "new", "created.json"), "created", cancellationToken);
+            await File.WriteAllTextAsync(Path.Combine(paths.RootFolderPath, "root.json"), "created", cancellationToken);
+            await File.WriteAllTextAsync(Path.Combine(paths.InternalMetadataPath, "internal.json"), "created", cancellationToken);
+            await File.WriteAllTextAsync(Path.Combine(paths.DefaultInternalMetadataPath, "default.json"), "created", cancellationToken);
+
+            await snapshot.RollbackAsync(cancellationToken);
+        }
+
+        Assert.Equal("before", await File.ReadAllTextAsync(existing, cancellationToken));
+        if (!OperatingSystem.IsWindows() && originalMode is { } mode)
+        {
+            Assert.Equal(mode, File.GetUnixFileMode(existing));
+        }
+
+        Assert.False(Directory.Exists(Path.Combine(paths.DataPath, "new")));
+        Assert.False(File.Exists(Path.Combine(paths.RootFolderPath, "root.json")));
+        Assert.False(File.Exists(Path.Combine(paths.InternalMetadataPath, "internal.json")));
+        Assert.False(File.Exists(Path.Combine(paths.DefaultInternalMetadataPath, "default.json")));
+    }
+
+    [Fact]
+    public async Task RestoreFilesystemSnapshot_RejectsSymlinkAndHardLinkTargets()
+    {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "Unix link safety contract.");
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var paths = new TestApplicationPaths(Path.Combine(this.testRoot, "links"));
+        paths.CreateDirectories();
+        var archivePath = Path.Combine(this.testRoot, "links.zip");
+        using (var archive = ZipFile.Open(archivePath, ZipArchiveMode.Create))
+        {
+            _ = archive.CreateEntry("Config/linked.xml");
+        }
+
+        var outside = Path.Combine(this.testRoot, "outside.xml");
+        await File.WriteAllTextAsync(outside, "outside", cancellationToken);
+        var target = Path.Combine(paths.ConfigurationDirectoryPath, "linked.xml");
+        File.CreateSymbolicLink(target, outside);
+        var symbolic = await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlRestoreFileSnapshot.CaptureAsync(archivePath, paths, cancellationToken));
+        Assert.Contains("symbolic/reparse", symbolic.Message, StringComparison.Ordinal);
+        File.Delete(target);
+
+        Assert.Equal(0, CreateHardLink(outside, target));
+        var hard = await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlRestoreFileSnapshot.CaptureAsync(archivePath, paths, cancellationToken));
+        Assert.Contains("hard links", hard.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ProviderGate_SerializesRestoreAgainstBackup()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var restorePath = this.CreateStockArchive();
+        await NpgsqlBackupArchive.BindAsync(restorePath, true, cancellationToken);
+        var createPath = this.CreateStockArchive(databaseIncluded: false);
+        var inner = new BlockingBackupService(restorePath, createPath);
+        var decorator = new NpgsqlBackupServiceDecorator(inner, true);
+
+        var restore = decorator.RestoreBackupAsync(restorePath);
+        await inner.RestoreEntered.Task.WaitAsync(TimeSpan.FromSeconds(5), cancellationToken);
+        var backup = decorator.CreateBackupAsync(new BackupOptionsDto { Database = false });
+        var prematureBackup = await Task.WhenAny(
+            inner.BackupEntered.Task,
+            Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken));
+        Assert.NotSame(inner.BackupEntered.Task, prematureBackup);
+
+        inner.Release.TrySetResult();
+        await Task.WhenAll(restore, backup).WaitAsync(TimeSpan.FromSeconds(10), cancellationToken);
+        Assert.Equal(1, inner.MaximumConcurrency);
+    }
+
+    [Fact]
     public async Task ModelPreflight_AcceptsExactEmptyModelAndHistory()
     {
         var path = this.CreateStockArchive(historyJson: CreateExactHistoryJson());
@@ -217,6 +464,53 @@ public sealed class BackupArchiveTests : IDisposable
             path,
             context.Model,
             TestContext.Current.CancellationToken);
+    }
+
+    [Theory]
+    [InlineData("migration-too-long")]
+    [InlineData("version-too-long")]
+    [InlineData("version-wrong-type")]
+    [InlineData("version-null")]
+    [InlineData("version-arbitrary")]
+    [InlineData("wrong-order")]
+    public async Task ModelPreflight_RejectsInvalidExactHistoryContract(string corruption)
+    {
+        var rows = JsonNode.Parse(CreateExactHistoryJson())!.AsArray();
+        switch (corruption)
+        {
+            case "migration-too-long":
+                rows[0]!["MigrationId"] = "20260101000000_" + new string('x', 136);
+                break;
+            case "version-too-long":
+                rows[0]!["ProductVersion"] = new string('1', 33);
+                break;
+            case "version-wrong-type":
+                rows[0]!["ProductVersion"] = 122;
+                break;
+            case "version-null":
+                rows[0]!["ProductVersion"] = null;
+                break;
+            case "version-arbitrary":
+                rows[0]!["ProductVersion"] = "12.2.0.1";
+                break;
+            case "wrong-order":
+                var first = rows[0]!.DeepClone();
+                var second = rows[1]!.DeepClone();
+                rows[0] = second;
+                rows[1] = first;
+                break;
+            default:
+                throw new InvalidOperationException();
+        }
+
+        var path = this.CreateStockArchive(historyJson: rows.ToJsonString());
+        await NpgsqlBackupArchive.BindAsync(path, true, TestContext.Current.CancellationToken);
+        using var context = CreateContext();
+        await Assert.ThrowsAnyAsync<Exception>(
+            () => NpgsqlBackupArchive.ValidateAsync(
+                path,
+                context.Model,
+                TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -403,11 +697,12 @@ public sealed class BackupArchiveTests : IDisposable
         string activityLogsJson = "[]",
         string historyJson = "[]",
         string permissionsJson = "[]",
-        CompressionLevel databaseCompression = CompressionLevel.Optimal)
+        CompressionLevel databaseCompression = CompressionLevel.Optimal,
+        bool databaseIncluded = true)
     {
         var path = Path.Combine(this.testRoot, Guid.NewGuid().ToString("N") + ".zip");
         using var archive = ZipFile.Open(path, ZipArchiveMode.Create);
-        foreach (var name in DatabaseEntries.Where(name => !string.Equals(name, omit, StringComparison.Ordinal)))
+        foreach (var name in DatabaseEntries.Where(name => databaseIncluded && !string.Equals(name, omit, StringComparison.Ordinal)))
         {
             var entry = archive.CreateEntry("Database/" + name + ".json", databaseCompression);
             using var writer = new StreamWriter(entry.Open());
@@ -424,7 +719,7 @@ public sealed class BackupArchiveTests : IDisposable
         var manifest = archive.CreateEntry("manifest.json");
         using (var writer = new StreamWriter(manifest.Open()))
         {
-            writer.Write("{\"ServerVersion\":\"12.2.0.0\",\"BackupEngineVersion\":\"0.2.0\",\"DateCreated\":\"2026-10-09T00:00:00Z\",\"DatabaseTables\":[],\"Options\":{\"Database\":true}}");
+            writer.Write($"{{\"ServerVersion\":\"12.2.0.0\",\"BackupEngineVersion\":\"0.2.0\",\"DateCreated\":\"2026-10-09T00:00:00Z\",\"DatabaseTables\":[],\"Options\":{{\"Database\":{databaseIncluded.ToString().ToLowerInvariant()}}}}}");
         }
 
         return path;
@@ -439,7 +734,13 @@ public sealed class BackupArchiveTests : IDisposable
                     "20261009061446_AddActivityLogTypeDateIndex",
                     "20261009113458_AddUuidMinMaxAggregates",
                 ])
-                .Select(id => new { MigrationId = id, ProductVersion = PluginMetadata.SupportedDatabaseAbi }));
+                .Select(id => new
+                {
+                    MigrationId = id,
+                    ProductVersion = id.StartsWith("20261009", StringComparison.Ordinal)
+                        ? ProductInfo.GetVersion()
+                        : PluginMetadata.SupportedDatabaseAbi,
+                }));
 
     private static JellyfinDbContext CreateContext()
     {
@@ -454,6 +755,16 @@ public sealed class BackupArchiveTests : IDisposable
             provider,
             new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
     }
+
+#pragma warning disable CA2101 // LPUTF8Str explicitly matches Linux filesystem path encoding.
+#pragma warning disable SYSLIB1054 // Test-only libc probe avoids enabling unsafe source-generated interop.
+    [DllImport("libc", EntryPoint = "link", CharSet = CharSet.Ansi)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.SafeDirectories)]
+    private static extern int CreateHardLink(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string existing,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string link);
+#pragma warning restore SYSLIB1054
+#pragma warning restore CA2101
 
     private static async Task ReplaceEntryAsync(
         string archivePath,
@@ -521,5 +832,144 @@ public sealed class BackupArchiveTests : IDisposable
         }
 
         public void ScheduleRestoreAndRestartServer(string archivePath) => this.RestoreCalls++;
+    }
+
+    private sealed class BlockingBackupService(string restorePath, string createPath) : IBackupService
+    {
+        private int concurrency;
+        private int maximumConcurrency;
+
+        internal TaskCompletionSource RestoreEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal TaskCompletionSource BackupEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        internal int MaximumConcurrency => this.maximumConcurrency;
+
+        public async Task<BackupManifestDto> CreateBackupAsync(BackupOptionsDto backupOptions)
+        {
+            await this.EnterAsync(this.BackupEntered);
+            return new BackupManifestDto
+            {
+                ServerVersion = new Version(12, 2),
+                BackupEngineVersion = new Version(0, 2),
+                DateCreated = DateTimeOffset.UtcNow,
+                Path = createPath,
+                Options = backupOptions,
+            };
+        }
+
+        public Task<BackupManifestDto[]> EnumerateBackups()
+            => Task.FromResult(Array.Empty<BackupManifestDto>());
+
+        public Task<BackupManifestDto?> GetBackupManifest(string archivePath)
+            => Task.FromResult<BackupManifestDto?>(null);
+
+        public async Task RestoreBackupAsync(string archivePath)
+        {
+            Assert.NotEqual(restorePath, archivePath);
+            await this.EnterAsync(this.RestoreEntered);
+        }
+
+        public void ScheduleRestoreAndRestartServer(string archivePath)
+            => throw new NotSupportedException();
+
+        private async Task EnterAsync(TaskCompletionSource entered)
+        {
+            var current = Interlocked.Increment(ref this.concurrency);
+            var observed = Volatile.Read(ref this.maximumConcurrency);
+            while (current > observed)
+            {
+                var exchanged = Interlocked.CompareExchange(ref this.maximumConcurrency, current, observed);
+                if (exchanged == observed)
+                {
+                    break;
+                }
+
+                observed = exchanged;
+            }
+
+            entered.TrySetResult();
+            try
+            {
+                await this.Release.Task;
+            }
+            finally
+            {
+                _ = Interlocked.Decrement(ref this.concurrency);
+            }
+        }
+    }
+
+    private sealed class TestApplicationPaths(string root) : IServerApplicationPaths
+    {
+        public string ProgramDataPath => root;
+
+        public string WebPath => Path.Combine(root, "web");
+
+        public string ProgramSystemPath => Path.Combine(root, "system");
+
+        public string DataPath => Path.Combine(root, "data");
+
+        public string ImageCachePath => Path.Combine(root, "cache", "images");
+
+        public string PluginsPath => Path.Combine(root, "plugins");
+
+        public string PluginConfigurationsPath => Path.Combine(root, "plugins", "configurations");
+
+        public string LogDirectoryPath => Path.Combine(root, "log");
+
+        public string ConfigurationDirectoryPath => Path.Combine(root, "config");
+
+        public string SystemConfigurationFilePath => Path.Combine(this.ConfigurationDirectoryPath, "system.xml");
+
+        public string CachePath => Path.Combine(root, "cache");
+
+        public string TempDirectory => Path.Combine(root, "cache", "temp");
+
+        public string VirtualDataPath => "%data%";
+
+        public string TrickplayPath => Path.Combine(root, "data", "trickplay");
+
+        public string BackupPath => Path.Combine(root, "data", "backups");
+
+        public string RootFolderPath => Path.Combine(root, "root");
+
+        public string DefaultUserViewsPath => Path.Combine(this.RootFolderPath, "views");
+
+        public string PeoplePath => Path.Combine(this.RootFolderPath, "people");
+
+        public string GenrePath => Path.Combine(this.RootFolderPath, "genres");
+
+        public string MusicGenrePath => Path.Combine(this.RootFolderPath, "musicgenres");
+
+        public string StudioPath => Path.Combine(this.RootFolderPath, "studios");
+
+        public string YearPath => Path.Combine(this.RootFolderPath, "years");
+
+        public string UserConfigurationDirectoryPath => Path.Combine(this.ConfigurationDirectoryPath, "users");
+
+        public string DefaultInternalMetadataPath => Path.Combine(root, "default-metadata");
+
+        public string InternalMetadataPath => Path.Combine(root, "metadata");
+
+        public string VirtualInternalMetadataPath => "%metadata%";
+
+        public string ArtistsPath => Path.Combine(this.RootFolderPath, "artists");
+
+        public void CreateDirectories()
+        {
+            Directory.CreateDirectory(this.ConfigurationDirectoryPath);
+            Directory.CreateDirectory(this.DataPath);
+            Directory.CreateDirectory(this.RootFolderPath);
+            Directory.CreateDirectory(this.InternalMetadataPath);
+            Directory.CreateDirectory(this.DefaultInternalMetadataPath);
+        }
+
+        public void MakeSanityCheckOrThrow() => this.CreateDirectories();
+
+        public void CreateAndCheckMarker(string path, string markerName, bool recursive = false)
+            => Directory.CreateDirectory(path);
     }
 }

@@ -6,10 +6,14 @@ using Jellyfin.Database.Implementations.Entities.Security;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Database.Implementations.Locking;
 using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
+using Jellyfin.Server.Implementations.SystemBackupService;
+using MediaBrowser.Controller;
+using MediaBrowser.Controller.SystemBackupService;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
 using Xunit;
@@ -473,6 +477,93 @@ public sealed class StockBackupRestoreIntegrationTests
         }
     }
 
+    [Theory]
+    [InlineData("extraction")]
+    [InlineData("history")]
+    [InlineData("reseed")]
+    [InlineData("cancellation")]
+    public async Task DecoratedRestoreCompensatesFilesHistoryAndDatabaseForEveryLateFailure(string failureStage)
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var scratch = Path.Combine(
+            AppContext.BaseDirectory,
+            "stock-restore-compensation-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            await using (var seed = CreateContext(database.RuntimeConnectionString))
+            {
+                await seed.GetService<IMigrator>().MigrateAsync(cancellationToken: cancellationToken);
+                await SeedHostHistoryAsync(seed, cancellationToken);
+                seed.ActivityLogs.Add(new ActivityLog("must survive decorated restore failure", "BackupRestore", Guid.Empty));
+                await seed.SaveChangesAsync(cancellationToken);
+            }
+
+            var factory = new TestDbContextFactory(database.RuntimeConnectionString);
+            var paths = new TestApplicationPaths(Path.Combine(scratch, "paths"));
+            paths.CreateDirectories();
+            var protectedFile = Path.Combine(paths.ConfigurationDirectoryPath, "system.xml");
+            await File.WriteAllTextAsync(protectedFile, "before", cancellationToken);
+            UnixFileMode? protectedMode = null;
+            if (!OperatingSystem.IsWindows())
+            {
+                protectedMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead;
+                File.SetUnixFileMode(protectedFile, protectedMode.Value);
+            }
+
+            var archivePath = Path.Combine(scratch, "restore.zip");
+            await using (var modelContext = CreateContext(database.RuntimeConnectionString))
+            {
+                await CreateExactEmptyStockArchiveAsync(archivePath, modelContext, cancellationToken);
+            }
+
+            var originalHistory = await ReadHistoryAsync(database.RuntimeConnectionString, cancellationToken);
+            var services = new ServiceCollection()
+                .AddSingleton<IDbContextFactory<JellyfinDbContext>>(factory)
+                .AddSingleton<IServerApplicationPaths>(paths)
+                .BuildServiceProvider();
+            await using (services.ConfigureAwait(false))
+            {
+                var inner = new FailingRestoreService(
+                    database.RuntimeConnectionString,
+                    paths,
+                    failureStage);
+                var decorator = new NpgsqlBackupServiceDecorator(inner, true, services);
+                var failure = await Assert.ThrowsAnyAsync<Exception>(() => decorator.RestoreBackupAsync(archivePath));
+                if (failure is AggregateException aggregate)
+                {
+                    throw aggregate.Flatten();
+                }
+            }
+
+            Assert.Equal("before", await File.ReadAllTextAsync(protectedFile, cancellationToken));
+            Assert.False(File.Exists(Path.Combine(paths.DataPath, "created", "partial.json")));
+            if (!OperatingSystem.IsWindows() && protectedMode is { } mode)
+            {
+                Assert.Equal(mode, File.GetUnixFileMode(protectedFile));
+            }
+
+            Assert.Equal(originalHistory, await ReadHistoryAsync(database.RuntimeConnectionString, cancellationToken));
+            await using var verification = CreateContext(database.RuntimeConnectionString);
+            Assert.Equal(
+                ["must survive decorated restore failure"],
+                await verification.ActivityLogs.Select(row => row.Name).ToArrayAsync(cancellationToken));
+        }
+        finally
+        {
+            if (Directory.Exists(scratch))
+            {
+                Directory.Delete(scratch, true);
+            }
+
+            NpgsqlConnection.ClearAllPools();
+        }
+    }
+
     [Fact]
     public async Task RestoreSupportsNegativeOnlyExplicitIdsAndRestartsAtLegalPositiveValues()
     {
@@ -506,11 +597,22 @@ public sealed class StockBackupRestoreIntegrationTests
         }
     }
 
+    public static TheoryData<string, string> ReseedFailureMatrix => new()
+    {
+        { "failure", "first" },
+        { "failure", "middle" },
+        { "failure", "last" },
+        { "cancellation", "first" },
+        { "cancellation", "middle" },
+        { "cancellation", "last" },
+        { "connection", "first" },
+        { "connection", "middle" },
+        { "connection", "last" },
+    };
+
     [Theory]
-    [InlineData("failure")]
-    [InlineData("cancellation")]
-    [InlineData("connection")]
-    public async Task FailedMiddleReseedRollsBackTablesAndExactSequenceStates(string mode)
+    [MemberData(nameof(ReseedFailureMatrix))]
+    public async Task FailedReseedRollsBackTablesAndEveryExactSequenceState(string mode, string position)
     {
         var options = PostgreSqlTestOptions.FromEnvironment();
         Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
@@ -533,13 +635,8 @@ public sealed class StockBackupRestoreIntegrationTests
                     cancellationToken);
             }
 
-            var beforeAccess = await ReadSequenceStateAsync(
+            var beforeSequences = await ReadAllSequenceStatesAsync(
                 database.RuntimeConnectionString,
-                "AccessSchedules_Id_seq",
-                cancellationToken);
-            var beforeActivity = await ReadSequenceStateAsync(
-                database.RuntimeConnectionString,
-                "ActivityLogs_Id_seq",
                 cancellationToken);
 
             await using (var restore = CreateContext(database.RuntimeConnectionString))
@@ -548,9 +645,17 @@ public sealed class StockBackupRestoreIntegrationTests
                 var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
                 await provider.PurgeDatabase(restore, GetStockTableNames(restore));
                 _ = SeedEveryIdentityWithExplicitIds(restore, 900);
+                var identityCount = NpgsqlDatabaseOperations.GetIdentityColumns(restore.Model).Count;
+                var failureOrdinal = position switch
+                {
+                    "first" => 1,
+                    "middle" => Math.Max(2, identityCount / 2),
+                    "last" => identityCount,
+                    _ => throw new InvalidOperationException(),
+                };
                 NpgsqlRestoreScope.SetIdentityRestartCheckpoint(async (ordinal, _) =>
                 {
-                    if (ordinal != 2)
+                    if (ordinal != failureOrdinal)
                     {
                         return;
                     }
@@ -580,22 +685,179 @@ public sealed class StockBackupRestoreIntegrationTests
             }
 
             Assert.Equal(
-                beforeAccess,
-                await ReadSequenceStateAsync(
-                    database.RuntimeConnectionString,
-                    "AccessSchedules_Id_seq",
-                    cancellationToken));
-            Assert.Equal(
-                beforeActivity,
-                await ReadSequenceStateAsync(
-                    database.RuntimeConnectionString,
-                    "ActivityLogs_Id_seq",
-                    cancellationToken));
+                beforeSequences,
+                await ReadAllSequenceStatesAsync(database.RuntimeConnectionString, cancellationToken));
         }
         finally
         {
             NpgsqlConnection.ClearAllPools();
         }
+    }
+
+    [Fact]
+    public async Task RestorePreservesCustomSequenceDefinitionAndReseedsPositiveRowsExactly()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await using var context = CreateContext(database.RuntimeConnectionString);
+            await context.GetService<IMigrator>().MigrateAsync(cancellationToken: cancellationToken);
+            await SeedHostHistoryAsync(context, cancellationToken);
+            await context.Database.ExecuteSqlRawAsync(
+                "ALTER SEQUENCE public.\"ActivityLogs_Id_seq\" MINVALUE -100 MAXVALUE 1000 INCREMENT BY 7 START WITH 8 CYCLE",
+                cancellationToken);
+            await context.Database.ExecuteSqlRawAsync(
+                "SELECT pg_catalog.setval('public.\"ActivityLogs_Id_seq\"'::pg_catalog.regclass, 99, true)",
+                cancellationToken);
+            var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
+            using (NpgsqlRestoreScope.Enter())
+            {
+                await provider.PurgeDatabase(context, GetStockTableNames(context));
+            }
+
+            _ = SeedEveryIdentityWithExplicitIds(context, 900);
+            await context.SaveChangesAsync(cancellationToken);
+
+            var state = (await ReadAllSequenceStatesAsync(database.RuntimeConnectionString, cancellationToken))
+                ["public.ActivityLogs_Id_seq"];
+            Assert.Equal(-100, state.Minimum);
+            Assert.Equal(1000, state.Maximum);
+            Assert.Equal(7, state.Increment);
+            Assert.Equal(8, state.Start);
+            Assert.True(state.Cycle);
+            Assert.Equal(907, state.LastValue);
+            Assert.False(state.IsCalled);
+        }
+        finally
+        {
+            NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RestoreReseedsEmptyAndNegativeOnlyCustomDescendingSequencesExactly(bool negativeRows)
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await using var context = CreateContext(database.RuntimeConnectionString);
+            await context.GetService<IMigrator>().MigrateAsync(cancellationToken: cancellationToken);
+            await SeedHostHistoryAsync(context, cancellationToken);
+            await context.Database.ExecuteSqlRawAsync(
+                "ALTER SEQUENCE public.\"ActivityLogs_Id_seq\" MINVALUE -1000 MAXVALUE 1000 INCREMENT BY -7 START WITH -1 NO CYCLE",
+                cancellationToken);
+            var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
+            using (NpgsqlRestoreScope.Enter())
+            {
+                await provider.PurgeDatabase(context, GetStockTableNames(context));
+            }
+
+            if (negativeRows)
+            {
+                _ = SeedEveryIdentityWithExplicitIds(context, -900);
+            }
+
+            await context.SaveChangesAsync(cancellationToken);
+            var state = (await ReadAllSequenceStatesAsync(database.RuntimeConnectionString, cancellationToken))
+                ["public.ActivityLogs_Id_seq"];
+            Assert.Equal(-1000, state.Minimum);
+            Assert.Equal(1000, state.Maximum);
+            Assert.Equal(-7, state.Increment);
+            Assert.Equal(-1, state.Start);
+            Assert.False(state.Cycle);
+            Assert.Equal(negativeRows ? -907 : -1, state.LastValue);
+            Assert.False(state.IsCalled);
+        }
+        finally
+        {
+            NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    private static async Task CreateExactEmptyStockArchiveAsync(
+        string archivePath,
+        JellyfinDbContext context,
+        CancellationToken cancellationToken)
+    {
+        var history = await context.GetService<IHistoryRepository>()
+            .GetAppliedMigrationsAsync(cancellationToken).ConfigureAwait(false);
+        using (var archive = ZipFile.Open(archivePath, ZipArchiveMode.Create))
+        {
+            var sourceNames = typeof(JellyfinDbContext)
+                .GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
+                .Where(property => property.PropertyType.IsAssignableTo(typeof(IQueryable)))
+                .Select(property => property.Name)
+                .Append(nameof(HistoryRow))
+                .Order(StringComparer.Ordinal);
+            foreach (var sourceName in sourceNames)
+            {
+                var entry = archive.CreateEntry("Database/" + sourceName + ".json");
+                var stream = await entry.OpenAsync(cancellationToken).ConfigureAwait(false);
+                await using (stream.ConfigureAwait(false))
+                {
+                    if (string.Equals(sourceName, nameof(HistoryRow), StringComparison.Ordinal))
+                    {
+                        await JsonSerializer.SerializeAsync(
+                            stream,
+                            history,
+                            cancellationToken: cancellationToken).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await JsonSerializer.SerializeAsync(
+                            stream,
+                            Array.Empty<object>(),
+                            cancellationToken: cancellationToken).ConfigureAwait(false);
+                    }
+                }
+            }
+
+            var config = archive.CreateEntry("Config/system.xml");
+            var configStream = await config.OpenAsync(cancellationToken).ConfigureAwait(false);
+            await using (configStream.ConfigureAwait(false))
+            {
+                await configStream.WriteAsync("archive"u8.ToArray(), cancellationToken).ConfigureAwait(false);
+            }
+
+            var created = archive.CreateEntry("Data/created/partial.json");
+            var createdStream = await created.OpenAsync(cancellationToken).ConfigureAwait(false);
+            await using (createdStream.ConfigureAwait(false))
+            {
+                await createdStream.WriteAsync("partial"u8.ToArray(), cancellationToken).ConfigureAwait(false);
+            }
+
+            var manifest = archive.CreateEntry("manifest.json");
+            var manifestStream = await manifest.OpenAsync(cancellationToken).ConfigureAwait(false);
+            await using (manifestStream.ConfigureAwait(false))
+            {
+                await manifestStream.WriteAsync(
+                    "{\"ServerVersion\":\"12.2.0.0\",\"BackupEngineVersion\":\"0.2.0\",\"DateCreated\":\"2026-10-09T00:00:00Z\",\"DatabaseTables\":[],\"Options\":{\"Database\":true}}"u8.ToArray(),
+                    cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        await NpgsqlBackupArchive.BindAsync(archivePath, true, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<(string MigrationId, string ProductVersion)[]> ReadHistoryAsync(
+        string connectionString,
+        CancellationToken cancellationToken)
+    {
+        await using var context = CreateContext(connectionString);
+        return (await context.GetService<IHistoryRepository>()
+            .GetAppliedMigrationsAsync(cancellationToken).ConfigureAwait(false))
+            .Select(row => (row.MigrationId, row.ProductVersion))
+            .ToArray();
     }
 
     private static JellyfinDbContext CreateContext(string connectionString)
@@ -610,19 +872,51 @@ public sealed class StockBackupRestoreIntegrationTests
             new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
     }
 
-    private static async Task<(long LastValue, bool IsCalled)> ReadSequenceStateAsync(
+    private static async Task<SortedDictionary<string, SequenceState>> ReadAllSequenceStatesAsync(
         string connectionString,
-        string sequence,
         CancellationToken cancellationToken)
     {
+        var states = new SortedDictionary<string, SequenceState>(StringComparer.Ordinal);
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
         await using var command = new NpgsqlCommand(
-            $"SELECT last_value, is_called FROM public.{NpgsqlDatabaseOperations.QuoteIdentifier(sequence)}",
+            "SELECT schemaname, sequencename, start_value, min_value, max_value, increment_by, cycle FROM pg_catalog.pg_sequences WHERE schemaname = 'public' ORDER BY sequencename",
             connection);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        Assert.True(await reader.ReadAsync(cancellationToken));
-        return (reader.GetInt64(0), reader.GetBoolean(1));
+        var definitions = new List<(string Schema, string Name, long Start, long Minimum, long Maximum, long Increment, bool Cycle)>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            definitions.Add((
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetInt64(2),
+                reader.GetInt64(3),
+                reader.GetInt64(4),
+                reader.GetInt64(5),
+                reader.GetBoolean(6)));
+        }
+
+        await reader.DisposeAsync();
+        foreach (var definition in definitions)
+        {
+            await using var stateCommand = new NpgsqlCommand(
+                $"SELECT last_value, is_called FROM {NpgsqlDatabaseOperations.QuoteIdentifier(definition.Schema)}.{NpgsqlDatabaseOperations.QuoteIdentifier(definition.Name)}",
+                connection);
+            await using var stateReader = await stateCommand.ExecuteReaderAsync(cancellationToken);
+            Assert.True(await stateReader.ReadAsync(cancellationToken));
+            states.Add(
+                definition.Schema + "." + definition.Name,
+                new SequenceState(
+                    definition.Start,
+                    definition.Minimum,
+                    definition.Maximum,
+                    definition.Increment,
+                    definition.Cycle,
+                    stateReader.GetInt64(0),
+                    stateReader.GetBoolean(1)));
+        }
+
+        return states;
     }
 
     private static ActivityLog SeedEveryIdentityWithExplicitIds(JellyfinDbContext context, int id)
@@ -858,4 +1152,170 @@ public sealed class StockBackupRestoreIntegrationTests
 
     private static string Quote(string identifier)
         => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+
+    private sealed class TestDbContextFactory(string connectionString) : IDbContextFactory<JellyfinDbContext>
+    {
+        public JellyfinDbContext CreateDbContext() => CreateContext(connectionString);
+
+        public ValueTask<JellyfinDbContext> CreateDbContextAsync(CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return ValueTask.FromResult(this.CreateDbContext());
+        }
+    }
+
+    private sealed class FailingRestoreService(
+        string connectionString,
+        TestApplicationPaths paths,
+        string failureStage) : IBackupService
+    {
+        public Task<BackupManifestDto> CreateBackupAsync(BackupOptionsDto backupOptions)
+            => throw new NotSupportedException();
+
+        public Task<BackupManifestDto[]> EnumerateBackups()
+            => Task.FromResult(Array.Empty<BackupManifestDto>());
+
+        public Task<BackupManifestDto?> GetBackupManifest(string archivePath)
+            => Task.FromResult<BackupManifestDto?>(null);
+
+        public async Task RestoreBackupAsync(string archivePath)
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(paths.ConfigurationDirectoryPath, "system.xml"),
+                "mutated").ConfigureAwait(false);
+            var createdDirectory = Path.Combine(paths.DataPath, "created");
+            Directory.CreateDirectory(createdDirectory);
+            await File.WriteAllTextAsync(
+                Path.Combine(createdDirectory, "partial.json"),
+                "mutated").ConfigureAwait(false);
+
+            switch (failureStage)
+            {
+                case "extraction":
+                    throw new InvalidOperationException("Injected post-extraction failure.");
+                case "cancellation":
+                    throw new OperationCanceledException("Injected post-extraction cancellation.");
+                case "history":
+                    await using (var historyContext = CreateContext(connectionString))
+                    {
+                        await historyContext.Database.ExecuteSqlRawAsync(
+                            "DELETE FROM public.\"__EFMigrationsHistory\"").ConfigureAwait(false);
+                        await historyContext.Database.ExecuteSqlRawAsync(
+                            "INSERT INTO public.\"__EFMigrationsHistory\" (\"MigrationId\", \"ProductVersion\") VALUES ('20250420000000_CreateNetworkConfiguration', '12.2.0.0')").ConfigureAwait(false);
+                    }
+
+                    throw new InvalidOperationException("Injected post-history failure.");
+                case "reseed":
+                    await using (var restore = CreateContext(connectionString))
+                    {
+                        var provider = new NpgsqlDatabaseProvider(NullLogger<NpgsqlDatabaseProvider>.Instance);
+                        await provider.PurgeDatabase(restore, GetStockTableNames(restore));
+                        try
+                        {
+                            await restore.Database.ExecuteSqlRawAsync(
+                                "INSERT INTO public.\"ActivityLogs\" (\"Id\", \"Name\", \"Type\", \"UserId\", \"DateCreated\", \"LogSeverity\", \"RowVersion\") VALUES (900, 'partial', 'BackupRestore', '00000000-0000-0000-0000-000000000000', CURRENT_TIMESTAMP, 2, 1)").ConfigureAwait(false);
+                            var last = NpgsqlDatabaseOperations.GetIdentityColumns(restore.Model).Count;
+                            NpgsqlRestoreScope.SetIdentityRestartCheckpoint((ordinal, _) => ordinal == last
+                                ? Task.FromException(new InvalidOperationException("Injected final reseed failure."))
+                                : Task.CompletedTask);
+                            await NpgsqlDatabaseOperations.ReseedIdentitiesAsync(
+                                restore,
+                                CancellationToken.None).ConfigureAwait(false);
+                        }
+                        catch
+                        {
+                            await NpgsqlRestoreCoordinator.FailAsync(restore).ConfigureAwait(false);
+                            throw;
+                        }
+                    }
+
+                    throw new InvalidOperationException("The injected reseed failure did not run.");
+                default:
+                    throw new InvalidOperationException("Unknown injected failure stage.");
+            }
+        }
+
+        public void ScheduleRestoreAndRestartServer(string archivePath)
+            => throw new NotSupportedException();
+    }
+
+    private sealed class TestApplicationPaths(string root) : IServerApplicationPaths
+    {
+        public string ProgramDataPath => root;
+
+        public string WebPath => Path.Combine(root, "web");
+
+        public string ProgramSystemPath => Path.Combine(root, "system");
+
+        public string DataPath => Path.Combine(root, "data");
+
+        public string ImageCachePath => Path.Combine(root, "cache", "images");
+
+        public string PluginsPath => Path.Combine(root, "plugins");
+
+        public string PluginConfigurationsPath => Path.Combine(root, "plugins", "configurations");
+
+        public string LogDirectoryPath => Path.Combine(root, "log");
+
+        public string ConfigurationDirectoryPath => Path.Combine(root, "config");
+
+        public string SystemConfigurationFilePath => Path.Combine(this.ConfigurationDirectoryPath, "system.xml");
+
+        public string CachePath => Path.Combine(root, "cache");
+
+        public string TempDirectory => Path.Combine(root, "cache", "temp");
+
+        public string VirtualDataPath => "%data%";
+
+        public string TrickplayPath => Path.Combine(root, "data", "trickplay");
+
+        public string BackupPath => Path.Combine(root, "data", "backups");
+
+        public string RootFolderPath => Path.Combine(root, "root");
+
+        public string DefaultUserViewsPath => Path.Combine(this.RootFolderPath, "views");
+
+        public string PeoplePath => Path.Combine(this.RootFolderPath, "people");
+
+        public string GenrePath => Path.Combine(this.RootFolderPath, "genres");
+
+        public string MusicGenrePath => Path.Combine(this.RootFolderPath, "musicgenres");
+
+        public string StudioPath => Path.Combine(this.RootFolderPath, "studios");
+
+        public string YearPath => Path.Combine(this.RootFolderPath, "years");
+
+        public string UserConfigurationDirectoryPath => Path.Combine(this.ConfigurationDirectoryPath, "users");
+
+        public string DefaultInternalMetadataPath => Path.Combine(root, "default-metadata");
+
+        public string InternalMetadataPath => Path.Combine(root, "metadata");
+
+        public string VirtualInternalMetadataPath => "%metadata%";
+
+        public string ArtistsPath => Path.Combine(this.RootFolderPath, "artists");
+
+        public void CreateDirectories()
+        {
+            Directory.CreateDirectory(this.ConfigurationDirectoryPath);
+            Directory.CreateDirectory(this.DataPath);
+            Directory.CreateDirectory(this.RootFolderPath);
+            Directory.CreateDirectory(this.InternalMetadataPath);
+            Directory.CreateDirectory(this.DefaultInternalMetadataPath);
+        }
+
+        public void MakeSanityCheckOrThrow() => this.CreateDirectories();
+
+        public void CreateAndCheckMarker(string path, string markerName, bool recursive = false)
+            => Directory.CreateDirectory(path);
+    }
+
+    private sealed record SequenceState(
+        long Start,
+        long Minimum,
+        long Maximum,
+        long Increment,
+        bool Cycle,
+        long LastValue,
+        bool IsCalled);
 }

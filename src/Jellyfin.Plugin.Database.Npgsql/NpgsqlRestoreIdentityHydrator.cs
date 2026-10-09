@@ -57,45 +57,57 @@ internal static class NpgsqlRestoreIdentityHydrator
             var zipEntry = archive.GetEntry($"Database/{sourceName}.json")
                 ?? throw new InvalidDataException($"The bound PostgreSQL archive is missing identity source '{sourceName}'.");
             var stream = await zipEntry.OpenAsync(cancellationToken).ConfigureAwait(false);
-            JsonDocument document;
             await using (stream.ConfigureAwait(false))
             {
-                document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
-            }
-
-            using (document)
-            {
-                var rows = document.RootElement.EnumerateArray().ToArray();
-                if (rows.Length != tracked.Length)
+                var seenValues = identityProperties.ToDictionary(
+                    property => property.Name,
+                    _ => new HashSet<object>(),
+                    StringComparer.Ordinal);
+                var rowIndex = 0;
+                await foreach (var row in JsonSerializer.DeserializeAsyncEnumerable<JsonElement>(
+                    stream,
+                    cancellationToken: cancellationToken).ConfigureAwait(false))
                 {
-                    throw new InvalidDataException(
-                        $"Identity source '{sourceName}' contains {rows.Length} rows but stock tracked {tracked.Length} rows.");
-                }
-
-                foreach (var identityProperty in identityProperties)
-                {
-                    var seen = new HashSet<object>();
-                    for (var index = 0; index < rows.Length; index++)
+                    if (row.ValueKind is not JsonValueKind.Object)
                     {
-                        if (!rows[index].TryGetProperty(identityProperty.Name, out var jsonValue))
+                        throw new InvalidDataException($"Identity source '{sourceName}' row {rowIndex} is not an object.");
+                    }
+
+                    if (rowIndex >= tracked.Length)
+                    {
+                        throw new InvalidDataException(
+                            $"Identity source '{sourceName}' contains more rows than stock tracked ({tracked.Length}).");
+                    }
+
+                    foreach (var identityProperty in identityProperties)
+                    {
+                        if (!row.TryGetProperty(identityProperty.Name, out var jsonValue))
                         {
                             throw new InvalidDataException(
-                                $"Identity source '{sourceName}' row {index} has no '{identityProperty.Name}' value.");
+                                $"Identity source '{sourceName}' row {rowIndex} has no '{identityProperty.Name}' value.");
                         }
 
                         var value = jsonValue.Deserialize(identityProperty.ClrType)
                             ?? throw new InvalidDataException(
-                                $"Identity source '{sourceName}' row {index} has a null '{identityProperty.Name}' value.");
-                        if (!seen.Add(value))
+                                $"Identity source '{sourceName}' row {rowIndex} has a null '{identityProperty.Name}' value.");
+                        if (!seenValues[identityProperty.Name].Add(value))
                         {
                             throw new InvalidDataException(
                                 $"Identity source '{sourceName}' contains duplicate '{identityProperty.Name}' value '{value}'.");
                         }
 
-                        var propertyEntry = tracked[index].Property(identityProperty.Name);
+                        var propertyEntry = tracked[rowIndex].Property(identityProperty.Name);
                         propertyEntry.CurrentValue = value;
                         propertyEntry.IsTemporary = false;
                     }
+
+                    rowIndex++;
+                }
+
+                if (rowIndex != tracked.Length)
+                {
+                    throw new InvalidDataException(
+                        $"Identity source '{sourceName}' contains {rowIndex} rows but stock tracked {tracked.Length} rows.");
                 }
             }
         }

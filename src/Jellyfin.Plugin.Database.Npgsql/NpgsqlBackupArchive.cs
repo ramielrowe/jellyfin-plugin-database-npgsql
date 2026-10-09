@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Jellyfin.Database.Implementations;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Migrations;
 
@@ -34,6 +35,9 @@ internal static class NpgsqlBackupArchive
     /// <summary>Maximum accepted provider-marker length.</summary>
     internal const long MaximumMarkerBytes = 8L * 1024 * 1024;
 
+    /// <summary>Maximum accepted stock-manifest length.</summary>
+    internal const long MaximumManifestBytes = 1024 * 1024;
+
     /// <summary>Maximum accepted expanded-to-compressed ratio.</summary>
     internal const long MaximumCompressionRatio = 1000;
 
@@ -50,6 +54,12 @@ internal static class NpgsqlBackupArchive
     internal const int MaximumJsonRowBytes = 32 * 1024 * 1024;
 
     private const string Format = "jellyfin-npgsql-backup-v1";
+
+    private const string ManifestEntryName = "manifest.json";
+
+    private const UnixFileMode OwnerFileMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+
+    private static readonly TimeSpan RestoreDeadline = TimeSpan.FromMinutes(10);
 
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.General)
     {
@@ -129,18 +139,22 @@ internal static class NpgsqlBackupArchive
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(archivePath);
+        using var deadline = new CancellationTokenSource(RestoreDeadline);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token);
+        var operationToken = linked.Token;
         var directory = Path.GetDirectoryName(Path.GetFullPath(archivePath))
             ?? throw new InvalidOperationException("The stock backup archive has no parent directory.");
+        UnixFileMode? originalMode = OperatingSystem.IsWindows() ? null : File.GetUnixFileMode(archivePath);
         var temporaryPath = Path.Combine(
             directory,
             $".{Path.GetFileName(archivePath)}.{Guid.NewGuid():N}.npgsql-binding");
         try
         {
-            await CopyFileAsync(archivePath, temporaryPath, cancellationToken).ConfigureAwait(false);
+            await CopyFileAsync(archivePath, temporaryPath, operationToken).ConfigureAwait(false);
             using (var archive = await ZipFile.OpenAsync(
                 temporaryPath,
                 ZipArchiveMode.Update,
-                cancellationToken).ConfigureAwait(false))
+                operationToken).ConfigureAwait(false))
             {
                 ValidateArchiveLimits(archive);
                 ValidateEntryNames(archive);
@@ -154,6 +168,22 @@ internal static class NpgsqlBackupArchive
                     throw new InvalidDataException($"The stock backup unexpectedly already contains '{HomeSectionsEntryName}'.");
                 }
 
+                var manifest = await ReadManifestAsync(archive, operationToken).ConfigureAwait(false);
+                var existingEntries = new List<BoundEntry>(archive.Entries.Count) { manifest.Binding };
+                foreach (var entry in archive.Entries
+                    .Where(candidate => !string.Equals(candidate.FullName, ManifestEntryName, StringComparison.Ordinal))
+                    .OrderBy(candidate => candidate.FullName, StringComparer.Ordinal))
+                {
+                    existingEntries.Add(await ReadBoundEntryAsync(entry, operationToken).ConfigureAwait(false));
+                }
+
+                existingEntries.Sort((left, right) => StringComparer.Ordinal.Compare(left.Path, right.Path));
+                if (manifest.DatabaseIncluded != databaseIncluded)
+                {
+                    throw new InvalidDataException(
+                        "The stock manifest database option does not agree with the backup operation that is being bound.");
+                }
+
                 if (databaseIncluded)
                 {
                     BoundEntry homeSectionsBound;
@@ -164,7 +194,7 @@ internal static class NpgsqlBackupArchive
                         if (homeSectionsSnapshotPath is null)
                         {
                             var empty = "[]"u8.ToArray();
-                            await homeSectionsStream.WriteAsync(empty, cancellationToken).ConfigureAwait(false);
+                            await homeSectionsStream.WriteAsync(empty, operationToken).ConfigureAwait(false);
                             homeSectionsBound = new BoundEntry(
                                 HomeSectionsEntryName,
                                 empty.LongLength,
@@ -187,7 +217,7 @@ internal static class NpgsqlBackupArchive
                                 FileOptions.Asynchronous | FileOptions.SequentialScan);
                             await using (snapshotStream.ConfigureAwait(false))
                             {
-                                await snapshotStream.CopyToAsync(homeSectionsStream, cancellationToken).ConfigureAwait(false);
+                                await snapshotStream.CopyToAsync(homeSectionsStream, operationToken).ConfigureAwait(false);
                             }
 
                             var hashStream = new FileStream(
@@ -203,35 +233,28 @@ internal static class NpgsqlBackupArchive
                                     HomeSectionsEntryName,
                                     snapshotInfo.Length,
                                     Convert.ToHexStringLower(
-                                        await SHA256.HashDataAsync(hashStream, cancellationToken).ConfigureAwait(false)));
+                                        await SHA256.HashDataAsync(hashStream, operationToken).ConfigureAwait(false)));
                             }
                         }
                     }
 
-                    var entries = new List<BoundEntry>(archive.Entries.Count);
-                    foreach (var entry in archive.Entries
-                        .Where(candidate => !string.Equals(candidate.FullName, HomeSectionsEntryName, StringComparison.Ordinal))
-                        .OrderBy(candidate => candidate.FullName, StringComparer.Ordinal))
-                    {
-                        entries.Add(await ReadBoundEntryAsync(entry, cancellationToken).ConfigureAwait(false));
-                    }
-
+                    var entries = existingEntries;
                     entries.Add(homeSectionsBound);
                     entries.Sort((left, right) => StringComparer.Ordinal.Compare(left.Path, right.Path));
 
-                    await ValidateDatabaseShapeAsync(archive, cancellationToken).ConfigureAwait(false);
-                    await WriteMarkerAsync(archive, entries, databaseIncluded, cancellationToken).ConfigureAwait(false);
+                    await ValidateDatabaseShapeAsync(archive, operationToken).ConfigureAwait(false);
+                    await WriteMarkerAsync(archive, entries, databaseIncluded, operationToken).ConfigureAwait(false);
                 }
                 else
                 {
-                    var entries = new List<BoundEntry>(archive.Entries.Count);
-                    foreach (var entry in archive.Entries.OrderBy(candidate => candidate.FullName, StringComparer.Ordinal))
-                    {
-                        entries.Add(await ReadBoundEntryAsync(entry, cancellationToken).ConfigureAwait(false));
-                    }
-
-                    await WriteMarkerAsync(archive, entries, databaseIncluded, cancellationToken).ConfigureAwait(false);
+                    await ValidateDatabaseAbsenceAsync(archive).ConfigureAwait(false);
+                    await WriteMarkerAsync(archive, existingEntries, databaseIncluded, operationToken).ConfigureAwait(false);
                 }
+            }
+
+            if (!OperatingSystem.IsWindows() && originalMode is { } mode)
+            {
+                File.SetUnixFileMode(temporaryPath, mode);
             }
 
             File.Move(temporaryPath, archivePath, true);
@@ -289,7 +312,7 @@ internal static class NpgsqlBackupArchive
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(archivePath);
-        using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+        using var deadline = new CancellationTokenSource(RestoreDeadline);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token);
         var validationToken = linked.Token;
         var archiveInfo = new FileInfo(archivePath);
@@ -342,6 +365,12 @@ internal static class NpgsqlBackupArchive
                     $"the provider/version binding is not exactly {PluginMetadata.Name} {PluginMetadata.Version} for database ABI {PluginMetadata.SupportedDatabaseAbi}");
             }
 
+            var manifest = await ReadManifestAsync(archive, validationToken).ConfigureAwait(false);
+            if (marker.DatabaseIncluded != manifest.DatabaseIncluded)
+            {
+                throw Unsupported("the provider binding and stock manifest disagree about whether database content is included");
+            }
+
             var actualEntries = archive.Entries
                 .Where(entry => !string.Equals(entry.FullName, MarkerEntryName, StringComparison.Ordinal))
                 .OrderBy(entry => entry.FullName, StringComparer.Ordinal)
@@ -364,6 +393,10 @@ internal static class NpgsqlBackupArchive
             if (marker.DatabaseIncluded)
             {
                 await ValidateDatabaseShapeAsync(archive, validationToken, model: model).ConfigureAwait(false);
+            }
+            else
+            {
+                await ValidateDatabaseAbsenceAsync(archive).ConfigureAwait(false);
             }
         }
     }
@@ -388,6 +421,10 @@ internal static class NpgsqlBackupArchive
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(archivePath);
+        using var deadline = new CancellationTokenSource(RestoreDeadline);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, deadline.Token);
+        var operationToken = linked.Token;
+        operationToken.ThrowIfCancellationRequested();
         var sourceInfo = new FileInfo(archivePath);
         if (!sourceInfo.Exists)
         {
@@ -406,8 +443,8 @@ internal static class NpgsqlBackupArchive
             $".jellyfin-npgsql-restore-{Guid.NewGuid():N}.zip");
         try
         {
-            await CopyFileAsync(archivePath, snapshotPath, cancellationToken).ConfigureAwait(false);
-            await ValidateAsync(snapshotPath, model, cancellationToken).ConfigureAwait(false);
+            await CopyFileAsync(archivePath, snapshotPath, operationToken).ConfigureAwait(false);
+            await ValidateAsync(snapshotPath, model, operationToken).ConfigureAwait(false);
             return new ValidatedArchiveSnapshot(snapshotPath);
         }
         catch
@@ -459,6 +496,95 @@ internal static class NpgsqlBackupArchive
         if (model is null)
         {
             await ValidateJsonObjectArrayAsync(homeSectionsEntry, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static Task ValidateDatabaseAbsenceAsync(ZipArchive archive)
+    {
+        var unexpected = archive.Entries
+            .Where(entry => entry.FullName.StartsWith("Database/", StringComparison.Ordinal)
+                && !string.Equals(entry.FullName, MarkerEntryName, StringComparison.Ordinal))
+            .Select(entry => entry.FullName)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (unexpected.Length != 0)
+        {
+            throw Unsupported(
+                $"the stock manifest excludes database content but database entries are present [{string.Join(", ", unexpected)}]");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static async Task<StockManifest> ReadManifestAsync(
+        ZipArchive archive,
+        CancellationToken cancellationToken)
+    {
+        var entries = archive.Entries
+            .Where(entry => string.Equals(entry.FullName, ManifestEntryName, StringComparison.Ordinal))
+            .ToArray();
+        if (entries.Length != 1)
+        {
+            throw Unsupported("the stock manifest is missing or duplicated");
+        }
+
+        var entry = entries[0];
+        var entryLength = entry.Length;
+        if (entryLength > MaximumManifestBytes)
+        {
+            throw new InvalidDataException("The stock backup manifest exceeds its supported size limit.");
+        }
+
+        var stream = await OpenBoundedAsync(entry, MaximumManifestBytes, cancellationToken).ConfigureAwait(false);
+        await using (stream.ConfigureAwait(false))
+        {
+            using var manifestBytes = new MemoryStream((int)entryLength);
+            await stream.CopyToAsync(manifestBytes, cancellationToken).ConfigureAwait(false);
+            var bytes = manifestBytes.ToArray();
+            JsonDocument document;
+            try
+            {
+                document = JsonDocument.Parse(
+                    bytes,
+                    new JsonDocumentOptions { AllowTrailingCommas = true, MaxDepth = SerializerOptions.MaxDepth });
+            }
+            catch (JsonException exception)
+            {
+                throw new InvalidDataException("The stock backup manifest is malformed.", exception);
+            }
+
+            using (document)
+            {
+                if (document.RootElement.ValueKind is not JsonValueKind.Object)
+                {
+                    throw new InvalidDataException("The stock backup manifest must be a JSON object.");
+                }
+
+                var optionsProperties = document.RootElement.EnumerateObject()
+                    .Where(property => string.Equals(property.Name, "Options", StringComparison.Ordinal))
+                    .ToArray();
+                if (optionsProperties.Length != 1 || optionsProperties[0].Value.ValueKind is not JsonValueKind.Object)
+                {
+                    throw new InvalidDataException("The stock backup manifest must contain exactly one object-valued Options property.");
+                }
+
+                var databaseProperties = optionsProperties[0].Value.EnumerateObject()
+                    .Where(property => string.Equals(property.Name, "Database", StringComparison.Ordinal))
+                    .ToArray();
+                if (databaseProperties.Length != 1
+                    || databaseProperties[0].Value.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                {
+                    throw new InvalidDataException(
+                        "The stock backup manifest must contain exactly one boolean Options.Database property.");
+                }
+
+                return new StockManifest(
+                    databaseProperties[0].Value.GetBoolean(),
+                    new BoundEntry(
+                        ManifestEntryName,
+                        entryLength,
+                        Convert.ToHexStringLower(SHA256.HashData(bytes))));
+            }
         }
     }
 
@@ -603,7 +729,15 @@ internal static class NpgsqlBackupArchive
                         throw new InvalidDataException("The database migration history contains an invalid row.");
                     }
 
-                    state.AddHistory(history.MigrationId);
+                    if (history.MigrationId.Length > 150
+                        || history.ProductVersion.Length > 32
+                        || !IsValidMigrationId(history.MigrationId)
+                        || !Version.TryParse(history.ProductVersion, out _))
+                    {
+                        throw new InvalidDataException("The database migration history contains an invalid row.");
+                    }
+
+                    state.AddHistory(history.MigrationId, history.ProductVersion);
                     rows++;
                     stream.ResetSegmentBudget();
                 }
@@ -692,6 +826,7 @@ internal static class NpgsqlBackupArchive
     private static void ValidateEntryNames(ZipArchive archive)
     {
         var names = new HashSet<string>(StringComparer.Ordinal);
+        var canonicalNames = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in archive.Entries)
         {
             if (!names.Add(entry.FullName))
@@ -699,12 +834,85 @@ internal static class NpgsqlBackupArchive
                 throw new InvalidDataException($"The backup contains duplicate entry '{entry.FullName}'.");
             }
 
-            if (Path.IsPathRooted(entry.FullName)
-                || entry.FullName.Split('/').Any(segment => segment is "." or ".."))
+            var isDirectory = entry.FullName.EndsWith('/');
+            if (string.IsNullOrEmpty(entry.FullName)
+                || Path.IsPathRooted(entry.FullName)
+                || entry.FullName.StartsWith('/')
+                || entry.FullName.Contains('\\', StringComparison.Ordinal)
+                || entry.FullName.Contains("//", StringComparison.Ordinal)
+                || entry.FullName.Contains('\0', StringComparison.Ordinal))
             {
                 throw new InvalidDataException($"The backup contains unsafe entry name '{entry.FullName}'.");
             }
+
+            var path = isDirectory ? entry.FullName[..^1] : entry.FullName;
+            var segments = path.Split('/');
+            if (segments.Length == 0
+                || segments.Any(segment => segment.Length == 0
+                    || segment is "." or ".."
+                    || segment.Contains(':', StringComparison.Ordinal)
+                    || segment.EndsWith(' ')
+                    || segment.EndsWith('.')
+                    || segment.Any(char.IsControl)))
+            {
+                throw new InvalidDataException($"The backup contains unsafe entry name '{entry.FullName}'.");
+            }
+
+            var canonical = string.Join('/', segments.Select(segment => segment.Normalize(NormalizationForm.FormC)));
+            if (canonicalNames.TryGetValue(canonical, out var existingDirectory))
+            {
+                var kind = existingDirectory == isDirectory ? "alias" : "file/directory collision";
+                throw new InvalidDataException(
+                    $"The backup contains a canonical {kind} for entry '{entry.FullName}'.");
+            }
+
+            var ancestor = string.Empty;
+            for (var index = 0; index < segments.Length - 1; index++)
+            {
+                ancestor = index == 0 ? segments[index] : ancestor + "/" + segments[index];
+                ancestor = ancestor.Normalize(NormalizationForm.FormC);
+                if (canonicalNames.TryGetValue(ancestor, out var ancestorIsDirectory) && !ancestorIsDirectory)
+                {
+                    throw new InvalidDataException(
+                        $"The backup contains a file/directory collision for entry '{entry.FullName}'.");
+                }
+            }
+
+            if (!isDirectory
+                && canonicalNames.Keys.Any(existing => existing.StartsWith(canonical + "/", StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new InvalidDataException(
+                    $"The backup contains a file/directory collision for entry '{entry.FullName}'.");
+            }
+
+            canonicalNames.Add(canonical, isDirectory);
         }
+    }
+
+    private static bool IsValidMigrationId(string migrationId)
+    {
+        if (migrationId.Length < 16 || migrationId[14] != '_')
+        {
+            return false;
+        }
+
+        for (var index = 0; index < migrationId.Length; index++)
+        {
+            var character = migrationId[index];
+            if (index < 14)
+            {
+                if (!char.IsAsciiDigit(character))
+                {
+                    return false;
+                }
+            }
+            else if (index > 14 && !(char.IsAsciiLetterOrDigit(character) || character == '_'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static void ValidateArchiveLimits(ZipArchive archive)
@@ -774,6 +982,7 @@ internal static class NpgsqlBackupArchive
 
     private static async Task CopyFileAsync(string source, string destination, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var sourceStream = new FileStream(
             source,
             FileMode.Open,
@@ -781,13 +990,20 @@ internal static class NpgsqlBackupArchive
             FileShare.Read,
             131072,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
-        var destinationStream = new FileStream(
-            destination,
-            FileMode.CreateNew,
-            FileAccess.Write,
-            FileShare.None,
-            131072,
-            FileOptions.Asynchronous | FileOptions.WriteThrough);
+        var destinationOptions = new FileStreamOptions
+        {
+            Mode = FileMode.CreateNew,
+            Access = FileAccess.Write,
+            Share = FileShare.None,
+            BufferSize = 131072,
+            Options = FileOptions.Asynchronous | FileOptions.WriteThrough,
+        };
+        if (!OperatingSystem.IsWindows())
+        {
+            destinationOptions.UnixCreateMode = OwnerFileMode;
+        }
+
+        var destinationStream = new FileStream(destination, destinationOptions);
         await using (sourceStream.ConfigureAwait(false))
         await using (destinationStream.ConfigureAwait(false))
         {
@@ -850,6 +1066,8 @@ internal static class NpgsqlBackupArchive
 
     private sealed record BoundEntry(string Path, long Length, string Sha256);
 
+    private sealed record StockManifest(bool DatabaseIncluded, BoundEntry Binding);
+
     private sealed class ModelValidationState
     {
         private static readonly string[] PluginMigrationIds =
@@ -863,6 +1081,7 @@ internal static class NpgsqlBackupArchive
         private readonly Dictionary<IIndex, HashSet<string>> uniqueIndexes = new();
         private readonly Dictionary<IForeignKey, HashSet<string>> foreignKeys = new();
         private readonly HashSet<string> histories = new(StringComparer.Ordinal);
+        private readonly List<string> orderedHistories = new();
 
         internal ModelValidationState(IModel model)
         {
@@ -885,12 +1104,28 @@ internal static class NpgsqlBackupArchive
             }
         }
 
-        internal void AddHistory(string migrationId)
+        internal void AddHistory(string migrationId, string productVersion)
         {
             if (!this.histories.Add(migrationId))
             {
                 throw new InvalidDataException($"The database migration history contains duplicate id '{migrationId}'.");
             }
+
+            var expectedProductVersion = NpgsqlHostMigrationAudit.AuditedMigrationIds.Contains(
+                migrationId,
+                StringComparer.Ordinal)
+                ? PluginMetadata.SupportedDatabaseAbi
+                : PluginMigrationIds.Contains(migrationId, StringComparer.Ordinal)
+                    ? ProductInfo.GetVersion()
+                    : null;
+            if (expectedProductVersion is null
+                || !string.Equals(productVersion, expectedProductVersion, StringComparison.Ordinal))
+            {
+                throw Unsupported(
+                    $"migration '{migrationId}' has ProductVersion '{productVersion}' instead of its exact supported value");
+            }
+
+            this.orderedHistories.Add(migrationId);
         }
 
         internal void AddEntity(IEntityType entityType, JsonElement json, string path)
@@ -987,13 +1222,13 @@ internal static class NpgsqlBackupArchive
         {
             var expectedHistory = NpgsqlHostMigrationAudit.AuditedMigrationIds
                 .Concat(PluginMigrationIds)
-                .ToHashSet(StringComparer.Ordinal);
-            if (!this.histories.SetEquals(expectedHistory))
+                .ToArray();
+            if (!this.orderedHistories.SequenceEqual(expectedHistory, StringComparer.Ordinal))
             {
                 var missing = expectedHistory.Except(this.histories, StringComparer.Ordinal).Order(StringComparer.Ordinal);
                 var unknown = this.histories.Except(expectedHistory, StringComparer.Ordinal).Order(StringComparer.Ordinal);
                 throw Unsupported(
-                    $"the migration history is not the exact supported lineage; missing [{string.Join(", ", missing)}], unknown [{string.Join(", ", unknown)}]");
+                    $"the migration history is not the exact supported ordered lineage; missing [{string.Join(", ", missing)}], unknown [{string.Join(", ", unknown)}]");
             }
 
             foreach (var (foreignKey, references) in this.foreignKeys)
@@ -1200,7 +1435,17 @@ internal static class NpgsqlBackupArchive
 
         private void Account(int read)
         {
-            this.consumed += read;
+            try
+            {
+                this.consumed = checked(this.consumed + read);
+            }
+            catch (OverflowException exception)
+            {
+                throw new InvalidDataException(
+                    $"Backup entry '{this.entryName}' overflowed its streamed size accounting.",
+                    exception);
+            }
+
             if (this.consumed > this.limit)
             {
                 throw new InvalidDataException($"Backup entry '{this.entryName}' exceeded its supported size while streaming.");
