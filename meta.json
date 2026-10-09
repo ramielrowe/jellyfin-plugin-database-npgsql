@@ -7,7 +7,7 @@
   "category": "Database",
   "imageUrl": "",
   "versions": [],
-  "status": "Disabled",
+  "status": "Active",
   "targetAbi": "12.2.0.0",
   "version": "0.1.0.0",
   "changelog": "Initial standalone provider package.",

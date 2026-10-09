@@ -168,6 +168,8 @@ API/media-scan proof, and intentional provider differences are documented in
 [`docs/persistence-parity.md`](docs/persistence-parity.md).
 The atomic backup format, validation boundaries, and transactional restore are
 documented in [`docs/migration-backups.md`](docs/migration-backups.md).
+Stock database-inclusive backup and restore behavior is documented in
+[`docs/full-system-backup.md`](docs/full-system-backup.md).
 The checked-in predecessor package and exact fresh-start, upgrade, restart, and
 failure matrix are documented in
 [`docs/stock-lifecycle.md`](docs/stock-lifecycle.md).

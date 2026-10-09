@@ -1015,6 +1015,17 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
         if destination not in target.parents and target != destination:
             raise SystemExit(f"unsafe ZIP path: {entry.filename}")
     archive.extractall(destination)' "$PACKAGE_ZIP" "$PLUGIN_FOLDER"
+# The provider must be available to Jellyfin's early database loader while its
+# ordinary plugin entry remains disabled for the prefix-selection failure
+# matrix below. The shipped manifest is active so vanilla installations get
+# the backup integration; stage an explicit disabled copy only for this phase.
+python3 - "$PLUGIN_FOLDER/meta.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+metadata = json.loads(path.read_text(encoding="utf-8"))
+metadata["status"] = "Disabled"
+path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+PY
 dotnet build \
     "$PLUGIN_PROJECT" \
     --configuration Release \
@@ -1022,8 +1033,8 @@ dotnet build \
     -p:PackagingFailureMigration=true
 
 mkdir -p "$OLD_PLUGIN_FOLDER" "$AMBIGUOUS_PLUGIN_FOLDER"
-cp "$PLUGIN_ROOT/meta.json" "$OLD_PLUGIN_FOLDER/meta.json"
-cp "$PLUGIN_ROOT/meta.json" "$AMBIGUOUS_PLUGIN_FOLDER/meta.json"
+cp "$PLUGIN_FOLDER/meta.json" "$OLD_PLUGIN_FOLDER/meta.json"
+cp "$PLUGIN_FOLDER/meta.json" "$AMBIGUOUS_PLUGIN_FOLDER/meta.json"
 cp "$PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.dll" "$AMBIGUOUS_PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.dll"
 cp "$PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.deps.json" "$AMBIGUOUS_PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.deps.json"
 cp "$PLUGIN_FOLDER/Npgsql.EntityFrameworkCore.PostgreSQL.dll" "$AMBIGUOUS_PLUGIN_FOLDER/Npgsql.EntityFrameworkCore.PostgreSQL.dll"
@@ -1391,7 +1402,13 @@ stop_host "$HTTP_PORT" "$FIRST_TOKEN" || fail "first host did not stop cleanly"
 FOREIGN_KEY_COUNT=$(psql_value "SELECT COUNT(*) FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class r ON r.oid=c.conrelid JOIN pg_catalog.pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname='public' AND c.contype='f'")
 [ "$FOREIGN_KEY_COUNT" -gt 0 ] || fail "baseline contains no foreign keys"
 
-sed 's/"status": "Disabled"/"status": "Active"/' "$PLUGIN_ROOT/meta.json" >"$PLUGIN_FOLDER/meta.json"
+python3 - "$PLUGIN_FOLDER/meta.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+metadata = json.loads(path.read_text(encoding="utf-8"))
+metadata["status"] = "Active"
+path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+PY
 start_host "$RUN_ROOT/active-scan.log"
 wait_for_health "$HTTP_PORT" || fail "vanilla Jellyfin did not survive the later active plugin scan"
 grep -F 'Registering whitelisted assemblies for plugin "Npgsql Database"' "$RUN_ROOT/active-scan.log" >/dev/null \

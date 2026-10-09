@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Npgsql;
 
@@ -57,10 +58,29 @@ internal static class NpgsqlDatabaseOperations
         IEnumerable<string>? tableNames)
     {
         ArgumentNullException.ThrowIfNull(dbContext);
-        var sql = BuildPurgeSql(dbContext.Model, tableNames);
+        var requestedNames = tableNames?.Distinct(StringComparer.Ordinal).ToArray();
+        var sql = BuildPurgeSql(dbContext.Model, requestedNames);
         if (sql is null)
         {
             return;
+        }
+
+        if (NpgsqlRestoreScope.IsActive)
+        {
+            await PurgeForStockRestoreAsync(dbContext, requestedNames).ConfigureAwait(false);
+            return;
+        }
+
+        var stockTables = GetStockTableNames(dbContext);
+        if (requestedNames is not null
+            && requestedNames.Order(StringComparer.Ordinal).SequenceEqual(stockTables, StringComparer.Ordinal))
+        {
+            await RepairExpectedHistoryAsync(
+                dbContext,
+                dbContext.Database.GetMigrations().Order(StringComparer.Ordinal).ToArray()).ConfigureAwait(false);
+            throw new NotSupportedException(
+                "Refusing an unvalidated stock PostgreSQL restore purge because the regular Npgsql plugin safety decorator is inactive. "
+                + "The expected migration history was repaired and application tables were not purged.");
         }
 
         var ownsTransaction = dbContext.Database.CurrentTransaction is null;
@@ -73,6 +93,163 @@ internal static class NpgsqlDatabaseOperations
         {
             await transaction.CommitAsync().ConfigureAwait(false);
         }
+    }
+
+    private static async Task PurgeForStockRestoreAsync(
+        JellyfinDbContext dbContext,
+        string[]? requestedNames)
+    {
+        if (dbContext.Database.CurrentTransaction is not null)
+        {
+            throw new InvalidOperationException("Stock PostgreSQL restore unexpectedly entered PurgeDatabase with an existing transaction.");
+        }
+
+        if (NpgsqlRestoreScope.ArchivePath is { } archivePath)
+        {
+            // Validate in the early-provider load context too. This makes the
+            // process-wide Activity carrier a signal, not an authorization.
+            await NpgsqlBackupArchive.ValidateAsync(archivePath, CancellationToken.None).ConfigureAwait(false);
+        }
+
+        var stockTables = GetStockTableNames(dbContext);
+        var actualRequestedNames = requestedNames?.Order(StringComparer.Ordinal).ToArray() ?? stockTables;
+        if (!actualRequestedNames.SequenceEqual(stockTables, StringComparer.Ordinal))
+        {
+            var missing = stockTables.Except(actualRequestedNames, StringComparer.Ordinal);
+            var unknown = actualRequestedNames.Except(stockTables, StringComparer.Ordinal);
+            throw new InvalidOperationException(
+                $"Stock PostgreSQL restore did not request the exact audited Jellyfin table set. Missing: [{string.Join(", ", missing)}]. "
+                + $"Unknown: [{string.Join(", ", unknown)}].");
+        }
+
+        var pluginMigrations = dbContext.Database.GetMigrations().Order(StringComparer.Ordinal).ToArray();
+        var expectedHistory = NpgsqlHostMigrationAudit.AuditedMigrationIds
+            .Concat(pluginMigrations)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        var actualHistory = (await dbContext.Database.GetAppliedMigrationsAsync().ConfigureAwait(false))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        if (!actualHistory.SequenceEqual(expectedHistory, StringComparer.Ordinal))
+        {
+            await RepairExpectedHistoryAsync(dbContext, pluginMigrations).ConfigureAwait(false);
+            var missing = expectedHistory.Except(actualHistory, StringComparer.Ordinal);
+            var unknown = actualHistory.Except(expectedHistory, StringComparer.Ordinal);
+            throw new NotSupportedException(
+                $"The PostgreSQL restore archive has an incompatible migration lineage. Missing: [{string.Join(", ", missing)}]. "
+                + $"Unknown: [{string.Join(", ", unknown)}]. The current lineage was repaired and application tables were not purged.");
+        }
+
+        var transaction = await dbContext.Database.BeginTransactionAsync().ConfigureAwait(false);
+        try
+        {
+            // Stock enumerates only public DbSet properties. HomeSection is a
+            // separately mapped navigation table and must be purged with its
+            // owning DisplayPreferences rows to satisfy its foreign key.
+            var purgeSql = BuildPurgeSql(dbContext.Model, null)
+                ?? throw new InvalidOperationException("The audited Jellyfin model contains no tables to restore.");
+            purgeSql = purgeSql.Replace(
+                " RESTART IDENTITY",
+                $", {QuoteTableName("public", "__JellyfinTextNodes")} RESTART IDENTITY",
+                StringComparison.Ordinal);
+            await dbContext.Database.ExecuteSqlRawAsync(purgeSql).ConfigureAwait(false);
+            var reseedSql = BuildIdentityReseedSql(dbContext.Model);
+            NpgsqlRestoreCoordinator.Register(dbContext, transaction, reseedSql);
+        }
+        catch
+        {
+            await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
+            await transaction.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private static async Task RepairExpectedHistoryAsync(
+        JellyfinDbContext dbContext,
+        IReadOnlyList<string> pluginMigrations)
+    {
+        await using var transaction = await dbContext.Database.BeginTransactionAsync().ConfigureAwait(false);
+        await dbContext.Database.ExecuteSqlRawAsync("DELETE FROM public.\"__EFMigrationsHistory\"").ConfigureAwait(false);
+        foreach (var migrationId in NpgsqlHostMigrationAudit.AuditedMigrationIds)
+        {
+            await dbContext.Database.ExecuteSqlInterpolatedAsync(
+                $"INSERT INTO public.\"__EFMigrationsHistory\" (\"MigrationId\", \"ProductVersion\") VALUES ({migrationId}, {PluginMetadata.SupportedDatabaseAbi})").ConfigureAwait(false);
+        }
+
+        foreach (var migrationId in pluginMigrations)
+        {
+            await dbContext.Database.ExecuteSqlInterpolatedAsync(
+                $"INSERT INTO public.\"__EFMigrationsHistory\" (\"MigrationId\", \"ProductVersion\") VALUES ({migrationId}, {ProductInfo.GetVersion()})").ConfigureAwait(false);
+        }
+
+        await transaction.CommitAsync().ConfigureAwait(false);
+    }
+
+    private static string[] GetStockTableNames(JellyfinDbContext dbContext)
+        => typeof(JellyfinDbContext)
+            .GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
+            .Where(property => property.PropertyType.IsAssignableTo(typeof(IQueryable)))
+            .Select(property => dbContext.Model.FindEntityType(property.PropertyType.GetGenericArguments()[0])!.GetSchemaQualifiedTableName()!)
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+
+    /// <summary>
+    /// Builds sequence repair statements for every identity column owned by the finalized model.
+    /// </summary>
+    /// <param name="model">The finalized Jellyfin model.</param>
+    /// <returns>Exact-schema-qualified, model-derived reseed SQL.</returns>
+    internal static string BuildIdentityReseedSql(IReadOnlyModel model)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        var columns = new HashSet<(string Schema, string Table, string Column)>();
+        foreach (var entityType in model.GetEntityTypes())
+        {
+            var table = entityType.GetTableName();
+            if (table is null)
+            {
+                continue;
+            }
+
+            var schema = entityType.GetSchema() ?? "public";
+            var storeObject = StoreObjectIdentifier.Table(table, entityType.GetSchema());
+            foreach (var property in entityType.GetProperties())
+            {
+                var strategy = property.FindAnnotation("Npgsql:ValueGenerationStrategy")?.Value?.ToString();
+                if (strategy is null || !strategy.StartsWith("Identity", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var column = property.GetColumnName(storeObject)
+                    ?? throw new InvalidOperationException($"Identity property '{property.DeclaringType.Name}.{property.Name}' has no table column.");
+                columns.Add((schema, table, column));
+            }
+        }
+
+        if (columns.Count == 0)
+        {
+            throw new InvalidOperationException("The audited Jellyfin PostgreSQL model unexpectedly contains no identity columns.");
+        }
+
+        // The bounded long-text trie is intentionally provider-owned rather
+        // than part of Jellyfin's CLR model. Stock backup restores its logical
+        // source strings, so triggers rebuild the trie and its identity too.
+        columns.Add(("public", "__JellyfinTextNodes", "Id"));
+
+        return string.Join(
+            ";\n",
+            columns.OrderBy(item => item.Schema, StringComparer.Ordinal)
+                .ThenBy(item => item.Table, StringComparer.Ordinal)
+                .ThenBy(item => item.Column, StringComparer.Ordinal)
+                .Select(item =>
+                {
+                    var qualifiedTable = $"{QuoteIdentifier(item.Schema)}.{QuoteIdentifier(item.Table)}";
+                    var column = QuoteIdentifier(item.Column);
+                    var tableLiteral = qualifiedTable.Replace("'", "''", StringComparison.Ordinal);
+                    var columnLiteral = item.Column.Replace("'", "''", StringComparison.Ordinal);
+                    return $"SELECT pg_catalog.setval(pg_catalog.pg_get_serial_sequence('{tableLiteral}', '{columnLiteral}')::pg_catalog.regclass, COALESCE(pg_catalog.max({column})::bigint, 1), pg_catalog.max({column}) IS NOT NULL) FROM {qualifiedTable}";
+                })) + ";";
     }
 
     /// <summary>

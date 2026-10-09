@@ -29,6 +29,7 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
     private bool _disposed;
     private bool _logCompleted;
     private bool _expectedStartupFailure;
+    private bool _expectedScheduledRestart;
 
     private JellyfinHostProcess(
         JellyfinHostLayout layout,
@@ -328,6 +329,25 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             throw;
         }
     }
+
+    internal async Task WaitForExpectedScheduledRestartAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        _expectedScheduledRestart = true;
+        await WaitForExitAsync(timeout, cancellationToken).ConfigureAwait(false);
+        if (_supervisor.Process.ExitCode is not 0 and not 143)
+        {
+            throw new InvalidOperationException(
+                $"Jellyfin's scheduled restart exited with unexpected status {_supervisor.Process.ExitCode}.");
+        }
+
+        await CompleteLogAsync().ConfigureAwait(false);
+        _layout.CollectSanitizedLogs(_redactor);
+        await _layout.Publish.VerifyUnchangedAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    internal void ExpectScheduledRestart() => _expectedScheduledRestart = true;
 
     public async Task TerminateAsync()
     {
@@ -746,7 +766,10 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             throw new InvalidOperationException("The Linux process supervisor failed: " + _redactor.Redact(diagnostic));
         }
 
-        if (_supervisor.Process.ExitCode != 0 && !_supervisor.WasTerminationRequested && !_expectedStartupFailure)
+        if (_supervisor.Process.ExitCode != 0
+            && !_supervisor.WasTerminationRequested
+            && !_expectedStartupFailure
+            && !_expectedScheduledRestart)
         {
             throw new InvalidOperationException(
                 $"The supervised Jellyfin host exited unexpectedly with status {_supervisor.Process.ExitCode}: "

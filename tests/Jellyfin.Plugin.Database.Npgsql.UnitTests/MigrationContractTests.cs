@@ -54,6 +54,20 @@ public sealed class MigrationContractTests
     }
 
     [Fact]
+    public void RestoreReseed_CoversEveryAndOnlyPostgreSqlIdentityColumn()
+    {
+        using var context = CreateRuntimeContext();
+
+        var sql = NpgsqlDatabaseOperations.BuildIdentityReseedSql(context.Model);
+
+        Assert.Equal(13, sql.Split("SELECT pg_catalog.setval", StringSplitOptions.None).Length - 1);
+        Assert.Contains("\"public\".\"ActivityLogs\"", sql, StringComparison.Ordinal);
+        Assert.Contains("\"public\".\"Permissions\"", sql, StringComparison.Ordinal);
+        Assert.Contains("pg_catalog.pg_get_serial_sequence", sql, StringComparison.Ordinal);
+        Assert.Contains("\"public\".\"__JellyfinTextNodes\"", sql, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void HostMigrationAudit_AcceptsOnlyTheExactPinnedSet()
     {
         Assert.Equal(
