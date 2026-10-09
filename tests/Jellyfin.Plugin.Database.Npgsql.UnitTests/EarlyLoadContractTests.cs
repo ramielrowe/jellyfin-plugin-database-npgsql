@@ -72,7 +72,7 @@ public sealed class EarlyLoadContractTests
 
     [Theory]
     [InlineData(12, 2, 0, 0, true)]
-    [InlineData(12, 2, 99, 0, true)]
+    [InlineData(12, 2, 99, 0, false)]
     [InlineData(12, 1, 0, 0, false)]
     [InlineData(12, 3, 0, 0, false)]
     [InlineData(13, 0, 0, 0, false)]

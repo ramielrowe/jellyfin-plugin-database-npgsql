@@ -49,6 +49,11 @@ dotnet_diagnostic.SA1633.severity = none
 [src/Jellyfin.Plugin.Database.Npgsql/Migrations/*.cs]
 generated_code = true
 
+[tests/fixtures/predecessor/source-tree/**/*.cs]
+# This is an integrity-pinned historical release snapshot. Current formatters
+# and analyzers must not rewrite it; its dedicated project compiles it as-is.
+generated_code = true
+
 [src/Jellyfin.Plugin.Database.Npgsql/{NpgsqlDatabaseOperations,NpgsqlDatabaseProvider}.cs]
 # Raw SQL literals are intentionally kept readable, and the helpers quote every
 # interpolated identifier/value. Async-disposable CA2007 cannot be satisfied by

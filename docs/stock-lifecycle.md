@@ -8,8 +8,13 @@ cache, media, logs, migration backups, and PostgreSQL all remain outside the
 publish.
 
 `StockServerLifecycleTests` builds a genuine `0.0.9.0` predecessor from the
-checked-in fixture project. That assembly contains only the baseline and index
-migrations. The test records the SHA-256 of both predecessor and current ZIPs,
+checked-in, immutable source snapshot rooted at plugin commit
+`f7575d769132236431388eddbcd13525d4507150`. That assembly contains only the
+baseline and index migrations. A checked-in manifest asserts the complete
+source-tree, DLL, and deterministic ZIP SHA-256 values and rejects post-0.0.9
+symbols. The fixture project can compile only `source-tree/**/*.cs`, so a change
+to the current production tree cannot silently change the predecessor. The test
+also records the SHA-256 of both predecessor and current ZIPs,
 installs the predecessor before first start, and writes vanilla
 `PLUGIN_PROVIDER` configuration. It completes setup over HTTP, creates two
 users, adds and scans a metadata-rich movie library, shuts down through the
@@ -21,10 +26,24 @@ migration is the only new database migration. A third fresh process proves the
 available through the public API. No SQLite database file may appear.
 
 The predecessor fixture is source, metadata, and migrations rather than a
-checked-in binary. Its package reuses the release ZIP's integrity-checked
-Npgsql runtime dependencies, so the only intentional differences are the
-provider assembly, dependency manifest, version metadata, and shorter
-migration lineage.
+checked-in binary. Its package reuses only the release ZIP's version-locked
+Npgsql runtime binaries; the fixture supplies its own provider assembly,
+dependency manifest, metadata, and shorter migration lineage. Any dependency
+binary change changes the asserted predecessor ZIP hash and fails the audit.
+
+## Supported-host upgrade limitation
+
+This release deliberately supports the exact `Jellyfin.Database.Implementations`
+ABI `12.2.0.0`, not an untested `12.2.x` range. Jellyfin tag `v12.2` and the
+`release-12.z` ref both resolve to the single commit
+`ca0f16eb7c195f720a1493ed469a27c4657db0c6`; there is no second immutable,
+supported 12.2 host release to use as a genuine host-version upgrade fixture.
+The next available host line reports ABI `13.0.0.0` and is intentionally rejected
+before connection parsing. Consequently this release proves plugin `0.0.9.0` to
+`0.1.0.0` upgrade plus restart on the one supported stock host, and explicitly
+does not claim a host-version upgrade. A second supported host must be added to
+the integrity manifest and exercised against the same plugin/data/history/API
+state before the compatibility contract can be widened.
 
 ## Failure and recovery matrix
 
@@ -39,13 +58,15 @@ migration lineage.
 | Migration lock contention and timeout | `Snapshot_MigrationLockContentionTimesOutWithoutMutationOrArtifact` | The bounded command timeout leaves migration zero and publishes no backup. |
 | Deliberate transactional/non-transactional migration failure | `black-box-smoke.sh` and `MigrationBackupIntegrationTests` | The vanilla migration service calls provider restore; exact rows, schema, history, FKs, and sequence states return. |
 | Corrupt, stale, wrong-target, symlinked, partially written, or actively leased backup | `MigrationBackupIntegrationTests` restore cases | Validation/staging finishes before the target transaction; the target and published backup remain unchanged on failure. |
-| Missing/deleted selected provider | `StockServerLifecycleTests` and early-loader package smoke controls | Startup fails with the configured provider identity; tests assert that no SQLite fallback database is created. |
+| Missing folder/deleted assembly/ambiguous selection/deleted or disabled metadata | `StockServerLifecycleTests` and early-loader package smoke controls | Selection failures remain distinct, while disabled or absent ordinary-plugin metadata does not disable the early selected provider; no SQLite fallback database is created. |
 
-Connection refusal, authentication failure, a missing database, and PostgreSQL
-permission errors use Npgsql's bounded connection/command timeouts after the
-provider's secret-redacting configuration gate. The isolated database fixture
-and package smoke use generated credentials only, and all retained diagnostics
-are passed through the same bounded streaming redactor.
+`StockServerLifecycleTests` launches the untouched host from clean state for
+connection refusal, authentication failure, a missing database, and PostgreSQL
+permission denial. Each case asserts a 35-second outer bound, its stable
+Npgsql/PostgreSQL diagnostic, secret redaction, an unchanged public schema, and
+the absence of SQLite files. The isolated database fixture and package smoke use
+generated credentials only, and all retained diagnostics are passed through the
+same bounded streaming redactor.
 
 The exercised native publish is the official .NET publish layout used by the
 Jellyfin packaging pipeline. The test does not claim an official Linux

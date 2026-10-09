@@ -1,7 +1,9 @@
+using System.Diagnostics;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Xml.Linq;
 using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
 using Npgsql;
 using Xunit;
@@ -27,6 +29,253 @@ public sealed class StockServerLifecycleTests
         "THIRD-PARTY-NOTICES.md",
         "meta.json",
     ];
+
+    [Fact]
+    public async Task PredecessorFixture_IsImmutableAuditableAndIntegrityPinned()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var fixtureRoot = Path.Combine(repositoryRoot, "tests", "fixtures", "predecessor");
+        var manifest = JsonSerializer.Deserialize<PredecessorFixtureManifest>(
+            await File.ReadAllTextAsync(Path.Combine(fixtureRoot, "fixture-manifest.json"), cancellationToken),
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+            ?? throw new InvalidDataException("The predecessor fixture manifest was empty.");
+        Assert.Equal(PredecessorVersion, manifest.Version);
+        Assert.Equal(40, manifest.HistoricalSourceCommit.Length);
+        Assert.Equal(Successor, manifest.LastMigration);
+        Assert.Equal(51, manifest.ExpectedHistoryRows);
+
+        var sourceRoot = Path.Combine(fixtureRoot, "source-tree");
+        Assert.Equal(
+            manifest.SourceSha256,
+            await PristineJellyfinPublish.HashDirectoryAsync(sourceRoot, cancellationToken));
+        var fixtureProject = XDocument.Load(Path.Combine(
+            fixtureRoot,
+            "Jellyfin.Plugin.Database.Npgsql.PredecessorFixture.csproj"));
+        var compileIncludes = fixtureProject.Descendants("Compile")
+            .Select(element => (string?)element.Attribute("Include"))
+            .Where(value => value is not null)
+            .ToArray();
+        Assert.Equal(new[] { "source-tree/**/*.cs" }, compileIncludes);
+        Assert.DoesNotContain("../../../src", fixtureProject.ToString(), StringComparison.Ordinal);
+
+        var buildDirectory = Path.Combine(fixtureRoot, "bin", "Release", "net10.0");
+        var assemblyPath = Path.Combine(buildDirectory, PluginMetadata.AssemblyFileName);
+        Assert.True(File.Exists(assemblyPath), "Build the immutable predecessor fixture in Release before running its audit.");
+        Assert.Equal(manifest.AssemblySha256, await HashFileAsync(assemblyPath, cancellationToken));
+        var assemblyText = Encoding.UTF8.GetString(await File.ReadAllBytesAsync(assemblyPath, cancellationToken));
+        Assert.Contains(Successor, assemblyText, StringComparison.Ordinal);
+        Assert.Contains(PredecessorVersion, assemblyText, StringComparison.Ordinal);
+        foreach (var forbidden in manifest.ForbiddenPostReleaseSymbols)
+        {
+            Assert.DoesNotContain(forbidden, assemblyText, StringComparison.Ordinal);
+        }
+
+        var currentPackage = Path.Combine(
+            repositoryRoot,
+            "artifacts",
+            "jellyfin-plugin-database-npgsql_" + PluginMetadata.Version + ".zip");
+        Assert.True(File.Exists(currentPackage), "Build the audited current plugin ZIP before running the predecessor audit.");
+        using var artifacts = HostTestArtifactScope.Create("predecessor-integrity");
+        var package = CreatePredecessorPackage(repositoryRoot, currentPackage, artifacts.CaseDirectory);
+        var packageHash = await HashFileAsync(package, cancellationToken);
+        Assert.True(
+            string.Equals(manifest.PackageSha256, packageHash, StringComparison.Ordinal),
+            $"Predecessor package SHA-256 changed: {packageHash}");
+        using var archive = ZipFile.OpenRead(package);
+        Assert.Equal(PackageFiles.Order(StringComparer.Ordinal), archive.Entries.Select(entry => entry.FullName).Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task StockHost_ConnectionFailuresAreBoundedRedactedAndNeverFallbackOrMutate()
+    {
+        var databaseOptions = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(
+            databaseOptions.IsConfigured && IsCurrentHostConfigured(),
+            "Configure PostgreSQL and the integrity-pinned current stock host to run lifecycle connection failures.");
+
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(databaseOptions, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        using var artifacts = HostTestArtifactScope.Create("stock-lifecycle-connections");
+        var publish = await PristineJellyfinPublish.CreateAsync(
+            PristineJellyfinPublishOptions.FromEnvironment(),
+            Path.Combine(artifacts.CaseDirectory, "host"),
+            cancellationToken);
+        var package = CurrentPackage(repositoryRoot);
+        var originalSchema = await ReadPublicSchemaAsync(database.RuntimeConnectionString, cancellationToken);
+        Assert.Empty(originalSchema);
+        var valid = new NpgsqlConnectionStringBuilder(database.RuntimeConnectionString)
+        {
+            Timeout = 2,
+            CommandTimeout = 2,
+        };
+
+        var wrongPassword = "wrong-password-" + Guid.NewGuid().ToString("N");
+        var wrongCredentials = new NpgsqlConnectionStringBuilder(valid.ConnectionString) { Password = wrongPassword };
+        await AssertStockStartupFailureAsync(
+            publish,
+            package,
+            artifacts.CaseDirectory,
+            repositoryRoot,
+            "wrong-credentials",
+            wrongCredentials.ConnectionString,
+            [wrongPassword, valid.Password!],
+            ["28P01", "password authentication failed"],
+            cancellationToken);
+        Assert.Equal(originalSchema, await ReadPublicSchemaAsync(database.RuntimeConnectionString, cancellationToken));
+
+        var missingDatabaseName = TestResourceNames.Create("missing").DatabaseName;
+        var missingDatabase = new NpgsqlConnectionStringBuilder(valid.ConnectionString) { Database = missingDatabaseName };
+        await AssertStockStartupFailureAsync(
+            publish,
+            package,
+            artifacts.CaseDirectory,
+            repositoryRoot,
+            "missing-database",
+            missingDatabase.ConnectionString,
+            [valid.Password!],
+            ["does not exist"],
+            cancellationToken);
+        Assert.False(await PostgreSqlTestDatabase.DatabaseExistsAsync(
+            environment.AdministratorConnectionString,
+            missingDatabaseName,
+            cancellationToken));
+        Assert.Equal(originalSchema, await ReadPublicSchemaAsync(database.RuntimeConnectionString, cancellationToken));
+
+        using (var refusedPort = LoopbackPortReservation.Acquire(Path.Combine(artifacts.CaseDirectory, ".refused-port-leases")))
+        {
+            var refused = new NpgsqlConnectionStringBuilder(valid.ConnectionString)
+            {
+                Host = "127.0.0.1",
+                Port = refusedPort.Port,
+            };
+            await AssertStockStartupFailureAsync(
+                publish,
+                package,
+                artifacts.CaseDirectory,
+                repositoryRoot,
+                "network-unreachable",
+                refused.ConnectionString,
+                [valid.Password!],
+                ["operation has timed out", $"127.0.0.1:{refusedPort.Port}"],
+                cancellationToken);
+        }
+
+        Assert.Equal(originalSchema, await ReadPublicSchemaAsync(database.RuntimeConnectionString, cancellationToken));
+        await database.ExecuteAsync("REVOKE CREATE ON SCHEMA public FROM pg_database_owner", cancellationToken);
+        try
+        {
+            await AssertStockStartupFailureAsync(
+                publish,
+                package,
+                artifacts.CaseDirectory,
+                repositoryRoot,
+                "insufficient-permissions",
+                valid.ConnectionString,
+                [valid.Password!],
+                ["permission denied"],
+                cancellationToken);
+            Assert.Equal(originalSchema, await ReadPublicSchemaAsync(database.RuntimeConnectionString, cancellationToken));
+        }
+        finally
+        {
+            await database.ExecuteAsync("GRANT CREATE ON SCHEMA public TO pg_database_owner", CancellationToken.None);
+        }
+
+        await publish.VerifyUnchangedAsync(cancellationToken);
+    }
+
+    [Fact]
+    public async Task StockHost_SelectedProviderStatesAreDistinctAndNeverFallback()
+    {
+        var databaseOptions = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(
+            databaseOptions.IsConfigured && IsCurrentHostConfigured(),
+            "Configure PostgreSQL and the integrity-pinned current stock host to run selected-provider failures.");
+
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(databaseOptions, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        using var artifacts = HostTestArtifactScope.Create("stock-lifecycle-provider-states");
+        var publish = await PristineJellyfinPublish.CreateAsync(
+            PristineJellyfinPublishOptions.FromEnvironment(),
+            Path.Combine(artifacts.CaseDirectory, "host"),
+            cancellationToken);
+        var package = CurrentPackage(repositoryRoot);
+        var originalSchema = await ReadPublicSchemaAsync(database.RuntimeConnectionString, cancellationToken);
+        var secret = new NpgsqlConnectionStringBuilder(database.RuntimeConnectionString).Password!;
+
+        await AssertProviderSelectionFailureAsync(
+            publish,
+            package,
+            artifacts.CaseDirectory,
+            repositoryRoot,
+            database.RuntimeConnectionString,
+            "missing-folder",
+            installPackage: false,
+            deleteAssembly: false,
+            deleteMetadata: false,
+            pluginName: PluginMetadata.InstallationDirectory,
+            expectedDiagnostic: "requested custom database plugin",
+            secret,
+            cancellationToken);
+        await AssertProviderSelectionFailureAsync(
+            publish,
+            package,
+            artifacts.CaseDirectory,
+            repositoryRoot,
+            database.RuntimeConnectionString,
+            "deleted-assembly",
+            installPackage: true,
+            deleteAssembly: true,
+            deleteMetadata: false,
+            pluginName: PluginMetadata.InstallationDirectory,
+            expectedDiagnostic: "Could not find the requested assembly",
+            secret,
+            cancellationToken);
+        await AssertProviderSelectionFailureAsync(
+            publish,
+            package,
+            artifacts.CaseDirectory,
+            repositoryRoot,
+            database.RuntimeConnectionString,
+            "ambiguous-prefix",
+            installPackage: true,
+            deleteAssembly: false,
+            deleteMetadata: false,
+            pluginName: "Npgsql Database_0.1.0",
+            expectedDiagnostic: "exact folder and PluginName",
+            secret,
+            cancellationToken);
+
+        var wrongPassword = "metadata-proof-" + Guid.NewGuid().ToString("N");
+        var wrongCredentials = new NpgsqlConnectionStringBuilder(database.RuntimeConnectionString)
+        {
+            Password = wrongPassword,
+            Timeout = 2,
+            CommandTimeout = 2,
+        };
+        await AssertProviderSelectionFailureAsync(
+            publish,
+            package,
+            artifacts.CaseDirectory,
+            repositoryRoot,
+            wrongCredentials.ConnectionString,
+            "deleted-metadata-still-early-loads",
+            installPackage: true,
+            deleteAssembly: false,
+            deleteMetadata: true,
+            pluginName: PluginMetadata.InstallationDirectory,
+            expectedDiagnostic: "28P01",
+            wrongPassword,
+            cancellationToken);
+
+        Assert.Equal(originalSchema, await ReadPublicSchemaAsync(database.RuntimeConnectionString, cancellationToken));
+        await publish.VerifyUnchangedAsync(cancellationToken);
+    }
 
     [Fact]
     public async Task PackagedPredecessor_FreshStartUpgradeRestart_PreservesDataAndExactHistory()
@@ -140,6 +389,10 @@ public sealed class StockServerLifecycleTests
                 await predecessor.StopGracefullyAsync(adminToken, TimeSpan.FromSeconds(30), cancellationToken);
             }
 
+            var predecessorDiagnostics = ReadCollectedLogs(layout);
+            Assert.Contains("Npgsql database provider 0.0.9.0 loaded", predecessorDiagnostics, StringComparison.Ordinal);
+            Assert.Contains("Skipping disabled plugin", predecessorDiagnostics, StringComparison.Ordinal);
+
             var predecessorHistory = await ReadHistoryAsync(database.RuntimeConnectionString, cancellationToken);
             Assert.Equal(ExpectedHistory(includeUuidAggregates: false), predecessorHistory);
             Assert.Equal(2, await CountUsersAsync(database.RuntimeConnectionString, cancellationToken));
@@ -227,8 +480,7 @@ public sealed class StockServerLifecycleTests
                     missingHttpPort,
                     redactor,
                     ffmpeg);
-                _ = await Assert.ThrowsAsync<InvalidOperationException>(
-                    () => missingProvider.WaitUntilReadyAsync(TimeSpan.FromSeconds(30), cancellationToken));
+                await missingProvider.WaitForExpectedStartupFailureAsync(TimeSpan.FromSeconds(30), cancellationToken);
                 var diagnostics = ReadCollectedLogs(layout);
                 Assert.Contains("Could not find the requested assembly", diagnostics, StringComparison.Ordinal);
                 Assert.DoesNotContain(password, diagnostics, StringComparison.Ordinal);
@@ -258,6 +510,150 @@ public sealed class StockServerLifecycleTests
         {
             NpgsqlConnection.ClearAllPools();
         }
+    }
+
+    private static bool IsCurrentHostConfigured()
+        => !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(
+                PristineJellyfinPublishOptions.PublishDirectoryEnvironmentVariable))
+            || !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(
+                PristineJellyfinPublishOptions.ArchiveEnvironmentVariable));
+
+    private static string CurrentPackage(string repositoryRoot)
+    {
+        var package = Path.Combine(
+            repositoryRoot,
+            "artifacts",
+            "jellyfin-plugin-database-npgsql_" + PluginMetadata.Version + ".zip");
+        Assert.True(File.Exists(package), "Build the audited current plugin ZIP before running lifecycle tests.");
+        return package;
+    }
+
+    private static async Task AssertStockStartupFailureAsync(
+        PristineJellyfinPublish publish,
+        string package,
+        string caseRoot,
+        string repositoryRoot,
+        string caseName,
+        string connectionString,
+        string[] secrets,
+        string[] expectedDiagnostics,
+        CancellationToken cancellationToken)
+    {
+        var layout = JellyfinHostLayout.Create(caseRoot, publish, caseName);
+        layout.InstallPluginZip(package, PluginMetadata.InstallationDirectory);
+        layout.WriteDatabaseConfiguration(
+            connectionString,
+            PluginMetadata.InstallationDirectory,
+            PluginMetadata.AssemblyFileName);
+        var leaseRoot = Path.Combine(layout.RunRoot, ".port-leases");
+        using var httpPort = LoopbackPortReservation.Acquire(leaseRoot);
+        using var httpsPort = LoopbackPortReservation.Acquire(leaseRoot);
+        layout.WriteNetworkConfiguration(httpPort.Port, httpsPort.Port);
+        var redactor = new SensitiveDataRedactor(secrets.Prepend(connectionString).ToArray());
+        var ffmpeg = PrepareFakeMediaTools(repositoryRoot, layout.RunRoot);
+        var stopwatch = Stopwatch.StartNew();
+        await using var host = JellyfinHostProcess.Start(layout, httpPort, redactor, ffmpeg);
+        await host.WaitForExpectedStartupFailureAsync(TimeSpan.FromSeconds(20), cancellationToken);
+        stopwatch.Stop();
+        Assert.InRange(stopwatch.Elapsed, TimeSpan.Zero, TimeSpan.FromSeconds(35));
+        await host.TerminateAsync();
+        var diagnostics = ReadCollectedLogs(layout);
+        foreach (var expected in expectedDiagnostics)
+        {
+            if (!diagnostics.Contains(expected, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"Expected startup diagnostic '{expected}' was absent. Sanitized diagnostics:\n{diagnostics}");
+            }
+        }
+
+        foreach (var secret in secrets.Where(value => !string.IsNullOrEmpty(value)))
+        {
+            Assert.DoesNotContain(secret, diagnostics, StringComparison.Ordinal);
+        }
+
+        Assert.DoesNotContain("Password=", diagnostics, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("CREATE DATABASE ", diagnostics, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(FindSqliteFiles(layout));
+    }
+
+    private static async Task AssertProviderSelectionFailureAsync(
+        PristineJellyfinPublish publish,
+        string package,
+        string caseRoot,
+        string repositoryRoot,
+        string connectionString,
+        string caseName,
+        bool installPackage,
+        bool deleteAssembly,
+        bool deleteMetadata,
+        string pluginName,
+        string expectedDiagnostic,
+        string secret,
+        CancellationToken cancellationToken)
+    {
+        var layout = JellyfinHostLayout.Create(caseRoot, publish, caseName);
+        if (installPackage)
+        {
+            var pluginDirectory = layout.InstallPluginZip(package, PluginMetadata.InstallationDirectory);
+            if (deleteAssembly)
+            {
+                File.Delete(Path.Combine(pluginDirectory, PluginMetadata.AssemblyFileName));
+            }
+
+            if (deleteMetadata)
+            {
+                File.Delete(Path.Combine(pluginDirectory, "meta.json"));
+            }
+        }
+
+        layout.WriteDatabaseConfiguration(connectionString, pluginName, PluginMetadata.AssemblyFileName);
+        var leaseRoot = Path.Combine(layout.RunRoot, ".port-leases");
+        using var httpPort = LoopbackPortReservation.Acquire(leaseRoot);
+        using var httpsPort = LoopbackPortReservation.Acquire(leaseRoot);
+        layout.WriteNetworkConfiguration(httpPort.Port, httpsPort.Port);
+        var redactor = new SensitiveDataRedactor(connectionString, secret);
+        var ffmpeg = PrepareFakeMediaTools(repositoryRoot, layout.RunRoot);
+        await using var host = JellyfinHostProcess.Start(layout, httpPort, redactor, ffmpeg);
+        await host.WaitForExpectedStartupFailureAsync(TimeSpan.FromSeconds(20), cancellationToken);
+        await host.TerminateAsync();
+        var diagnostics = ReadCollectedLogs(layout);
+        Assert.Contains(expectedDiagnostic, diagnostics, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(secret, diagnostics, StringComparison.Ordinal);
+        Assert.Empty(FindSqliteFiles(layout));
+    }
+
+    private static async Task<string[]> ReadPublicSchemaAsync(
+        string connectionString,
+        CancellationToken cancellationToken)
+    {
+        var builder = new NpgsqlConnectionStringBuilder(connectionString) { Pooling = false };
+        await using var connection = new NpgsqlConnection(builder.ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT kind || ':' || name
+            FROM (
+                SELECT c.relkind::text AS kind, c.relname AS name
+                FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
+                UNION ALL
+                SELECT 'f', p.proname
+                FROM pg_catalog.pg_proc p
+                JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                WHERE n.nspname = 'public'
+            ) objects
+            ORDER BY kind, name
+            """;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        var result = new List<string>();
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            result.Add(reader.GetString(0));
+        }
+
+        return result.ToArray();
     }
 
     private static string CreatePredecessorPackage(
@@ -464,4 +860,14 @@ public sealed class StockServerLifecycleTests
         await using var stream = File.OpenRead(path);
         return Convert.ToHexString(await SHA256.HashDataAsync(stream, cancellationToken)).ToLowerInvariant();
     }
+
+    private sealed record PredecessorFixtureManifest(
+        string Version,
+        string HistoricalSourceCommit,
+        string SourceSha256,
+        string AssemblySha256,
+        string PackageSha256,
+        string LastMigration,
+        int ExpectedHistoryRows,
+        string[] ForbiddenPostReleaseSymbols);
 }

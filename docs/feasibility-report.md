@@ -31,7 +31,7 @@ parity, purge, maintenance, and upgrade coverage remain in dependent beads.
 | PostgreSQL | 16.6, image digest `sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36` | Automated black-box gate with runtime version assertion |
 | Host PostgreSQL client programs | `pg_dump` absent; `psql` absent | Not required |
 
-The provider accepts only Jellyfin database ABI 12.2.x. It rejects 13.x and every
+The provider accepts only the exact Jellyfin database ABI 12.2.0.0. It rejects 13.x and every
 other ABI before parsing the connection string, opening PostgreSQL, or running a
 migration. No manual binding observation is a support claim.
 

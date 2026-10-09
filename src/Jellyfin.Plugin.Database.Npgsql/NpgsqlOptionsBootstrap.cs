@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Storage;
 using Npgsql;
 
 namespace Jellyfin.Plugin.Database.Npgsql;
@@ -66,6 +67,7 @@ internal static class NpgsqlOptionsBootstrap
             });
         options
             .ReplaceService<IModelCustomizer, NpgsqlModelCustomizer>()
+            .ReplaceService<IRelationalDatabaseCreator, NpgsqlExistingDatabaseOnlyCreator>()
             .AddInterceptors(NpgsqlQueryExpressionInterceptor.Instance);
         return configured;
     }

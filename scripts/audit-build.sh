@@ -7,6 +7,8 @@ PACKAGE_ZIP="$PLUGIN_ROOT/artifacts/jellyfin-plugin-database-npgsql_0.1.0.0.zip"
 PROVIDER_PROJECT="$PLUGIN_ROOT/src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj"
 NEGATIVE_CONTROL_PROJECT="$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests.csproj"
 REFERENCE_REPORT_DIR="$PLUGIN_ROOT/artifacts/evaluated-references"
+PREDECESSOR_ROOT="$PLUGIN_ROOT/tests/fixtures/predecessor"
+PREDECESSOR_PROJECT="$PREDECESSOR_ROOT/Jellyfin.Plugin.Database.Npgsql.PredecessorFixture.csproj"
 
 fail() {
     echo "FAIL: $*" >&2
@@ -22,6 +24,34 @@ fi
 
 [ -f "$PACKAGE_ZIP" ] || fail "package ZIP is missing; run the package command first"
 [ -d "$PACKAGE_DIR" ] || fail "staged package directory is missing"
+
+[ -f "$PREDECESSOR_ROOT/fixture-manifest.json" ] || fail "predecessor integrity manifest is missing"
+[ "$(grep -F -c '<Compile Include="source-tree/**/*.cs" />' "$PREDECESSOR_PROJECT")" = "1" ] \
+    || fail "predecessor fixture must compile exactly its immutable source-tree"
+if grep -F '../../../src/' "$PREDECESSOR_PROJECT" >/dev/null; then
+    fail "predecessor fixture links the current production source tree"
+fi
+mapfile -t provider_assembly_projects < <(
+    grep -R -l --include='*.csproj' '<AssemblyName>Jellyfin.Plugin.Database.Npgsql</AssemblyName>' \
+        "$PLUGIN_ROOT/src" "$PLUGIN_ROOT/tests" "$PLUGIN_ROOT/tools" | sort
+)
+expected_provider_assembly_projects=(
+    "$PLUGIN_ROOT/src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj"
+    "$PREDECESSOR_PROJECT"
+)
+[ "${provider_assembly_projects[*]}" = "${expected_provider_assembly_projects[*]}" ] \
+    || fail "only the release provider and explicit predecessor fixture may produce the provider assembly"
+for forbidden_symbol in ValidateMigrationHistoryAsync IsLoadedHostPresent UuidAggregatesMigration AddUuidMinMaxAggregates; do
+    if grep -R -F "$forbidden_symbol" "$PREDECESSOR_ROOT/source-tree" >/dev/null; then
+        fail "predecessor source contains post-0.0.9 symbol '$forbidden_symbol'"
+    fi
+done
+expected_source_hash=$(sed -n 's/^[[:space:]]*"sourceSha256": "\([0-9a-f]\{64\}\)",$/\1/p' "$PREDECESSOR_ROOT/fixture-manifest.json")
+[ -n "$expected_source_hash" ] || fail "predecessor source hash is absent or malformed"
+actual_source_hash=$(dotnet "$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/bin/Release/net10.0/Jellyfin.Plugin.Database.Npgsql.TestHarness.dll" \
+    hash-publish "$PREDECESSOR_ROOT/source-tree")
+[ "$actual_source_hash" = "$expected_source_hash" ] \
+    || fail "predecessor source snapshot differs from its pinned manifest"
 
 mapfile -t actual_files < <(find "$PACKAGE_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
 expected_files=(

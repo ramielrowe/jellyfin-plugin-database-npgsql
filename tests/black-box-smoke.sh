@@ -1115,7 +1115,7 @@ mv "$RUN_ROOT/canonical-package-hold" "$PLUGIN_FOLDER"
 if [ "$HOST_INPUT_MODE" = "legacy-repository" ] || [ -n "$UNSUPPORTED_HOST_PUBLISH" ]; then
     start_unsupported_host "$RUN_ROOT/unsupported-abi.log"
     wait_for_host_exit || fail "unsupported vanilla Jellyfin host did not stop after the ABI guard"
-    grep -F "supports Jellyfin database ABI 12.2.x; the host loaded 13.0.0.0" "$RUN_ROOT/unsupported-abi.log" >/dev/null \
+    grep -F "supports Jellyfin database ABI 12.2.0.0; the host loaded 13.0.0.0" "$RUN_ROOT/unsupported-abi.log" >/dev/null \
         || fail "unsupported host ABI failure did not identify the supported and loaded versions"
     grep -F "No database connection was attempted" "$RUN_ROOT/unsupported-abi.log" >/dev/null \
         || fail "unsupported host ABI failure did not state its pre-connection boundary"

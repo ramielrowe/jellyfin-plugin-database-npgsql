@@ -28,6 +28,7 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
     private readonly bool _preserveLayoutOnDispose;
     private bool _disposed;
     private bool _logCompleted;
+    private bool _expectedStartupFailure;
 
     private JellyfinHostProcess(
         JellyfinHostLayout layout,
@@ -216,6 +217,22 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
                 throw;
             }
         }
+    }
+
+    internal async Task WaitForExpectedStartupFailureAsync(TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        _expectedStartupFailure = true;
+        try
+        {
+            await WaitUntilReadyAsync(timeout, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or TimeoutException)
+        {
+            return;
+        }
+
+        await TerminateAsync().ConfigureAwait(false);
+        throw new InvalidOperationException("Jellyfin became healthy when startup was required to fail closed.");
     }
 
     public async Task<string> GetStringAsync(string relativePath, CancellationToken cancellationToken)
@@ -729,7 +746,7 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             throw new InvalidOperationException("The Linux process supervisor failed: " + _redactor.Redact(diagnostic));
         }
 
-        if (_supervisor.Process.ExitCode != 0 && !_supervisor.WasTerminationRequested)
+        if (_supervisor.Process.ExitCode != 0 && !_supervisor.WasTerminationRequested && !_expectedStartupFailure)
         {
             throw new InvalidOperationException(
                 $"The supervised Jellyfin host exited unexpectedly with status {_supervisor.Process.ExitCode}: "

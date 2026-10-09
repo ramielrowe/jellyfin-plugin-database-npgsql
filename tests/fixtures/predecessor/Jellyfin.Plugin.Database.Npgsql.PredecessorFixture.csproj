@@ -5,17 +5,17 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <GenerateDependencyFile>true</GenerateDependencyFile>
-    <AnalysisMode>AllEnabledByDefault</AnalysisMode>
-    <DefineConstants>$(DefineConstants);NPGSQL_PREDECESSOR_FIXTURE</DefineConstants>
+    <!-- Historical source is immutable and is audited by hash below, so current
+         analyzer policy must not rewrite or reject the frozen 0.0.9 snapshot. -->
+    <RunAnalyzers>false</RunAnalyzers>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
     <Version>0.0.9.0</Version>
     <AssemblyVersion>0.0.9.0</AssemblyVersion>
     <FileVersion>0.0.9.0</FileVersion>
   </PropertyGroup>
 
   <ItemGroup>
-    <Compile
-      Include="../../../src/Jellyfin.Plugin.Database.Npgsql/**/*.cs"
-      Exclude="../../../src/Jellyfin.Plugin.Database.Npgsql/bin/**;../../../src/Jellyfin.Plugin.Database.Npgsql/obj/**;../../../src/Jellyfin.Plugin.Database.Npgsql/Migrations/20261009113458_AddUuidMinMaxAggregates.cs;../../../src/Jellyfin.Plugin.Database.Npgsql/Migrations/20261009113458_AddUuidMinMaxAggregates.Designer.cs" />
+    <Compile Include="source-tree/**/*.cs" />
   </ItemGroup>
 
   <ItemGroup Label="Host-provided compile contracts">
@@ -30,15 +30,9 @@
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
   </ItemGroup>
 
-  <ItemGroup Label="Build analyzers">
-    <PackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" PrivateAssets="all" />
-    <PackageReference Include="SerilogAnalyzer" PrivateAssets="all" />
-    <PackageReference Include="SmartAnalyzers.MultithreadingAnalyzer" PrivateAssets="all" />
-    <PackageReference Include="StyleCop.Analyzers" PrivateAssets="all" />
-  </ItemGroup>
-
   <ItemGroup>
     <None Include="meta.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="fixture-manifest.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../../../LICENSE" CopyToOutputDirectory="PreserveNewest" Link="LICENSE" />
     <None Include="../../../THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" Link="THIRD-PARTY-NOTICES.md" />
   </ItemGroup>

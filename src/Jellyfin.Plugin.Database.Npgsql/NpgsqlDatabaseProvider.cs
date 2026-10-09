@@ -228,12 +228,12 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
         => NpgsqlDatabaseOperations.PurgeDatabaseAsync(dbContext, tableNames);
 
     /// <summary>
-    /// Determines whether a host database assembly belongs to this release's supported ABI family.
+    /// Determines whether a host database assembly is the exact audited release contract.
     /// </summary>
     /// <param name="version">The host database assembly version.</param>
     /// <returns><see langword="true" /> when the ABI is supported.</returns>
     internal static bool SupportsHostDatabaseAbi(Version version)
-        => version.Major == 12 && version.Minor == 2;
+        => version == new Version(12, 2, 0, 0);
 
     /// <summary>
     /// Validates the unmodified Jellyfin database configuration contract.

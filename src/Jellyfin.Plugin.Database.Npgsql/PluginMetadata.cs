@@ -40,7 +40,7 @@ public static class PluginMetadata
     /// <summary>
     /// Gets the supported Jellyfin database ABI family.
     /// </summary>
-    public const string SupportedDatabaseAbi = "12.2.x";
+    public const string SupportedDatabaseAbi = "12.2.0.0";
 
     /// <summary>
     /// Gets the permanent plugin identifier recorded in <c>build.yaml</c>.
