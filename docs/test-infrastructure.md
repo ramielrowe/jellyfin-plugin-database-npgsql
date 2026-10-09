@@ -115,6 +115,14 @@ No helper searches for or references a sibling/parent Jellyfin checkout. The
 standalone plugin root is found by its own solution marker, so the same commands
 work after this directory is moved to its dedicated repository.
 
+On Linux, host launches go through the checked-in `tests/process-supervisor.py`
+subreaper. Both the reusable C# harness and shell black-box test use the same
+supervision boundary. It records the real host PID and kernel start identity,
+drains and redacts bounded output, and adopts and reaps detached descendants even
+when the root host exits first. Initialization fails closed if the kernel cannot
+enable subreaper supervision; no change to the vanilla Jellyfin publish is
+required.
+
 ## Packaged plugin black-box proof
 
 `tests/black-box-smoke.sh` remains the comprehensive package-level consumer of

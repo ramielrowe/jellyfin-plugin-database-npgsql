@@ -14,6 +14,11 @@ curl() {
     command timeout --foreground 15s curl --connect-timeout 2 --max-time 10 --proto '=http' --max-redirs 0 "$@"
 }
 
+fail() {
+    echo "FAIL: $*" >&2
+    exit 1
+}
+
 validate_port() {
     local name=$1
     local value=$2
@@ -22,6 +27,147 @@ validate_port() {
         return 1
     fi
 }
+
+reap_stale_smoke_containers() {
+    local listing listing_status
+    set +e
+    listing=$(docker ps --all --no-trunc \
+        --filter 'label=org.jellyfin.database-npgsql.smoke-managed=true' \
+        --filter "label=org.jellyfin.database-npgsql.smoke-scope=$SMOKE_SCOPE" \
+        --format '{{.ID}}|{{.Names}}|{{.Label "org.jellyfin.database-npgsql.smoke-managed"}}|{{.Label "org.jellyfin.database-npgsql.smoke-scope"}}|{{.Label "org.jellyfin.database-npgsql.owner-lease"}}|{{.Label "org.jellyfin.database-npgsql.owner-pid"}}|{{.Label "org.jellyfin.database-npgsql.owner-start"}}' 2>&1)
+    listing_status=$?
+    set -e
+    [ "$listing_status" -eq 0 ] \
+        || fail "could not enumerate scoped test containers before reclamation: $listing"
+
+    local -a stale_ids=() stale_names=() stale_leases=() stale_pids=() stale_starts=()
+    local -A seen_ids=() seen_names=() seen_leases=()
+    local line stale_id stale_name managed scope stale_lease stale_pid stale_start extra
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        IFS='|' read -r stale_id stale_name managed scope stale_lease stale_pid stale_start extra <<<"$line"
+        if [ -n "${extra:-}" ] \
+            || [[ ! "$stale_id" =~ ^[0-9a-f]{64}$ ]] \
+            || [[ ! "$stale_name" =~ ^jellyfin-npgsql-smoke-[0-9]{14}-[0-9]+-[0-9a-f]{32}$ ]] \
+            || [ "$managed" != true ] \
+            || [ "$scope" != "$SMOKE_SCOPE" ] \
+            || [[ ! "$stale_lease" =~ ^[0-9]{14}-[0-9]+-[0-9a-f]{32}$ ]] \
+            || [ "$stale_name" != "jellyfin-npgsql-smoke-$stale_lease" ] \
+            || [[ ! "$stale_pid" =~ ^[1-9][0-9]*$ ]] \
+            || [[ ! "$stale_start" =~ ^[1-9][0-9]*$ ]]; then
+            fail "managed container in scope '$SMOKE_SCOPE' has malformed ID, name, or ownership labels ('$line'); no scoped container was removed"
+        fi
+        if [ -n "${seen_ids[$stale_id]:-}" ] || [ -n "${seen_names[$stale_name]:-}" ] || [ -n "${seen_leases[$stale_lease]:-}" ]; then
+            fail "scoped container discovery returned a duplicate immutable ID, name, or lease ('$line'); no scoped container was removed"
+        fi
+        seen_ids[$stale_id]=1
+        seen_names[$stale_name]=1
+        seen_leases[$stale_lease]=1
+        stale_ids+=("$stale_id")
+        stale_names+=("$stale_name")
+        stale_leases+=("$stale_lease")
+        stale_pids+=("$stale_pid")
+        stale_starts+=("$stale_start")
+    done <<<"$listing"
+
+    local index stale_lease_fd inspected inspect_status removal removal_status expected
+    for index in "${!stale_ids[@]}"; do
+        stale_id=${stale_ids[$index]}
+        stale_name=${stale_names[$index]}
+        stale_lease=${stale_leases[$index]}
+        stale_pid=${stale_pids[$index]}
+        stale_start=${stale_starts[$index]}
+        exec {stale_lease_fd}>"$CONTAINER_LEASE_ROOT/$stale_lease.lock"
+        if ! flock -n "$stale_lease_fd"; then
+            eval "exec ${stale_lease_fd}>&-"
+            continue
+        fi
+
+        set +e
+        inspected=$(docker inspect --format '{{.Id}}|{{.Name}}|{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-managed"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-scope"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-lease"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-pid"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-start"}}' "$stale_id" 2>&1)
+        inspect_status=$?
+        set -e
+        if [ "$inspect_status" -ne 0 ]; then
+            eval "exec ${stale_lease_fd}>&-"
+            if [[ "$inspected" == *"No such object:"* ]] || [[ "$inspected" == *"No such container:"* ]]; then
+                continue
+            fi
+            fail "could not revalidate exact stale container ID '$stale_id': $inspected"
+        fi
+        expected="$stale_id|/$stale_name|true|$SMOKE_SCOPE|$stale_lease|$stale_pid|$stale_start"
+        if [ "$inspected" != "$expected" ]; then
+            eval "exec ${stale_lease_fd}>&-"
+            fail "exact stale container ID '$stale_id' changed name or ownership labels; no removal was attempted for it"
+        fi
+
+        set +e
+        removal=$(docker rm --force "$stale_id" 2>&1)
+        removal_status=$?
+        set -e
+        eval "exec ${stale_lease_fd}>&-"
+        if [ "$removal_status" -ne 0 ] \
+            && [[ "$removal" != *"No such container:"* ]] \
+            && [[ "$removal" != *"No such object:"* ]]; then
+            fail "could not remove exact stale test container ID '$stale_id': $removal"
+        fi
+    done
+}
+
+if [ "${1:-}" = "--test-container-reaper-worker" ]; then
+    [ "$#" -eq 2 ] || { echo "usage: $0 --test-container-reaper-worker SCENARIO" >&2; exit 2; }
+    SMOKE_SCOPE=${FAKE_DOCKER_SCOPE:?}
+    CONTAINER_LEASE_ROOT=${FAKE_DOCKER_LEASE_ROOT:?}
+    mkdir -p -m 700 "$CONTAINER_LEASE_ROOT"
+    exec {worker_scope_fd}>"${FAKE_DOCKER_LOCK:?}"
+    flock "$worker_scope_fd"
+    reap_stale_smoke_containers
+    exit 0
+fi
+
+if [ "${1:-}" = "--test-container-reaper" ]; then
+    test_root=$(mktemp -d)
+    trap 'rm -rf "$test_root"' EXIT
+    export PATH="$PLUGIN_ROOT/tests/fixtures:$PATH"
+    export FAKE_DOCKER_SCOPE
+    FAKE_DOCKER_SCOPE=$(printf 'e%.0s' $(seq 1 64))
+    export FAKE_DOCKER_LEASE_ROOT="$test_root/leases"
+    export FAKE_DOCKER_LOCK="$test_root/scope.lock"
+    export FAKE_DOCKER_STATE="$test_root/state"
+    export FAKE_DOCKER_LOG="$test_root/removals"
+    for rejected in malformed duplicate; do
+        : >"$FAKE_DOCKER_STATE"
+        : >"$FAKE_DOCKER_LOG"
+        export FAKE_DOCKER_SCENARIO=$rejected
+        if "$0" --test-container-reaper-worker "$rejected" >/dev/null 2>&1; then
+            echo "FAIL: $rejected scoped metadata was accepted" >&2
+            exit 1
+        fi
+        [ ! -s "$FAKE_DOCKER_LOG" ] || { echo "FAIL: $rejected discovery mutated a container" >&2; exit 1; }
+    done
+    for accepted in disappeared decoy; do
+        : >"$FAKE_DOCKER_STATE"
+        : >"$FAKE_DOCKER_LOG"
+        export FAKE_DOCKER_SCENARIO=$accepted
+        "$0" --test-container-reaper-worker "$accepted"
+        if [ "$accepted" = decoy ]; then
+            [ "$(wc -l <"$FAKE_DOCKER_LOG")" -eq 1 ] \
+                && grep -qx "$(printf 'a%.0s' $(seq 1 64))" "$FAKE_DOCKER_LOG" \
+                || { echo "FAIL: decoy isolation did not remove exactly the validated scoped ID" >&2; exit 1; }
+        else
+            [ ! -s "$FAKE_DOCKER_LOG" ] || { echo "FAIL: an already-disappeared ID was removed" >&2; exit 1; }
+        fi
+    done
+    : >"$FAKE_DOCKER_STATE"
+    : >"$FAKE_DOCKER_LOG"
+    export FAKE_DOCKER_SCENARIO=two-process
+    "$0" --test-container-reaper-worker two-process & first_worker=$!
+    "$0" --test-container-reaper-worker two-process & second_worker=$!
+    wait "$first_worker"
+    wait "$second_worker"
+    [ "$(wc -l <"$FAKE_DOCKER_LOG")" -eq 1 ] \
+        || { echo "FAIL: two-process reclamation did not serialize to one exact removal" >&2; exit 1; }
+    exit 0
+fi
 
 if [ "${1:-}" = "--validate-port" ]; then
     [ "$#" -eq 3 ] || { echo "usage: $0 --validate-port NAME VALUE" >&2; exit 2; }
@@ -32,26 +178,41 @@ fi
 if [ "${1:-}" = "--test-detached-cleanup" ]; then
     test_root=$(mktemp -d)
     pid_file="$test_root/detached.pid"
-    setsid --wait sh -c "setsid sh -c 'trap \"\" TERM; echo \$\$ > \"$pid_file\"; sleep 30' & sleep 30" &
-    test_pid=$!
+    identity_file="$test_root/identity"
+    log_file="$test_root/output"
+    secrets_file="$test_root/secrets"
+    printf 'detached-secret\0' >"$secrets_file"
+    chmod 600 "$secrets_file"
+    python3 "$PLUGIN_ROOT/tests/process-supervisor.py" \
+        --identity-file "$identity_file" \
+        --log-file "$log_file" \
+        --secrets-file "$secrets_file" \
+        --grace-seconds 0.25 \
+        -- sh -c "(sh -c \"setsid sh -c 'trap \\\"\\\" TERM; echo \\\$\\\$ > \\\"$pid_file\\\"; printf detached-; sleep 0.05; printf secret-inherited-output; sleep 30' & exit 0\" &) ; exit 0" &
+    supervisor_pid=$!
     for _ in $(seq 1 100); do
-        [ -s "$pid_file" ] && break
+        [ -s "$pid_file" ] && [ -s "$identity_file" ] && break
         sleep 0.01
     done
-    read -r test_pgid test_start < <(python3 - "$test_pid" <<'PY'
-import pathlib, sys
-data = pathlib.Path('/proc', sys.argv[1], 'stat').read_text()
-fields = data[data.rfind(')') + 2:].split()
-print(fields[2], fields[19])
-PY
-)
-    terminate_recorded_process_tree "$test_pid" "$test_pgid" "$test_start"
-    wait "$test_pid" 2>/dev/null || true
+    [ -s "$pid_file" ] && [ -s "$identity_file" ] || { echo "FAIL: subreaper regression did not initialize" >&2; exit 1; }
+    read -r _version recorded_supervisor recorded_start _host_pid _host_start _host_group <"$identity_file"
+    [ "$recorded_supervisor" = "$supervisor_pid" ] || { echo "FAIL: supervisor PID handoff mismatch" >&2; exit 1; }
+    actual_start=$(awk '{print $22}' "/proc/$supervisor_pid/stat")
+    [ "$actual_start" = "$recorded_start" ] || { echo "FAIL: supervisor start identity mismatch" >&2; exit 1; }
+    if process_start_matches "$supervisor_pid" "$((recorded_start + 1))"; then
+        echo "FAIL: PID-reuse guard accepted the wrong start identity" >&2
+        exit 1
+    fi
+    kill -TERM "$supervisor_pid"
+    wait "$supervisor_pid" 2>/dev/null || true
     detached_pid=$(cat "$pid_file")
     if [ -r "/proc/$detached_pid/stat" ]; then
         echo "FAIL: detached-child cleanup regression left PID $detached_pid alive" >&2
         exit 1
     fi
+    grep -q '<redacted>-inherited-output' "$log_file" \
+        && ! grep -q 'detached-secret' "$log_file" \
+        || { echo "FAIL: inherited output was not continuously drained and redacted" >&2; exit 1; }
     rm -rf "$test_root"
     exit 0
 fi
@@ -149,6 +310,10 @@ ADMIN_PASSWORD=$(tr -d '-' </proc/sys/kernel/random/uuid)
 HOST_PID=""
 HOST_START=""
 HOST_PGID=""
+HOST_SUPERVISOR_PID=""
+HOST_SUPERVISOR_START=""
+HOST_SUPERVISOR_PGID=""
+HOST_SUPERVISOR_ERRORS=""
 POSTGRES_CONTAINER_ID=""
 OWNER_START=$(awk '{print $22}' "/proc/$$/stat")
 export NUGET_PACKAGES NUGET_HTTP_CACHE_PATH
@@ -273,11 +438,6 @@ PY
 }
 trap cleanup EXIT
 
-fail() {
-    echo "FAIL: $*" >&2
-    exit 1
-}
-
 dotnet build "$HASH_HELPER_PROJECT" --configuration Release --no-restore --nologo >/dev/null
 [ -f "$HASH_HELPER" ] || fail "the prebuilt machine-readable hash helper is missing"
 
@@ -383,77 +543,72 @@ assert_host_identity() {
         || fail "the launched Jellyfin PID start time or dedicated process group changed"
 }
 
-capture_host_identity() {
-    HOST_START=$(awk '{print $22}' "/proc/$HOST_PID/stat") \
-        || fail "could not capture the launched Jellyfin PID start time"
-    HOST_PGID=$HOST_PID
-    local current_start current_pgid
-    for _ in $(seq 1 100); do
-        kill -0 "$HOST_PID" 2>/dev/null || fail "Jellyfin exited before entering its dedicated process group"
-        read -r current_pgid current_start < <(awk '{print $5, $22}' "/proc/$HOST_PID/stat") \
-            || fail "could not read the launched Jellyfin process identity"
-        [ "$current_start" = "$HOST_START" ] \
-            || fail "the launched Jellyfin PID was reused during startup"
-        if [ "$current_pgid" = "$HOST_PID" ]; then
-            return 0
-        fi
-        sleep 0.01
-    done
-    fail "Jellyfin did not enter a dedicated process group within one second"
-}
-
 launch_host_process() {
     local environment_file=$1
     local log_file=$2
     shift 2
-    setsid --wait python3 -c 'import os, pathlib, subprocess, sys
-environment_path, log_path, *command = sys.argv[1:]
-for name in ("PGUSER", "PGPASSWORD", "PGPASSFILE", "PGSSLCERT", "PGSSLKEY", "PGSSLROOTCERT", "PGCLIENTENCODING", "PGTZ", "PGOPTIONS", "PGTARGETSESSIONATTRS", "PGSSLNEGOTIATION", "PGGSSENCMODE", "PGREQUIREAUTH", "PGAPPNAME"):
-    os.environ.pop(name, None)
-for item in open(environment_path, "rb").read().split(b"\0"):
-    if item:
-        name, value = item.decode().split("=", 1)
-        os.environ[name] = value
-os.unlink(environment_path)
-limit = 16 * 1024 * 1024
-written = 0
-with pathlib.Path(log_path).open("xb") as output:
-    os.chmod(log_path, 0o600)
-    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=os.environ)
-    while True:
-        chunk = child.stdout.read1(65536)
-        if not chunk:
-            break
-        if written < limit:
-            kept = chunk[:limit - written]
-            output.write(kept)
-            output.flush()
-            written += len(kept)
-    status = child.wait()
-raise SystemExit(status if status >= 0 else 128 - status)' "$environment_file" "$log_file" "$@" >/dev/null 2>&1 &
-    HOST_PID=$!
-    capture_host_identity
+    local identity_file="$log_file.identity"
+    local secrets_file="$log_file.secrets"
+    printf '%s\0' \
+        "$BOOTSTRAP_PASSWORD" "$APPLICATION_PASSWORD" "$ADMIN_PASSWORD" \
+        "${SECRET_FILE_MARKER:-}" "${PASSFILE_UNRELATED_SECRET:-}" \
+        "${PASSFILE_FIRST_HOST_SECRET:-}" "${PASSFILE_LOWER_PRECEDENCE_SECRET:-}" \
+        "${RUNTIME_PASSFILE:-}" "${FIRST_TOKEN:-}" "${RESTART_TOKEN:-}" \
+        "${MALFORMED_TOKEN:-}" "${RECOVERY_TOKEN:-}" "$RUN_ROOT" >"$secrets_file"
+    chmod 600 "$secrets_file"
+    python3 "$PLUGIN_ROOT/tests/process-supervisor.py" \
+        --identity-file "$identity_file" \
+        --log-file "$log_file" \
+        --environment-file "$environment_file" \
+        --secrets-file "$secrets_file" \
+        --working-directory "$RUN_ROOT/host-publish" \
+        -- "$@" >/dev/null 2>"$log_file.supervisor-errors" &
+    HOST_SUPERVISOR_ERRORS="$log_file.supervisor-errors"
+    HOST_SUPERVISOR_PID=$!
+    read -r HOST_SUPERVISOR_PGID HOST_SUPERVISOR_START < <(awk '{print $5, $22}' "/proc/$HOST_SUPERVISOR_PID/stat") \
+        || fail "could not capture the process-supervisor identity"
+    for _ in $(seq 1 500); do
+        [ -s "$identity_file" ] && break
+        kill -0 "$HOST_SUPERVISOR_PID" 2>/dev/null || break
+        sleep 0.01
+    done
+    [ -s "$identity_file" ] || { sed -n '1,20p' "$log_file.supervisor-errors" >&2; fail "the process supervisor failed closed during initialization"; }
+    local version reported_supervisor reported_supervisor_start
+    read -r version reported_supervisor reported_supervisor_start HOST_PID HOST_START HOST_PGID <"$identity_file" \
+        || fail "could not parse the process-supervisor identity handoff"
+    [ "$version" = v1 ] \
+        && [ "$reported_supervisor" = "$HOST_SUPERVISOR_PID" ] \
+        && [ "$reported_supervisor_start" = "$HOST_SUPERVISOR_START" ] \
+        && [ "$HOST_PGID" = "$HOST_PID" ] \
+        && process_start_matches "$HOST_PID" "$HOST_START" \
+        || fail "the process-supervisor identity handoff was malformed or stale"
 }
 
 terminate_host_group() {
-    [ -n "$HOST_PID" ] || return 0
-    if ! kill -0 "$HOST_PID" 2>/dev/null; then
-        wait "$HOST_PID" 2>/dev/null || true
-        if kill -0 -- "-$HOST_PGID" 2>/dev/null; then
-            if [ -r "/proc/$HOST_PGID/stat" ] && [ "$(awk '{print $22}' "/proc/$HOST_PGID/stat")" != "$HOST_START" ]; then
-                echo "FAIL: refusing to signal a reused Jellyfin process-group ID" >&2
-                return 1
-            fi
-            kill -KILL -- "-$HOST_PGID" || return 1
-        fi
-        HOST_PID="" HOST_START="" HOST_PGID=""
-        return 0
+    [ -n "$HOST_SUPERVISOR_PID" ] || return 0
+    local supervisor_status
+    if process_identity_matches "$HOST_SUPERVISOR_PID" "$HOST_SUPERVISOR_PGID" "$HOST_SUPERVISOR_START"; then
+        kill -TERM "$HOST_SUPERVISOR_PID" || return 1
+    elif kill -0 "$HOST_SUPERVISOR_PID" 2>/dev/null; then
+        echo "FAIL: refusing to signal a process supervisor whose PID identity changed" >&2
+        return 1
     fi
-
-    assert_host_identity
-    terminate_recorded_process_tree "$HOST_PID" "$HOST_PGID" "$HOST_START" || return 1
-    wait "$HOST_PID" 2>/dev/null || true
+    set +e
+    wait "$HOST_SUPERVISOR_PID" 2>/dev/null
+    supervisor_status=$?
+    set -e
+    if [ "$supervisor_status" -eq 125 ]; then
+        sed -n '1,20p' "$HOST_SUPERVISOR_ERRORS" >&2
+        echo "FAIL: the Linux process supervisor reported an internal failure" >&2
+        return 1
+    fi
+    if process_start_matches "$HOST_PID" "$HOST_START"; then
+        echo "FAIL: the verified host process survived supervisor shutdown" >&2
+        return 1
+    fi
     HOST_PID="" HOST_START="" HOST_PGID=""
+    HOST_SUPERVISOR_PID="" HOST_SUPERVISOR_START="" HOST_SUPERVISOR_PGID=""
+    HOST_SUPERVISOR_ERRORS=""
 }
 
 start_host() {
@@ -617,13 +772,8 @@ assert_log_origin() {
 wait_for_host_exit() {
     for _ in $(seq 1 60); do
         if ! kill -0 "$HOST_PID" 2>/dev/null; then
-            wait "$HOST_PID" 2>/dev/null || true
-            if kill -0 -- "-$HOST_PGID" 2>/dev/null; then
-                echo "FAIL: Jellyfin exited while descendants remained in its process group" >&2
-                return 1
-            fi
-            HOST_PID="" HOST_START="" HOST_PGID=""
-            return 0
+            terminate_host_group
+            return $?
         fi
 
         sleep 1
@@ -684,13 +834,8 @@ stop_host() {
 
     for _ in $(seq 1 30); do
         if ! kill -0 "$HOST_PID" 2>/dev/null; then
-            wait "$HOST_PID" 2>/dev/null || true
-            if kill -0 -- "-$HOST_PGID" 2>/dev/null; then
-                echo "FAIL: graceful shutdown left descendants in the Jellyfin process group" >&2
-                return 1
-            fi
-            HOST_PID="" HOST_START="" HOST_PGID=""
-            return 0
+            terminate_host_group
+            return $?
         fi
 
         sleep 1
@@ -1013,28 +1158,7 @@ for insecure_mode in 0640 0644 0666; do
     chmod 600 "$CLIENT_PKCS12"
 done
 
-while IFS='|' read -r stale_short_id stale_name stale_lease stale_pid stale_start; do
-    [[ "$stale_short_id" =~ ^[0-9a-f]{12,64}$ ]] || continue
-    [[ "$stale_name" =~ ^jellyfin-npgsql-smoke-[0-9]{14}-[0-9]+-[0-9a-f]{32}$ ]] || continue
-    [[ "$stale_lease" =~ ^[0-9]{14}-[0-9]+-[0-9a-f]{32}$ ]] || continue
-    exec {stale_lease_fd}>"$CONTAINER_LEASE_ROOT/$stale_lease.lock"
-    if ! flock -n "$stale_lease_fd"; then
-        eval "exec ${stale_lease_fd}>&-"
-        continue
-    fi
-
-    stale_id=$(docker inspect --format '{{.Id}}' "$stale_short_id")
-    [[ "$stale_id" =~ ^[0-9a-f]{64}$ ]] || fail "Docker returned a malformed stale container ID"
-    stale_identity=$(docker inspect --format '{{.Id}}|{{.Name}}|{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-managed"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.smoke-scope"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-lease"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-pid"}}|{{index .Config.Labels "org.jellyfin.database-npgsql.owner-start"}}' "$stale_id")
-    [ "$stale_identity" = "$stale_id|/$stale_name|true|$SMOKE_SCOPE|$stale_lease|$stale_pid|$stale_start" ] \
-        || fail "stale container identity changed before cleanup"
-    docker rm --force "$stale_id" >/dev/null \
-        || fail "could not confirm removal of the exact stale container ID"
-    eval "exec ${stale_lease_fd}>&-"
-done < <(docker ps --all \
-    --filter 'label=org.jellyfin.database-npgsql.smoke-managed=true' \
-    --filter "label=org.jellyfin.database-npgsql.smoke-scope=$SMOKE_SCOPE" \
-    --format '{{.ID}}|{{.Names}}|{{.Label "org.jellyfin.database-npgsql.owner-lease"}}|{{.Label "org.jellyfin.database-npgsql.owner-pid"}}|{{.Label "org.jellyfin.database-npgsql.owner-start"}}')
+reap_stale_smoke_containers
 
 POSTGRES_CONTAINER_ID=$(docker run \
     --detach \

@@ -71,6 +71,14 @@ public sealed class SensitiveDataRedactor
         }
     }
 
+    internal string[] SnapshotSecrets()
+    {
+        lock (_secrets)
+        {
+            return _secrets.ToArray();
+        }
+    }
+
     public static string RedactConnectionString(string connectionString)
     {
         try

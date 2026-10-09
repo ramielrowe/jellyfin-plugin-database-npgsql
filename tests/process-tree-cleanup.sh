@@ -38,12 +38,32 @@ process_identity_matches() {
     [ -r "/proc/$pid/stat" ] || return 1
     read -r current_pgid current_start < <(python3 - "$pid" <<'PY'
 import pathlib, sys
-data = pathlib.Path('/proc', sys.argv[1], 'stat').read_text()
-fields = data[data.rfind(')') + 2:].split()
-print(fields[2], fields[19])
+try:
+    data = pathlib.Path('/proc', sys.argv[1], 'stat').read_text()
+    fields = data[data.rfind(')') + 2:].split()
+    print(fields[2], fields[19])
+except (FileNotFoundError, PermissionError, OSError, ValueError, IndexError):
+    raise SystemExit(1)
 PY
 ) || return 1
     [ "$current_pgid" = "$expected_pgid" ] && [ "$current_start" = "$expected_start" ]
+}
+
+process_start_matches() {
+    local pid=$1
+    local expected_start=$2
+    local current_start
+    current_start=$(python3 - "$pid" <<'PY'
+import pathlib, sys
+try:
+    data = pathlib.Path('/proc', sys.argv[1], 'stat').read_text()
+    fields = data[data.rfind(')') + 2:].split()
+    print(fields[19])
+except (FileNotFoundError, PermissionError, OSError, ValueError, IndexError):
+    raise SystemExit(1)
+PY
+) || return 1
+    [ "$current_start" = "$expected_start" ]
 }
 
 terminate_recorded_process_tree() {

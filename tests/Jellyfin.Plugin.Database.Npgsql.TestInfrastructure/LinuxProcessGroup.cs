@@ -123,6 +123,19 @@ internal sealed record LinuxProcessIdentity(int ProcessId, int ParentProcessId, 
         }
     }
 
+    public void Signal(int signal)
+    {
+        if (!IsCurrent())
+        {
+            throw new InvalidOperationException("Refusing to signal a process whose PID identity changed.");
+        }
+
+        if (kill(ProcessId, signal) != 0 && Marshal.GetLastPInvokeError() != 3)
+        {
+            throw new InvalidOperationException($"Could not send signal {signal} to verified test-process PID {ProcessId}.");
+        }
+    }
+
     public void TerminateGroup(TimeSpan gracePeriod)
     {
         if (!IsCurrent() || ProcessGroupId != ProcessId)

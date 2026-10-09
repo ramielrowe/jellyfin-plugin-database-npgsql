@@ -386,6 +386,58 @@ public sealed class TestInfrastructureTests
     }
 
     [Fact]
+    public async Task SmokeShellContainerReaper_ValidatesBeforeMutationAndSerializesWorkers()
+    {
+        var root = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var result = await ExternalCommand.RunAsync(
+            "/bin/bash",
+            new[] { Path.Combine(root, "tests", "black-box-smoke.sh"), "--test-container-reaper" },
+            TimeSpan.FromSeconds(20),
+            TestContext.Current.CancellationToken);
+        result.EnsureSuccess("Running the shell stale-container reaper regressions", new SensitiveDataRedactor());
+    }
+
+    [Fact]
+    public async Task LinuxSupervisor_ReapsRootExitsFirstSetsidDoubleForkWithInheritedPipe()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var root = CreateTemporaryDirectory();
+        var pidFile = Path.Combine(root, "detached.pid");
+        var logFile = Path.Combine(root, "supervised.log");
+        try
+        {
+            using var supervisor = LinuxProcessSupervisor.Start(
+                root,
+                logFile,
+                new SensitiveDataRedactor("supervisor-regression-secret"),
+                [
+                    "/bin/sh", "-c",
+                    $"(sh -c \"setsid sh -c 'trap \\\"\\\" TERM; echo \\$\\$ > \\\"{pidFile}\\\"; printf supervisor-; sleep 0.05; printf regression-secret-inherited-pipe-output; sleep 30' & exit 0\" &) ; exit 0"
+                ]);
+            Assert.False(LinuxProcessSupervisor.IdentityMatches(
+                supervisor.SupervisorIdentity.ProcessId,
+                supervisor.SupervisorIdentity.StartTime + 1));
+
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await supervisor.Process.WaitForExitAsync(timeout.Token);
+            Assert.True(File.Exists(pidFile));
+            var detachedPid = int.Parse(await File.ReadAllTextAsync(pidFile, TestContext.Current.CancellationToken));
+            Assert.Throws<ArgumentException>(() => Process.GetProcessById(detachedPid));
+            var output = await File.ReadAllTextAsync(logFile, TestContext.Current.CancellationToken);
+            Assert.Contains("<redacted>-inherited-pipe-output", output, StringComparison.Ordinal);
+            Assert.DoesNotContain("supervisor-regression-secret", output, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task PortReservations_AreCrossProcessDistinctAndListenerOwnershipIsProcessSpecific()
     {
         var root = CreateTemporaryDirectory();

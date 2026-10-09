@@ -22,11 +22,8 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
 
     private readonly JellyfinHostLayout _layout;
     private readonly SensitiveDataRedactor _redactor;
-    private readonly Process _process;
+    private readonly LinuxProcessSupervisor _supervisor;
     private readonly HttpClient _httpClient;
-    private readonly StreamWriter _processLog;
-    private readonly Task _standardOutput;
-    private readonly Task _standardError;
     private readonly LinuxProcessIdentity _processIdentity;
     private bool _disposed;
     private bool _logCompleted;
@@ -34,30 +31,24 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
     private JellyfinHostProcess(
         JellyfinHostLayout layout,
         SensitiveDataRedactor redactor,
-        Process process,
+        LinuxProcessSupervisor supervisor,
         HttpClient httpClient,
-        StreamWriter processLog,
-        Task standardOutput,
-        Task standardError,
         int httpPort,
         LinuxProcessIdentity processIdentity)
     {
         _layout = layout;
         _redactor = redactor;
-        _process = process;
+        _supervisor = supervisor;
         _httpClient = httpClient;
-        _processLog = processLog;
-        _standardOutput = standardOutput;
-        _standardError = standardError;
         _processIdentity = processIdentity;
         BaseAddress = new Uri($"http://127.0.0.1:{httpPort}/", UriKind.Absolute);
     }
 
     public Uri BaseAddress { get; }
 
-    public int ProcessId => _process.Id;
+    public int ProcessId => _processIdentity.ProcessId;
 
-    public bool HasExited => _process.HasExited;
+    public bool HasExited => !_processIdentity.IsCurrent();
 
     public static JellyfinHostProcess Start(
         JellyfinHostLayout layout,
@@ -75,55 +66,39 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             throw new PlatformNotSupportedException("The pristine-host harness requires Linux process-group and socket identity checks.");
         }
 
-        var startInfo = new ProcessStartInfo("setsid")
+        var command = new List<string>
         {
-            RedirectStandardError = true,
-            RedirectStandardOutput = true,
-            UseShellExecute = false,
-            WorkingDirectory = layout.Publish.DirectoryPath
+            "dotnet", layout.Publish.EntryAssemblyPath,
+            "--datadir", layout.DataDirectory,
+            "--configdir", layout.ConfigurationDirectory,
+            "--cachedir", layout.CacheDirectory,
+            "--logdir", layout.LogDirectory,
+            "--nowebclient",
+            "--nonetchange"
         };
-        startInfo.ArgumentList.Add("--wait");
-        startInfo.ArgumentList.Add("dotnet");
-        startInfo.ArgumentList.Add(layout.Publish.EntryAssemblyPath);
-        AddArgument(startInfo, "--datadir", layout.DataDirectory);
-        AddArgument(startInfo, "--configdir", layout.ConfigurationDirectory);
-        AddArgument(startInfo, "--cachedir", layout.CacheDirectory);
-        AddArgument(startInfo, "--logdir", layout.LogDirectory);
-        startInfo.ArgumentList.Add("--nowebclient");
-        startInfo.ArgumentList.Add("--nonetchange");
         if (!string.IsNullOrWhiteSpace(ffmpegPath))
         {
-            AddArgument(startInfo, "--ffmpeg", Path.GetFullPath(ffmpegPath));
-        }
-
-        foreach (var variable in PostgreSqlEnvironmentVariables)
-        {
-            _ = startInfo.Environment.Remove(variable);
+            command.Add("--ffmpeg");
+            command.Add(Path.GetFullPath(ffmpegPath));
         }
 
         httpPortReservation.ReleaseSocketForLaunch();
-        var process = new Process { StartInfo = startInfo };
-        var started = false;
+        LinuxProcessSupervisor? supervisor = null;
         try
         {
-            if (!process.Start())
-            {
-                throw new InvalidOperationException("Could not start the integrity-checked Jellyfin publish.");
-            }
-
-            started = true;
-            var processIdentity = LinuxProcessIdentity.AwaitDedicatedGroup(process, TimeSpan.FromSeconds(1))
-                ?? throw new InvalidOperationException("Jellyfin exited before entering its dedicated test process group.");
-
             var logPath = Path.Combine(layout.RunRoot, $"process-{DateTimeOffset.UtcNow:yyyyMMddHHmmssfff}.log");
-            var processLog = new StreamWriter(SecureFileSystem.CreateFile(logPath), new UTF8Encoding(encoderShouldEmitUTF8Identifier: false))
-            {
-                AutoFlush = true
-            };
-            var outputLock = new SemaphoreSlim(1, 1);
-            var outputBudget = new OutputBudget(16 * 1024 * 1024);
-            var standardOutput = CopySanitizedAsync(process.StandardOutput, processLog, outputLock, redactor, "stdout", outputBudget);
-            var standardError = CopySanitizedAsync(process.StandardError, processLog, outputLock, redactor, "stderr", outputBudget);
+            supervisor = LinuxProcessSupervisor.Start(
+                layout.Publish.DirectoryPath,
+                logPath,
+                redactor,
+                command,
+                startInfo =>
+                {
+                    foreach (var variable in PostgreSqlEnvironmentVariables)
+                    {
+                        _ = startInfo.Environment.Remove(variable);
+                    }
+                });
             var handler = new SocketsHttpHandler { UseProxy = false, AllowAutoRedirect = false };
             var httpClient = new HttpClient(handler)
             {
@@ -133,22 +108,19 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             return new JellyfinHostProcess(
                 layout,
                 redactor,
-                process,
+                supervisor,
                 httpClient,
-                processLog,
-                standardOutput,
-                standardError,
                 httpPort,
-                processIdentity);
+                supervisor.TargetIdentity);
         }
         catch
         {
-            if (started)
+            if (supervisor is not null)
             {
-                ExternalCommand.TryTerminate(process);
+                supervisor.Terminate(TimeSpan.FromSeconds(15));
+                supervisor.Dispose();
             }
 
-            process.Dispose();
             layout.RetainOnlySanitizedEvidence(redactor);
             throw;
         }
@@ -176,12 +148,13 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
                 cancellationToken.ThrowIfCancellationRequested();
             }
 
-            if (_process.HasExited)
+            if (HasExited)
             {
+                _supervisor.Terminate(TimeSpan.FromSeconds(15));
                 await CompleteLogAsync().ConfigureAwait(false);
                 _layout.CollectSanitizedLogs(_redactor);
                 throw new InvalidOperationException(
-                    $"Jellyfin exited with code {_process.ExitCode} before becoming ready. See sanitized logs in '{_layout.CollectedLogDirectory}'.");
+                    $"Jellyfin exited before becoming ready. See sanitized logs in '{_layout.CollectedLogDirectory}'.");
             }
 
             try
@@ -277,7 +250,7 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         using var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
         try
         {
-            await _process.WaitForExitAsync(linkedSource.Token).ConfigureAwait(false);
+            await _supervisor.Process.WaitForExitAsync(linkedSource.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -293,13 +266,9 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
 
     public async Task TerminateAsync()
     {
-        if (!_process.HasExited)
+        if (!_supervisor.Process.HasExited)
         {
-            ExternalCommand.TryTerminate(_process, _processIdentity);
-        }
-        else
-        {
-            _processIdentity.TerminateRemainingGroup();
+            _supervisor.Terminate(TimeSpan.FromSeconds(15));
         }
 
         await CompleteLogAsync().ConfigureAwait(false);
@@ -322,16 +291,10 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         finally
         {
             _httpClient.Dispose();
-            _process.Dispose();
+            _supervisor.Dispose();
             _layout.RetainOnlySanitizedEvidence(_redactor);
         }
         GC.SuppressFinalize(this);
-    }
-
-    private static void AddArgument(ProcessStartInfo startInfo, string name, string value)
-    {
-        startInfo.ArgumentList.Add(name);
-        startInfo.ArgumentList.Add(value);
     }
 
     private static void ValidatePort(int port, string parameterName)
@@ -345,7 +308,7 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
     private void EnsureOwnsEndpoint()
     {
         var status = InspectListener(BaseAddress.Port, out var inode);
-        if (status == ListenerStatus.Missing && !_process.HasExited && _processIdentity.IsCurrent())
+        if (status == ListenerStatus.Missing && !HasExited && _processIdentity.IsCurrent())
         {
             throw new ListenerNotReadyException();
         }
@@ -353,13 +316,13 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         var listenerGroups = status == ListenerStatus.Valid ? GetListenerProcessGroups(inode!) : [];
         if (status == ListenerStatus.Valid
             && listenerGroups.Count == 0
-            && !_process.HasExited
+            && !HasExited
             && _processIdentity.IsCurrent())
         {
             throw new ListenerNotReadyException();
         }
 
-        if (_process.HasExited || !_processIdentity.IsCurrent() || !listenerGroups.Contains(_processIdentity.ProcessGroupId))
+        if (HasExited || !_processIdentity.IsCurrent() || !listenerGroups.Contains(_processIdentity.ProcessGroupId))
         {
             throw new InvalidOperationException(
                 "The launched Jellyfin process does not own one exact loopback listener on its leased endpoint; refusing to issue an API request. "
@@ -699,22 +662,22 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             return;
         }
 
-        var readers = Task.WhenAll(_standardOutput, _standardError);
-        if (await Task.WhenAny(readers, Task.Delay(TimeSpan.FromSeconds(5))).ConfigureAwait(false) != readers)
+        if (!_supervisor.Process.HasExited)
         {
-            _process.StandardOutput.Dispose();
-            _process.StandardError.Dispose();
-            if (await Task.WhenAny(readers, Task.Delay(TimeSpan.FromSeconds(5))).ConfigureAwait(false) != readers)
-            {
-                throw new InvalidOperationException("Jellyfin output readers did not terminate after their bounded pipe shutdown.");
-            }
+            throw new InvalidOperationException("Cannot complete the supervised process log while the supervisor is running.");
         }
-        else
+
+        if (await Task.WhenAny(_supervisor.StandardError, Task.Delay(TimeSpan.FromSeconds(5))).ConfigureAwait(false) != _supervisor.StandardError)
         {
-            await readers.ConfigureAwait(false);
+            throw new InvalidOperationException("The process-supervisor diagnostic stream did not close after bounded shutdown.");
         }
-        await _processLog.FlushAsync().ConfigureAwait(false);
-        _processLog.Dispose();
+
+        var diagnostic = await _supervisor.StandardError.ConfigureAwait(false);
+        if (_supervisor.Process.ExitCode == 125)
+        {
+            throw new InvalidOperationException("The Linux process supervisor failed: " + _redactor.Redact(diagnostic));
+        }
+
         _logCompleted = true;
     }
 }
