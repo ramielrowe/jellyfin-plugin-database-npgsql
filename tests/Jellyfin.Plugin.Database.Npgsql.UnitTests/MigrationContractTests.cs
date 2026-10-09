@@ -35,6 +35,10 @@ public sealed class MigrationContractTests
         Assert.Contains("__JellyfinTextNodes", script, StringComparison.Ordinal);
         Assert.Contains("CREATE AGGREGATE public.min(uuid)", script, StringComparison.Ordinal);
         Assert.Contains("CREATE AGGREGATE public.max(uuid)", script, StringComparison.Ordinal);
+        Assert.Contains("SORTOP = OPERATOR(pg_catalog.<)", script, StringComparison.Ordinal);
+        Assert.Contains("SORTOP = OPERATOR(pg_catalog.>)", script, StringComparison.Ordinal);
+        Assert.Contains("REVOKE EXECUTE ON FUNCTION public.min(uuid) FROM PUBLIC", script, StringComparison.Ordinal);
+        Assert.Contains("REVOKE EXECUTE ON FUNCTION public.__jellyfin_uuid_min(uuid, uuid) FROM PUBLIC", script, StringComparison.Ordinal);
         Assert.Contains("IX_ActivityLogs_Npgsql_Type_DateCreated", script, StringComparison.Ordinal);
         Assert.DoesNotContain("Digest", script, StringComparison.Ordinal);
     }

@@ -68,6 +68,7 @@ public sealed class PersistenceParityTests
         {
             var identities = await RunIdentitySecurityAndActivityAsync(database, cancellationToken);
             var catalog = await RunCatalogAndQueryAsync(database, cancellationToken);
+            await RunMediaAndChapterReplacementAsync(database, cancellationToken);
             var bulk = await RunLongKeyTransactionAndBulkAsync(database, cancellationToken);
             return new ParityResult(identities, catalog, bulk);
         }
@@ -75,6 +76,73 @@ public sealed class PersistenceParityTests
         {
             throw new InvalidOperationException($"Persistence parity scenario '{diagnosticName}' failed.", exception);
         }
+    }
+
+    private static async Task RunMediaAndChapterReplacementAsync(
+        ParityDatabase database,
+        CancellationToken cancellationToken)
+    {
+        var itemId = Guid.Parse("dddddddd-0000-0000-0000-000000000001");
+        var otherItemId = Guid.Parse("dddddddd-0000-0000-0000-000000000002");
+        await using (var seed = database.CreateContext())
+        {
+            seed.BaseItems.AddRange(
+                CreateItem(itemId, "Movie", "Replacement target", ScenarioStart, false),
+                CreateItem(otherItemId, "Movie", "Replacement survivor", ScenarioStart, false));
+            seed.MediaStreamInfos.AddRange(
+                new MediaStreamInfo { ItemId = itemId, Item = null!, StreamIndex = 0, StreamType = MediaStreamTypeEntity.Video, Codec = "h264" },
+                new MediaStreamInfo { ItemId = itemId, Item = null!, StreamIndex = 1, StreamType = MediaStreamTypeEntity.Audio, Language = "jpn" },
+                new MediaStreamInfo { ItemId = otherItemId, Item = null!, StreamIndex = 9, StreamType = MediaStreamTypeEntity.Audio, Title = "preserved" });
+            seed.Chapters.AddRange(
+                new Chapter { ItemId = itemId, Item = null!, ChapterIndex = 0, StartPositionTicks = 0, Name = "original" },
+                new Chapter { ItemId = otherItemId, Item = null!, ChapterIndex = 0, StartPositionTicks = 99, Name = "preserved" });
+            await seed.SaveChangesAsync(cancellationToken);
+        }
+
+        await using (var failedReplacement = database.CreateContext())
+        await using (var transaction = await failedReplacement.Database.BeginTransactionAsync(cancellationToken))
+        {
+            await failedReplacement.MediaStreamInfos.Where(stream => stream.ItemId == itemId).ExecuteDeleteAsync(cancellationToken);
+            await failedReplacement.Chapters.Where(chapter => chapter.ItemId == itemId).ExecuteDeleteAsync(cancellationToken);
+            failedReplacement.MediaStreamInfos.AddRange(
+                new MediaStreamInfo { ItemId = itemId, Item = null!, StreamIndex = 4, StreamType = MediaStreamTypeEntity.Audio, Title = "must-roll-back" },
+                new MediaStreamInfo { ItemId = Guid.Parse("dddddddd-ffff-ffff-ffff-ffffffffffff"), Item = null!, StreamIndex = 5, StreamType = MediaStreamTypeEntity.Audio });
+            failedReplacement.Chapters.Add(new Chapter { ItemId = itemId, Item = null!, ChapterIndex = 7, StartPositionTicks = 70, Name = "must-roll-back" });
+            await Assert.ThrowsAsync<DbUpdateException>(() => failedReplacement.SaveChangesAsync(cancellationToken));
+            await transaction.RollbackAsync(cancellationToken);
+        }
+
+        await using (var afterFailure = database.CreateContext())
+        {
+            Assert.Equal(new[] { 0, 1 }, await afterFailure.MediaStreamInfos.Where(stream => stream.ItemId == itemId).OrderBy(stream => stream.StreamIndex).Select(stream => stream.StreamIndex).ToArrayAsync(cancellationToken));
+            Assert.Equal("original", await afterFailure.Chapters.Where(chapter => chapter.ItemId == itemId).Select(chapter => chapter.Name).SingleAsync(cancellationToken));
+        }
+
+        await using (var replacement = database.CreateContext())
+        await using (var transaction = await replacement.Database.BeginTransactionAsync(cancellationToken))
+        {
+            await replacement.MediaStreamInfos.Where(stream => stream.ItemId == itemId).ExecuteDeleteAsync(cancellationToken);
+            await replacement.Chapters.Where(chapter => chapter.ItemId == itemId).ExecuteDeleteAsync(cancellationToken);
+            replacement.MediaStreamInfos.AddRange(
+                new MediaStreamInfo { ItemId = itemId, Item = null!, StreamIndex = 3, StreamType = MediaStreamTypeEntity.Video, Codec = "hevc", Width = 3840 },
+                new MediaStreamInfo { ItemId = itemId, Item = null!, StreamIndex = 4, StreamType = MediaStreamTypeEntity.Audio, Language = "fra", Channels = 6, Title = "replacement" });
+            replacement.Chapters.Add(new Chapter { ItemId = itemId, Item = null!, ChapterIndex = 0, StartPositionTicks = 10, Name = "replacement" });
+            await replacement.SaveChangesAsync(cancellationToken);
+            await transaction.CommitAsync(cancellationToken);
+        }
+
+        await using var verify = database.CreateContext();
+        Assert.Equal(new[] { 3, 4 }, await verify.MediaStreamInfos.Where(stream => stream.ItemId == itemId).OrderBy(stream => stream.StreamIndex).Select(stream => stream.StreamIndex).ToArrayAsync(cancellationToken));
+        Assert.Equal("replacement", await verify.Chapters.Where(chapter => chapter.ItemId == itemId).Select(chapter => chapter.Name).SingleAsync(cancellationToken));
+        Assert.Equal("preserved", await verify.MediaStreamInfos.Where(stream => stream.ItemId == otherItemId).Select(stream => stream.Title).SingleAsync(cancellationToken));
+        Assert.Equal("preserved", await verify.Chapters.Where(chapter => chapter.ItemId == otherItemId).Select(chapter => chapter.Name).SingleAsync(cancellationToken));
+
+        await verify.MediaStreamInfos.Where(stream => stream.ItemId == itemId).ExecuteDeleteAsync(cancellationToken);
+        await verify.Chapters.Where(chapter => chapter.ItemId == itemId).ExecuteDeleteAsync(cancellationToken);
+        Assert.False(await verify.MediaStreamInfos.AnyAsync(stream => stream.ItemId == itemId, cancellationToken));
+        Assert.False(await verify.Chapters.AnyAsync(chapter => chapter.ItemId == itemId, cancellationToken));
+        Assert.True(await verify.MediaStreamInfos.AnyAsync(stream => stream.ItemId == otherItemId, cancellationToken));
+        Assert.True(await verify.Chapters.AnyAsync(chapter => chapter.ItemId == otherItemId, cancellationToken));
     }
 
     private static async Task<IdentityResult> RunIdentitySecurityAndActivityAsync(
@@ -136,6 +204,38 @@ public sealed class PersistenceParityTests
         staleCopy.Username = "stale-writer";
         await Assert.ThrowsAsync<DbUpdateConcurrencyException>(() => staleWriter.SaveChangesAsync(cancellationToken));
 
+        var concurrentApiKeys = Enumerable.Range(0, 8)
+            .Select(index => new ApiKey($"independent-{index:D2}"))
+            .ToArray();
+        async Task PersistApiKeyAsync(ApiKey key)
+        {
+            await using var writer = database.CreateContext();
+            writer.ApiKeys.Add(key);
+            await writer.SaveChangesAsync(cancellationToken);
+        }
+
+        if (database.IsPostgreSql)
+        {
+            await Task.WhenAll(concurrentApiKeys.Select(PersistApiKeyAsync));
+        }
+        else
+        {
+            foreach (var key in concurrentApiKeys)
+            {
+                await PersistApiKeyAsync(key);
+            }
+        }
+
+        await using (var failedBatch = database.CreateContext())
+        await using (var transaction = await failedBatch.Database.BeginTransactionAsync(cancellationToken))
+        {
+            failedBatch.ApiKeys.AddRange(
+                new ApiKey("must-roll-back"),
+                new ApiKey("duplicate-token") { AccessToken = apiKey.AccessToken });
+            await Assert.ThrowsAsync<DbUpdateException>(() => failedBatch.SaveChangesAsync(cancellationToken));
+            await transaction.RollbackAsync(cancellationToken);
+        }
+
         await using var read = database.CreateContext();
         var stored = await read.Users
             .AsNoTracking()
@@ -164,8 +264,11 @@ public sealed class PersistenceParityTests
             Assert.Single(stored.Preferences).Value,
             storedDisplay.ShowSidebar,
             storedCustom.Value,
-            await read.ApiKeys.Select(entity => entity.Name).SingleAsync(cancellationToken),
+            await read.ApiKeys.Where(entity => entity.Name == "matrix-key").Select(entity => entity.Name).SingleAsync(cancellationToken),
             await read.Devices.Select(entity => entity.DeviceName).SingleAsync(cancellationToken),
+            await read.ApiKeys.CountAsync(entity => entity.Name.StartsWith("independent-"), cancellationToken),
+            await read.ApiKeys.Select(entity => entity.AccessToken).Distinct().CountAsync(cancellationToken),
+            await read.ApiKeys.AnyAsync(entity => entity.Name == "must-roll-back", cancellationToken),
             literalNames,
             asciiCaseFold,
             unicodeCaseFold,
@@ -429,11 +532,48 @@ public sealed class PersistenceParityTests
             .Select(index => Guid.Parse($"{index:x8}-1111-1111-1111-111111111111"))
             .ToArray();
         var survivorId = Guid.Parse("ffffffff-1111-1111-1111-111111111111");
+        var placeholderId = Guid.Parse("00000000-0000-0000-0000-000000000001");
+        var removedValue = CreateItemValue("bulk-removed-value");
+        var survivorValue = CreateItemValue("bulk-survivor-value");
+        var removedPerson = new People { Id = Guid.NewGuid(), Name = "Bulk Removed Person", PersonType = "Actor" };
+        var survivorPerson = new People { Id = Guid.NewGuid(), Name = "Bulk Survivor Person", PersonType = "Actor" };
         await using (var seed = database.CreateContext())
         {
             seed.BaseItems.AddRange(targetIds.Select((id, index) =>
                 CreateItem(id, "Book", $"Delete {index}", ScenarioStart.AddMinutes(index), false)));
             seed.BaseItems.Add(CreateItem(survivorId, "Book", "Keep", ScenarioStart, false));
+            seed.AddRange(removedValue, survivorValue, removedPerson, survivorPerson);
+            seed.UserData.AddRange(targetIds.Select((id, index) => new UserData
+            {
+                ItemId = id,
+                Item = null!,
+                UserId = longKeyUser.Id,
+                User = null!,
+                CustomDataKey = "bulk-shared-key",
+                LastPlayedDate = ScenarioStart.AddMinutes(index),
+                PlayCount = index
+            }));
+            seed.UserData.Add(new UserData
+            {
+                ItemId = survivorId,
+                Item = null!,
+                UserId = longKeyUser.Id,
+                User = null!,
+                CustomDataKey = "bulk-survivor-key",
+                PlayCount = 9999
+            });
+            seed.ItemValuesMap.AddRange(
+                new ItemValueMap { ItemId = targetIds[0], Item = null!, ItemValueId = removedValue.ItemValueId, ItemValue = null! },
+                new ItemValueMap { ItemId = survivorId, Item = null!, ItemValueId = survivorValue.ItemValueId, ItemValue = null! });
+            seed.PeopleBaseItemMap.AddRange(
+                new PeopleBaseItemMap { ItemId = targetIds[0], Item = null!, PeopleId = removedPerson.Id, People = null!, Role = "removed" },
+                new PeopleBaseItemMap { ItemId = survivorId, Item = null!, PeopleId = survivorPerson.Id, People = null!, Role = "survivor" });
+            seed.MediaStreamInfos.AddRange(
+                new MediaStreamInfo { ItemId = targetIds[0], Item = null!, StreamIndex = 0, StreamType = MediaStreamTypeEntity.Video },
+                new MediaStreamInfo { ItemId = survivorId, Item = null!, StreamIndex = 7, StreamType = MediaStreamTypeEntity.Audio });
+            seed.Chapters.AddRange(
+                new Chapter { ItemId = targetIds[0], Item = null!, ChapterIndex = 0, StartPositionTicks = 0, Name = "removed" },
+                new Chapter { ItemId = survivorId, Item = null!, ChapterIndex = 0, StartPositionTicks = 7, Name = "survives" });
             await seed.SaveChangesAsync(cancellationToken);
         }
 
@@ -441,12 +581,36 @@ public sealed class PersistenceParityTests
         await using (var delete = database.CreateContext())
         {
             await using var transaction = await delete.Database.BeginTransactionAsync(cancellationToken);
+            var retainedUserData = await delete.UserData
+                .Where(data => data.CustomDataKey == "bulk-shared-key")
+                .OrderByDescending(data => data.LastPlayedDate)
+                .ThenByDescending(data => data.PlayCount)
+                .FirstAsync(cancellationToken);
+            foreach (var partition in targetIds.Where(id => id != retainedUserData.ItemId).Chunk(200))
+            {
+                await delete.UserData
+                    .Where(data => partition.Contains(data.ItemId) && data.CustomDataKey == "bulk-shared-key")
+                    .ExecuteDeleteAsync(cancellationToken);
+            }
+
+            await delete.UserData
+                .Where(data => data.ItemId == retainedUserData.ItemId
+                    && data.UserId == retainedUserData.UserId
+                    && data.CustomDataKey == retainedUserData.CustomDataKey)
+                .ExecuteUpdateAsync(
+                    setters => setters
+                        .SetProperty(data => data.ItemId, placeholderId)
+                        .SetProperty(data => data.RetentionDate, ScenarioStart.AddYears(1)),
+                    cancellationToken);
             foreach (var partition in targetIds.Append(targetIds[0]).Append(Guid.Empty).Distinct().Chunk(200))
             {
                 deleted += await delete.BaseItems
                     .Where(item => partition.Contains(item.Id))
                     .ExecuteDeleteAsync(cancellationToken);
             }
+
+            await delete.ItemValues.Where(value => value.ItemValueId == removedValue.ItemValueId && !value.BaseItemsMap!.Any()).ExecuteDeleteAsync(cancellationToken);
+            await delete.Peoples.Where(person => person.Id == removedPerson.Id && !person.BaseItems!.Any()).ExecuteDeleteAsync(cancellationToken);
 
             await transaction.CommitAsync(cancellationToken);
         }
@@ -460,6 +624,20 @@ public sealed class PersistenceParityTests
             (await verify.ItemValues.SingleAsync(entity => entity.ItemValueId == longValue.ItemValueId, cancellationToken)).Value.Length,
             (await verify.CustomItemDisplayPreferences.SingleAsync(entity => entity.ItemId == longKeyItem.Id, cancellationToken)).Key.Length
         };
+        var detachedUserData = await verify.UserData.SingleAsync(
+            data => data.ItemId == placeholderId && data.CustomDataKey == "bulk-shared-key",
+            cancellationToken);
+        Assert.Equal(DeleteCount - 1, detachedUserData.PlayCount);
+        Assert.Equal(ScenarioStart.AddYears(1), detachedUserData.RetentionDate);
+        Assert.False(await verify.ItemValues.AnyAsync(value => value.ItemValueId == removedValue.ItemValueId, cancellationToken));
+        Assert.True(await verify.ItemValues.AnyAsync(value => value.ItemValueId == survivorValue.ItemValueId, cancellationToken));
+        Assert.False(await verify.Peoples.AnyAsync(person => person.Id == removedPerson.Id, cancellationToken));
+        Assert.True(await verify.Peoples.AnyAsync(person => person.Id == survivorPerson.Id, cancellationToken));
+        Assert.False(await verify.MediaStreamInfos.AnyAsync(stream => stream.ItemId == targetIds[0], cancellationToken));
+        Assert.Equal(7, await verify.MediaStreamInfos.Where(stream => stream.ItemId == survivorId).Select(stream => stream.StreamIndex).SingleAsync(cancellationToken));
+        Assert.False(await verify.Chapters.AnyAsync(chapter => chapter.ItemId == targetIds[0], cancellationToken));
+        Assert.Equal("survives", await verify.Chapters.Where(chapter => chapter.ItemId == survivorId).Select(chapter => chapter.Name).SingleAsync(cancellationToken));
+        Assert.Equal(9999, await verify.UserData.Where(data => data.ItemId == survivorId).Select(data => data.PlayCount).SingleAsync(cancellationToken));
         return new BulkResult(
             longLengths,
             await verify.Users.AnyAsync(entity => entity.Username == "rolled-back", cancellationToken),
@@ -477,6 +655,9 @@ public sealed class PersistenceParityTests
         Assert.Equal("雪", result.Identity.Theme);
         Assert.Equal("matrix-key", result.Identity.ApiKeyName);
         Assert.Equal("Living Room 雪", result.Identity.DeviceName);
+        Assert.Equal(8, result.Identity.ConcurrentApiKeyCount);
+        Assert.Equal(9, result.Identity.DistinctApiKeyTokenCount);
+        Assert.False(result.Identity.FailedApiKeyBatchPersisted);
         Assert.Equal([@"Literal C:\100%_done beta", @"Literal C:\100%_done gamma"], result.Identity.LiteralPage);
         Assert.Equal(4, result.Identity.AsciiCaseFoldCount);
         Assert.Equal(0, result.Identity.UnicodeCaseFoldCount);
@@ -553,6 +734,9 @@ public sealed class PersistenceParityTests
         string? Theme,
         string ApiKeyName,
         string DeviceName,
+        int ConcurrentApiKeyCount,
+        int DistinctApiKeyTokenCount,
+        bool FailedApiKeyBatchPersisted,
         string[] LiteralPage,
         int AsciiCaseFoldCount,
         int UnicodeCaseFoldCount,
@@ -635,6 +819,8 @@ public sealed class PersistenceParityTests
         }
 
         public JellyfinDbContext CreateContext() => _createContext();
+
+        public bool IsPostgreSql => _ownedConnection is null;
 
         public async ValueTask DisposeAsync()
         {

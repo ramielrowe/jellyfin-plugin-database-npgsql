@@ -144,8 +144,7 @@ the vanilla Jellyfin publish is required.
 these conventions. It installs the built ZIP into isolated data, writes
 `database.xml`, launches the exact publish, waits for health, uses Jellyfin's
 HTTP APIs, gracefully stops the server, and checks that the host publish did not
-change. During the current backup-development stage, run its provider-core
-boundary:
+change. Existing provider-core CI jobs may retain their compatibility flag:
 
 ```sh
 export JELLYFIN_HOST_PUBLISH=/path/to/vanilla-jellyfin-publish
@@ -153,8 +152,13 @@ export JELLYFIN_HOST_SHA256=<publish hash>
 PROVIDER_CORE_ONLY=true ./tests/black-box-smoke.sh
 ```
 
-This path uses the same digest-pinned PostgreSQL 16.6 image and requires exact
-`server_version_num = 160006` after startup. The reusable C# fixture
+The compatibility flag now runs the complete successful migration, snapshot
+deletion, forced-failure restore, restart, and public-API flow; there is no
+longer a pre-backup implementation guard. This path uses the same digest-pinned
+PostgreSQL 16.6 image and requires exact `server_version_num = 160006` after
+startup. Every exit path removes the exact revalidated labeled container with
+`docker rm --force --volumes` and verifies its captured anonymous volume set is
+absent. The reusable C# fixture
 above is the preferred path for new database tests and supports an external
 administrator connection. The package smoke removes its labeled container and
 retains only redacted logs and evidence with owner-only modes.

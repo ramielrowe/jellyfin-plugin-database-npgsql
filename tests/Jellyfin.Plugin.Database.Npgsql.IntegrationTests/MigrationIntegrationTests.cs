@@ -6,6 +6,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.Logging.Abstractions;
+using Npgsql;
 using Xunit;
 
 namespace Jellyfin.Plugin.Database.Npgsql.IntegrationTests;
@@ -128,12 +129,15 @@ public sealed class MigrationIntegrationTests
             Assert.Equal(5, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgname LIKE 'TR_%_Intern' AND NOT tgisinternal", cancellationToken));
             Assert.Equal(12, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace AND proname LIKE '__jellyfin_%'", cancellationToken));
             Assert.Equal(2, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace AND prokind = 'a' AND proname IN ('min', 'max') AND pg_catalog.pg_get_function_identity_arguments(oid) = 'uuid'", cancellationToken));
+            Assert.Equal(4, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('__jellyfin_uuid_min', '__jellyfin_uuid_max', 'min', 'max') AND NOT EXISTS (SELECT 1 FROM pg_catalog.aclexplode(coalesce(proacl, pg_catalog.acldefault('f', proowner))) acl WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE')", cancellationToken));
+            Assert.Equal(2, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_aggregate a JOIN pg_catalog.pg_proc p ON p.oid = a.aggfnoid WHERE p.pronamespace = 'public'::regnamespace AND ((p.proname = 'min' AND a.aggsortop = 'pg_catalog.<(uuid,uuid)'::regoperator) OR (p.proname = 'max' AND a.aggsortop = 'pg_catalog.>(uuid,uuid)'::regoperator))", cancellationToken));
             Assert.Equal(0, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_extension WHERE extname IN ('pgcrypto', 'citext')", cancellationToken));
             Assert.Equal(0, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_constraint WHERE conname IN ('PK_BaseItemProviders', 'PK_PeopleBaseItemMap', 'PK_UserData')", cancellationToken));
             Assert.True(await ScalarAsync<bool>(context, "SELECT NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = current_user", cancellationToken));
 
             await migrator.MigrateAsync(Baseline, cancellationToken);
             Assert.False(await IndexExistsAsync(context, cancellationToken));
+            Assert.Equal(0, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('__jellyfin_uuid_min', '__jellyfin_uuid_max', 'min', 'max')", cancellationToken));
             Assert.Equal(1, await context.ActivityLogs.CountAsync(cancellationToken));
             Assert.Equal(
                 [CoreNormalizedUsername, CoreDisableLegacyAuthorization, Baseline],
@@ -147,10 +151,87 @@ public sealed class MigrationIntegrationTests
             Assert.Equal(
                 [CoreNormalizedUsername, CoreDisableLegacyAuthorization, Baseline, Successor, UuidAggregates],
                 await ReadHistoryAsync(context, cancellationToken));
+            Assert.Equal(2, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_aggregate a JOIN pg_catalog.pg_proc p ON p.oid = a.aggfnoid WHERE p.pronamespace = 'public'::regnamespace AND p.proname IN ('min', 'max') AND pg_catalog.pg_get_function_identity_arguments(p.oid) = 'uuid'", cancellationToken));
         }
         finally
         {
             global::Npgsql.NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Theory]
+    [InlineData("helper")]
+    [InlineData("aggregate")]
+    public async Task UuidAggregateMigration_FailsAtomicallyOnOwnedNameCollision(string collision)
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await using var context = CreateContext(database.RuntimeConnectionString);
+            var migrator = context.GetService<IMigrator>();
+            await migrator.MigrateAsync(Successor, cancellationToken);
+            var collisionSql = collision == "helper"
+                ? "CREATE FUNCTION public.__jellyfin_uuid_min(uuid, uuid) RETURNS uuid LANGUAGE sql IMMUTABLE AS 'SELECT $1'"
+                : """
+                  CREATE FUNCTION public.__collision_uuid_min(uuid, uuid) RETURNS uuid LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+                  CREATE AGGREGATE public.min(uuid) (SFUNC = public.__collision_uuid_min, STYPE = uuid);
+                  """;
+            await context.Database.ExecuteSqlRawAsync(collisionSql, cancellationToken);
+
+            var failure = await Assert.ThrowsAsync<PostgresException>(
+                () => migrator.MigrateAsync(UuidAggregates, cancellationToken));
+            Assert.Equal("42723", failure.SqlState);
+            Assert.DoesNotContain(UuidAggregates, await ReadHistoryAsync(context, cancellationToken));
+            Assert.Equal(
+                collision == "helper" ? 1 : 0,
+                await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace AND proname = '__jellyfin_uuid_min'", cancellationToken));
+            Assert.Equal(
+                collision == "aggregate" ? 1 : 0,
+                await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace AND prokind = 'a' AND proname = 'min' AND pg_catalog.pg_get_function_identity_arguments(oid) = 'uuid'", cancellationToken));
+            Assert.Equal(0, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('__jellyfin_uuid_max', 'max')", cancellationToken));
+        }
+        finally
+        {
+            NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Fact]
+    public async Task UuidAggregateMigration_UsesQualifiedPgCatalogOperatorsDespitePublicCollisions()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await using var context = CreateContext(database.RuntimeConnectionString);
+            await context.GetService<IMigrator>().MigrateAsync(Successor, cancellationToken);
+            await context.Database.ExecuteSqlRawAsync(
+                """
+                CREATE FUNCTION public.__collision_uuid_less(uuid, uuid) RETURNS boolean
+                LANGUAGE sql IMMUTABLE AS 'SELECT false';
+                CREATE OPERATOR public.< (FUNCTION = public.__collision_uuid_less, LEFTARG = uuid, RIGHTARG = uuid);
+                CREATE FUNCTION public.__collision_uuid_greater(uuid, uuid) RETURNS boolean
+                LANGUAGE sql IMMUTABLE AS 'SELECT false';
+                CREATE OPERATOR public.> (FUNCTION = public.__collision_uuid_greater, LEFTARG = uuid, RIGHTARG = uuid);
+                """,
+                cancellationToken);
+
+            await context.GetService<IMigrator>().MigrateAsync(UuidAggregates, cancellationToken);
+            Assert.Equal(2, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_aggregate a JOIN pg_catalog.pg_proc p ON p.oid = a.aggfnoid WHERE p.pronamespace = 'public'::regnamespace AND ((p.proname = 'min' AND a.aggsortop = 'pg_catalog.<(uuid,uuid)'::regoperator) OR (p.proname = 'max' AND a.aggsortop = 'pg_catalog.>(uuid,uuid)'::regoperator))", cancellationToken));
+            Assert.Equal(
+                Guid.Parse("00000001-0000-0000-0000-000000000000"),
+                await ScalarAsync<Guid>(context, "SELECT public.min(value) FROM (VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid), ('00000001-0000-0000-0000-000000000000'::uuid)) values(value)", cancellationToken));
+        }
+        finally
+        {
+            NpgsqlConnection.ClearAllPools();
         }
     }
 

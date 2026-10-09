@@ -25,6 +25,15 @@ boundaries, 1,025-row deletion, exact UTC timestamps, duplicate constraints,
 UUID grouping/minimum/maximum aggregates, and composite text values over 10,000
 UTF-16 code units.
 
+Replacement and destructive-write coverage is transactional rather than merely
+checking final rows. A failed stream/chapter replacement rolls back its prior
+deletes, a successful replacement preserves another item's media graph, and a
+1,025-item deletion retains the winning detached user-data row while removing
+dependent item-value, people, stream, and chapter rows without touching their
+survivor counterparts. Eight independent PostgreSQL contexts concurrently
+persist API keys; token uniqueness and an intentionally failed mixed batch
+prove atomic rollback.
+
 The stock-server proof creates and configures users, authenticates a device,
 creates and revokes an API key, installs and scans a movie library, reads people
 and genres parsed from local NFO files, searches and pages through the Items
@@ -32,6 +41,9 @@ API, updates user data, shuts down normally, and then verifies the persisted
 PostgreSQL graph directly through the public context. Failure diagnostics are
 redacted and bounded; copied hosts and raw data remain inside an ownership-
 marked ignored repository-local scratch root and are deleted by the C# harness.
+The API layer also creates six API keys concurrently, revokes one, favorites
+and deletes a scanned item, and verifies Jellyfin's detached user-data retention
+and orphan cleanup while another scanned item's graph remains intact.
 
 ## Intentional provider differences
 
@@ -50,6 +62,14 @@ Jellyfin emits `min(uuid)` when collapsing presentation versions. The plugin's
 third migration adds those two exact aggregates using provider-prefixed,
 immutable transition functions. This is a database capability shim, not a host
 query change, and is reversibly removed on downgrade.
+Both aggregates declare their schema-qualified built-in UUID ordering operator,
+which enables PostgreSQL's min/max index optimization. An actual parameterized
+10,000-row `EXPLAIN` must contain the limit/index-only plan and no aggregate
+node. Catalog tests also pin the transition/combine/final-function shape,
+parallel safety, null behavior, owner and ACLs, public-schema operator
+collisions, atomic name-collision failure, idempotent upgrade, downgrade, and
+reinstall. Default `PUBLIC` execute privileges are revoked; the database owner
+used by Jellyfin retains the required execution right.
 
 PostgreSQL B-tree keys have a finite tuple size. Long logical text identities
 are therefore represented by the plugin's exact chunk-interned surrogate keys;

@@ -49,7 +49,7 @@ with state_path.open("r+") as state:
             print(f"{container_id}|/{name}|true|{scope}|{lease}|123|456")
         raise SystemExit(0)
 
-    if arguments[:2] == ["rm", "--force"]:
+    if arguments[:3] == ["rm", "--force", "--volumes"]:
         requested = arguments[-1]
         if requested != container_id or removed:
             print(f"Error: No such container: {requested}", file=sys.stderr)
@@ -59,7 +59,7 @@ with state_path.open("r+") as state:
         state.write("removed")
         state.flush()
         with log_path.open("a") as log:
-            log.write(requested + "\n")
+            log.write("|".join(arguments) + "\n")
         print(requested)
         raise SystemExit(0)
 

@@ -41,6 +41,7 @@ internal static class NpgsqlUuidAggregates
             SFUNC = public.__jellyfin_uuid_min,
             STYPE = uuid,
             COMBINEFUNC = public.__jellyfin_uuid_min,
+            SORTOP = OPERATOR(pg_catalog.<),
             PARALLEL = SAFE
         );
 
@@ -48,8 +49,14 @@ internal static class NpgsqlUuidAggregates
             SFUNC = public.__jellyfin_uuid_max,
             STYPE = uuid,
             COMBINEFUNC = public.__jellyfin_uuid_max,
+            SORTOP = OPERATOR(pg_catalog.>),
             PARALLEL = SAFE
         );
+
+        REVOKE EXECUTE ON FUNCTION public.__jellyfin_uuid_min(uuid, uuid) FROM PUBLIC;
+        REVOKE EXECUTE ON FUNCTION public.__jellyfin_uuid_max(uuid, uuid) FROM PUBLIC;
+        REVOKE EXECUTE ON FUNCTION public.min(uuid) FROM PUBLIC;
+        REVOKE EXECUTE ON FUNCTION public.max(uuid) FROM PUBLIC;
         """;
 
     /// <summary>The matching rollback SQL.</summary>

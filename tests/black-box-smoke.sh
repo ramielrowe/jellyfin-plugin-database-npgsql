@@ -101,7 +101,7 @@ reap_stale_smoke_containers() {
         fi
 
         set +e
-        removal=$(docker rm --force "$stale_id" 2>&1)
+        removal=$(docker rm --force --volumes "$stale_id" 2>&1)
         removal_status=$?
         set -e
         eval "exec ${stale_lease_fd}>&-"
@@ -160,6 +160,8 @@ if [ "${1:-}" = "--test-container-reaper" ]; then
     wait "$second_worker"
     [ "$(wc -l <"$FAKE_DOCKER_LOG")" -eq 1 ] \
         || { echo "FAIL: two-process reclamation did not serialize to one exact removal" >&2; exit 1; }
+    [ "$(cat "$FAKE_DOCKER_LOG")" = "rm|--force|--volumes|$(printf 'a%.0s' $(seq 1 64))" ] \
+        || { echo "FAIL: scoped reclamation did not request exact container-and-volume removal" >&2; exit 1; }
     exit 0
 fi
 
@@ -379,6 +381,7 @@ HOST_SUPERVISOR_START=""
 HOST_SUPERVISOR_PGID=""
 HOST_SUPERVISOR_ERRORS=""
 POSTGRES_CONTAINER_ID=""
+POSTGRES_VOLUME_IDS=""
 OWNER_START=$(awk '{print $22}' "/proc/$$/stat")
 export NUGET_PACKAGES NUGET_HTTP_CACHE_PATH
 mkdir -p -m 700 "$RUN_ROOT"
@@ -400,9 +403,20 @@ cleanup() {
             if [ "$inspected" != "$POSTGRES_CONTAINER_ID|/$POSTGRES_CONTAINER|true|$SMOKE_SCOPE|$SMOKE_ID|$$|$OWNER_START" ]; then
                 echo "FAIL: container cleanup identity mismatch for exact ID '$POSTGRES_CONTAINER_ID' and expected name '$POSTGRES_CONTAINER'. No removal attempted. Inspect with: docker inspect $POSTGRES_CONTAINER_ID" >&2
                 original_status=1
-            elif ! docker rm --force "$POSTGRES_CONTAINER_ID" >/dev/null; then
-                echo "FAIL: could not remove exact test container ID '$POSTGRES_CONTAINER_ID' (name '$POSTGRES_CONTAINER'); retry: docker rm --force $POSTGRES_CONTAINER_ID" >&2
+            elif ! docker rm --force --volumes "$POSTGRES_CONTAINER_ID" >/dev/null; then
+                echo "FAIL: could not remove exact test container ID '$POSTGRES_CONTAINER_ID' (name '$POSTGRES_CONTAINER') with its anonymous volumes; retry: docker rm --force --volumes $POSTGRES_CONTAINER_ID" >&2
                 original_status=1
+            else
+                local volume_id volume_inspection volume_status
+                while IFS= read -r volume_id; do
+                    [ -n "$volume_id" ] || continue
+                    volume_inspection=$(docker volume inspect "$volume_id" 2>&1)
+                    volume_status=$?
+                    if [ "$volume_status" -eq 0 ] || [[ "${volume_inspection,,}" != *"no such volume"* ]]; then
+                        echo "FAIL: anonymous volume '$volume_id' from exact test container '$POSTGRES_CONTAINER_ID' leaked or could not be verified absent: $volume_inspection" >&2
+                        original_status=1
+                    fi
+                done <<<"$POSTGRES_VOLUME_IDS"
             fi
         elif [[ "$inspected" != *"No such"* ]]; then
             echo "FAIL: could not inspect exact test container ID '$POSTGRES_CONTAINER_ID' (name '$POSTGRES_CONTAINER'): $inspected" >&2
@@ -1263,6 +1277,12 @@ POSTGRES_CONTAINER_ID=$(docker run \
     "$POSTGRES_IMAGE" \
     postgres -c max_connections=20)
 [[ "$POSTGRES_CONTAINER_ID" =~ ^[0-9a-f]{64}$ ]] || fail "Docker did not return one immutable lowercase container ID"
+POSTGRES_VOLUME_IDS=$(docker inspect --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' "$POSTGRES_CONTAINER_ID")
+while IFS= read -r volume_id; do
+    [ -z "$volume_id" ] || [[ "$volume_id" =~ ^[0-9a-f]{64}$ ]] \
+        || fail "test container attached unexpected non-anonymous volume '$volume_id'"
+done <<<"$POSTGRES_VOLUME_IDS"
+[ -n "$POSTGRES_VOLUME_IDS" ] || fail "test PostgreSQL container did not expose its expected anonymous data volume"
 
 for _ in $(seq 1 60); do
     if docker exec "$POSTGRES_CONTAINER_ID" pg_isready --username postgres --dbname postgres >/dev/null 2>&1; then
@@ -1325,63 +1345,9 @@ start_host \
     "PGPORT=1" \
     "PGDATABASE=attacker_database" \
     "PGSSLMODE=disable"
-if [ "${PROVIDER_CORE_ONLY:-false}" = "true" ]; then
-    for _ in $(seq 1 60); do
-        if grep -F 'does not yet implement the rollback-capable PostgreSQL migration backup protocol required by vanilla Jellyfin' "$RUN_ROOT/first-start.log" >/dev/null 2>&1; then
-            break
-        fi
-
-        if ! kill -0 "$HOST_PID" 2>/dev/null; then
-            break
-        fi
-
-        sleep 1
-    done
-    grep -F 'does not yet implement the rollback-capable PostgreSQL migration backup protocol required by vanilla Jellyfin' "$RUN_ROOT/first-start.log" >/dev/null \
-        || fail "vanilla Jellyfin did not surface the deliberate migration-backup guard"
-    grep -F 'Refusing the operation before making database changes' "$RUN_ROOT/first-start.log" >/dev/null \
-        || fail "migration-backup guard did not state its pre-mutation boundary"
-    grep -F "PostgreSQL configured at 127.0.0.2,127.0.0.1:$POSTGRES_PORT for database jellyfin;" "$RUN_ROOT/first-start.log" >/dev/null \
-        || fail "provider did not emit its endpoint-only configuration diagnostic"
-    assert_log_redacted \
-        "$RUN_ROOT/first-start.log" \
-        "$APPLICATION_PASSWORD" "$BOOTSTRAP_PASSWORD" "$ADMIN_PASSWORD" \
-        "$PASSFILE_UNRELATED_SECRET" "$PASSFILE_FIRST_HOST_SECRET" "$PASSFILE_LOWER_PRECEDENCE_SECRET"
-    if grep -F "$RUNTIME_PASSFILE" "$RUN_ROOT/first-start.log" >/dev/null; then
-        fail "vanilla host log exposed the configured passfile path"
-    fi
-    [ "$(psql_value "SELECT COUNT(*) FROM pg_catalog.pg_tables WHERE schemaname = 'public' AND tablename <> '__EFMigrationsHistory'")" = "0" ] \
-        || fail "the guarded startup created application tables"
-    [ "$(psql_value "SELECT COUNT(*) FROM pg_catalog.pg_namespace WHERE nspname LIKE 'jellyfin_migration_backup_%'")" = "0" ] \
-        || fail "the guarded startup created a migration-backup schema"
-
-    # Jellyfin keeps its setup listener alive after reporting this startup
-    # failure, so terminate the deliberately failed process after assertions.
-    terminate_host_group || fail "guarded-start host process group could not be terminated"
-    assert_pristine_host_unchanged
-
-    {
-        echo "result=PASS"
-        echo "scope=provider-core-before-backup-protocol"
-        echo "host_commit=$JELLYFIN_HOST_COMMIT"
-        echo "plugin_database_reference=12.2.0"
-        echo "postgres_image=$POSTGRES_IMAGE"
-        echo "postgres=$POSTGRES_SERVER_VERSION"
-        echo "postgres_major=16"
-        echo "runtime_role_flags=LOGIN,NOSUPERUSER,NOCREATEDB,NOCREATEROLE,NOREPLICATION,NOBYPASSRLS"
-        echo "runtime_role_connection_limit=6"
-        echo "database_connection_limit=8"
-        echo "npgsql_maximum_pool_size=4"
-        echo "guarded_mutation=true"
-        echo "endpoint_log_redacted=true"
-        echo "passfile_path_redacted=true"
-        echo "passfile_multi_host_failover=true"
-        echo "credential_file_modes=0600-accepted,0640-0644-0666-rejected"
-    } | tee "$RUN_ROOT/evidence.txt"
-
-    echo "Provider-core smoke test passed. Sanitized evidence will be retained under $RUN_ROOT"
-    exit 0
-fi
+# PROVIDER_CORE_ONLY remains accepted for existing CI callers. The provider now
+# implements the complete backup contract, so it deliberately runs the same
+# successful migration, restore, restart, and public-API proof as the full path.
 
 wait_for_health "$HTTP_PORT" || fail "vanilla Jellyfin 12.2 did not become healthy"
 assert_loopback_listener "$HTTP_PORT"

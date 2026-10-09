@@ -65,6 +65,7 @@ public sealed class StockServerPersistenceParityTests
                 adminPassword,
                 userPassword);
             var ffmpeg = PrepareFakeMediaTools(repositoryRoot, artifacts.CaseDirectory);
+            var adminId = Guid.Empty;
 
             await using (var host = JellyfinHostProcess.Start(layout, httpPort, redactor, ffmpeg))
             {
@@ -85,7 +86,7 @@ public sealed class StockServerPersistenceParityTests
                     cancellationToken);
                 using var authenticationDocument = JsonDocument.Parse(authentication);
                 var token = authenticationDocument.RootElement.GetProperty("AccessToken").GetString();
-                var adminId = Guid.Parse(authenticationDocument.RootElement.GetProperty("User").GetProperty("Id").GetString()!);
+                adminId = Guid.Parse(authenticationDocument.RootElement.GetProperty("User").GetProperty("Id").GetString()!);
                 Assert.False(string.IsNullOrWhiteSpace(token));
                 redactor.Add(token);
                 evidenceRedactor.Add(token);
@@ -144,6 +145,11 @@ public sealed class StockServerPersistenceParityTests
                     .EnumerateArray()
                     .Single(item => item.GetProperty("Name").GetString() == "Été 用户 100%_done");
                 var unicodeItemId = Guid.Parse(unicodeItem.GetProperty("Id").GetString()!);
+                var alphaItemId = Guid.Parse(items.GetProperty("Items")
+                    .EnumerateArray()
+                    .Single(item => item.GetProperty("Name").GetString() == "Alpha Movie")
+                    .GetProperty("Id")
+                    .GetString()!);
                 Assert.Contains(
                     unicodeItem.GetProperty("Genres").EnumerateArray().Select(value => value.GetString()),
                     value => value == "Sci-Fi 世界");
@@ -175,26 +181,40 @@ public sealed class StockServerPersistenceParityTests
                     authorization,
                     cancellationToken);
                 await host.PostJsonAsync(
-                    "Auth/Keys?app=" + Uri.EscapeDataString("parity-key-雪"),
+                    $"Users/{adminId}/FavoriteItems/{alphaItemId}",
                     "{}",
                     authorization,
                     cancellationToken);
+                var apiKeyNames = Enumerable.Range(0, 6).Select(index => $"parity-key-{index:D2}-雪").ToArray();
+                await Task.WhenAll(apiKeyNames.Select(name => host.PostJsonAsync(
+                    "Auth/Keys?app=" + Uri.EscapeDataString(name),
+                    "{}",
+                    authorization,
+                    cancellationToken)));
                 using var apiKeyDocument = JsonDocument.Parse(await host.GetStringAsync(
                     "Auth/Keys",
                     authorization,
                     cancellationToken));
-                var apiKey = apiKeyDocument.RootElement.GetProperty("Items")
+                var apiKeys = apiKeyDocument.RootElement.GetProperty("Items")
                     .EnumerateArray()
-                    .Single(key => key.GetProperty("AppName").GetString() == "parity-key-雪")
-                    .GetProperty("AccessToken")
-                    .GetString();
-                Assert.False(string.IsNullOrWhiteSpace(apiKey));
-                redactor.Add(apiKey);
-                evidenceRedactor.Add(apiKey);
+                    .Where(key => apiKeyNames.Contains(key.GetProperty("AppName").GetString(), StringComparer.Ordinal))
+                    .Select(key => key.GetProperty("AccessToken").GetString()!)
+                    .ToArray();
+                Assert.Equal(6, apiKeys.Length);
+                Assert.Equal(6, apiKeys.Distinct(StringComparer.Ordinal).Count());
+                Assert.All(apiKeys, key => Assert.False(string.IsNullOrWhiteSpace(key)));
+                foreach (var apiKey in apiKeys)
+                {
+                    redactor.Add(apiKey);
+                    evidenceRedactor.Add(apiKey);
+                }
+
                 await host.DeleteAsync(
-                    "Auth/Keys/" + Uri.EscapeDataString(apiKey!),
+                    "Auth/Keys/" + Uri.EscapeDataString(apiKeys[2]),
                     authorization,
                     cancellationToken);
+                await host.DeleteAsync("Items/" + alphaItemId, authorization, cancellationToken);
+                await WaitForItemAbsentAsync(host, authorization, alphaItemId, cancellationToken);
 
                 await host.StopGracefullyAsync(token!, TimeSpan.FromSeconds(30), cancellationToken);
             }
@@ -216,7 +236,19 @@ public sealed class StockServerPersistenceParityTests
             Assert.Contains(storedItem.ItemValues!, map => map.ItemValue.Value == "Sci-Fi 世界");
             Assert.Contains(storedItem.UserData!, data => data.IsFavorite);
             Assert.Contains(await context.Devices.Select(device => device.AppName).ToArrayAsync(cancellationToken), app => app == "npgsql-parity");
-            Assert.DoesNotContain(await context.ApiKeys.Select(key => key.Name).ToArrayAsync(cancellationToken), name => name == "parity-key-雪");
+            var storedApiKeys = await context.ApiKeys.Where(key => key.Name.StartsWith("parity-key-")).ToArrayAsync(cancellationToken);
+            Assert.Equal(5, storedApiKeys.Length);
+            Assert.Equal(5, storedApiKeys.Select(key => key.AccessToken).Distinct(StringComparer.Ordinal).Count());
+            Assert.False(await context.BaseItems.AnyAsync(item => item.Name == "Alpha Movie", cancellationToken));
+            var detachedFavorites = await context.UserData.Where(
+                data => data.ItemId == Guid.Parse("00000000-0000-0000-0000-000000000001")
+                    && data.UserId == adminId
+                    && data.IsFavorite)
+                .ToArrayAsync(cancellationToken);
+            Assert.NotEmpty(detachedFavorites);
+            Assert.All(detachedFavorites, data => Assert.NotNull(data.RetentionDate));
+            Assert.DoesNotContain(await context.Peoples.Select(person => person.Name).ToArrayAsync(cancellationToken), name => name == "Alice Actor");
+            Assert.DoesNotContain(await context.ItemValues.Select(value => value.Value).ToArrayAsync(cancellationToken), value => value == "Drama");
         }
         catch (Exception exception)
         {
@@ -230,6 +262,31 @@ public sealed class StockServerPersistenceParityTests
         {
             global::Npgsql.NpgsqlConnection.ClearAllPools();
         }
+    }
+
+    private static async Task WaitForItemAbsentAsync(
+        JellyfinHostProcess host,
+        string authorization,
+        Guid itemId,
+        CancellationToken cancellationToken)
+    {
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            using var document = JsonDocument.Parse(await host.GetStringAsync(
+                "Items?Recursive=true&IncludeItemTypes=Movie&EnableTotalRecordCount=true",
+                authorization,
+                cancellationToken));
+            if (document.RootElement.GetProperty("Items").EnumerateArray().All(
+                    item => Guid.Parse(item.GetProperty("Id").GetString()!) != itemId))
+            {
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
+        }
+
+        throw new TimeoutException($"Deleted item {itemId} remained visible through the untouched host API.");
     }
 
     private static async Task<JsonElement> WaitForMoviesAsync(
