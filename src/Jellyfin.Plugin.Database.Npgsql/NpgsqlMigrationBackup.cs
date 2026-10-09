@@ -73,6 +73,7 @@ internal static partial class NpgsqlMigrationBackup
 
             var identity = await ReadIdentityAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
             var tables = await ReadTablesAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+            await ValidateDependencyBoundaryAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
             var empty = tables.Count == 0;
             var historyOnly = IsHistoryOnly(tables);
             if (empty)
@@ -1220,6 +1221,134 @@ internal static partial class NpgsqlMigrationBackup
         {
             throw new NotSupportedException(
                 "The PostgreSQL public schema contains object classes outside the provider's exhaustive migration-backup schema contract. Refusing migration before mutation.");
+        }
+    }
+
+    private static async Task ValidateDependencyBoundaryAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        // DROP SCHEMA public CASCADE follows catalog dependencies, not schema names. Build the
+        // provider-owned address set from every public object that participates in pg_depend,
+        // then include only PostgreSQL-created internal/automatic children of that set. This
+        // includes row types, indexes, toast objects, constraints, triggers, and rewrite rules,
+        // without accidentally treating an auxiliary view or foreign key as provider-owned.
+        const string Sql = """
+            WITH RECURSIVE dependency_addresses(classid, objid, objsubid) AS (
+              SELECT dependency.classid, dependency.objid, dependency.objsubid
+              FROM pg_catalog.pg_depend dependency
+              UNION
+              SELECT dependency.refclassid, dependency.refobjid, dependency.refobjsubid
+              FROM pg_catalog.pg_depend dependency
+            ),
+            directly_owned(classid, objid, objsubid) AS (
+              SELECT address.classid, address.objid, address.objsubid
+              FROM dependency_addresses address
+              CROSS JOIN LATERAL pg_catalog.pg_identify_object(address.classid, address.objid, address.objsubid) identity
+              WHERE identity.schema = 'public'
+              UNION
+              SELECT 'pg_catalog.pg_namespace'::pg_catalog.regclass::oid, namespace.oid, 0
+              FROM pg_catalog.pg_namespace namespace
+              WHERE namespace.nspname = 'public'
+            ),
+            provider_owned(classid, objid, objsubid) AS (
+              SELECT directly_owned.classid, directly_owned.objid, directly_owned.objsubid
+              FROM directly_owned
+              UNION
+              SELECT dependency.classid, dependency.objid, dependency.objsubid
+              FROM pg_catalog.pg_depend dependency
+              JOIN provider_owned referenced
+                ON referenced.classid = dependency.refclassid
+               AND referenced.objid = dependency.refobjid
+               AND referenced.objsubid = dependency.refobjsubid
+              WHERE dependency.deptype IN ('a', 'i')
+            ),
+            crossing_dependencies AS (
+              SELECT dependency.*,
+                     dependent.classid IS NOT NULL AS dependent_owned,
+                     referenced.classid IS NOT NULL AS referenced_owned,
+                     referenced_identity.schema AS referenced_schema
+              FROM pg_catalog.pg_depend dependency
+              LEFT JOIN provider_owned dependent
+                ON dependent.classid = dependency.classid
+               AND dependent.objid = dependency.objid
+               AND dependent.objsubid = dependency.objsubid
+              LEFT JOIN provider_owned referenced
+                ON referenced.classid = dependency.refclassid
+               AND referenced.objid = dependency.refobjid
+               AND referenced.objsubid = dependency.refobjsubid
+              CROSS JOIN LATERAL pg_catalog.pg_identify_object(
+                dependency.refclassid,
+                dependency.refobjid,
+                dependency.refobjsubid) referenced_identity
+              WHERE (dependent.classid IS NULL) <> (referenced.classid IS NULL)
+            ),
+            unsafe_catalog_dependencies AS (
+              SELECT 1
+              FROM crossing_dependencies dependency
+              WHERE dependency.referenced_owned
+                 OR (
+                   dependency.dependent_owned
+                   AND NOT dependency.referenced_owned
+                   AND NOT (
+                     dependency.referenced_schema IN ('pg_catalog', 'information_schema')
+                     OR (
+                       dependency.refclassid = 'pg_catalog.pg_namespace'::pg_catalog.regclass::oid
+                       AND EXISTS (
+                         SELECT 1
+                         FROM pg_catalog.pg_namespace namespace
+                         WHERE namespace.oid = dependency.refobjid
+                           AND namespace.nspname IN ('pg_catalog', 'information_schema', 'pg_toast')))
+                     OR (
+                       dependency.refclassid = 'pg_catalog.pg_language'::pg_catalog.regclass::oid
+                       AND EXISTS (
+                         SELECT 1
+                         FROM pg_catalog.pg_language language_definition
+                         WHERE language_definition.oid = dependency.refobjid
+                           AND language_definition.lanname IN ('internal', 'c', 'sql', 'plpgsql')))))
+            ),
+            unsafe_inheritance AS (
+              SELECT 1
+              FROM pg_catalog.pg_inherits inheritance
+              JOIN pg_catalog.pg_class child ON child.oid = inheritance.inhrelid
+              JOIN pg_catalog.pg_namespace child_namespace ON child_namespace.oid = child.relnamespace
+              JOIN pg_catalog.pg_class parent ON parent.oid = inheritance.inhparent
+              JOIN pg_catalog.pg_namespace parent_namespace ON parent_namespace.oid = parent.relnamespace
+              WHERE (child_namespace.nspname = 'public') <> (parent_namespace.nspname = 'public')
+            ),
+            unsafe_cross_schema_constraints AS (
+              SELECT 1
+              FROM pg_catalog.pg_constraint constraint_definition
+              JOIN pg_catalog.pg_class local_relation ON local_relation.oid = constraint_definition.conrelid
+              JOIN pg_catalog.pg_namespace local_namespace ON local_namespace.oid = local_relation.relnamespace
+              JOIN pg_catalog.pg_class referenced_relation ON referenced_relation.oid = constraint_definition.confrelid
+              JOIN pg_catalog.pg_namespace referenced_namespace ON referenced_namespace.oid = referenced_relation.relnamespace
+              WHERE constraint_definition.contype = 'f'
+                AND (local_namespace.nspname = 'public') <> (referenced_namespace.nspname = 'public')
+            ),
+            unsafe_extension_membership AS (
+              SELECT 1
+              FROM pg_catalog.pg_depend dependency
+              JOIN provider_owned member
+                ON member.classid = dependency.classid
+               AND member.objid = dependency.objid
+               AND member.objsubid = dependency.objsubid
+              WHERE dependency.deptype = 'e'
+                AND dependency.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass::oid
+            )
+            SELECT
+              (SELECT count(*) FROM unsafe_catalog_dependencies)
+              + (SELECT count(*) FROM unsafe_inheritance)
+              + (SELECT count(*) FROM unsafe_cross_schema_constraints)
+              + (SELECT count(*) FROM unsafe_extension_membership)
+            """;
+        await using var command = new NpgsqlCommand(Sql, connection, transaction);
+        var unsupported = (long)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+        if (unsupported != 0)
+        {
+            throw new NotSupportedException(
+                "The PostgreSQL database contains dependencies across the provider-owned public schema boundary that cannot be preserved by migration rollback. Refusing migration before mutation.");
         }
     }
 

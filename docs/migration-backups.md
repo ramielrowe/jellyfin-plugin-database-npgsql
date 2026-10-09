@@ -63,6 +63,15 @@ after every restore, including migration-zero and history-only restores.
 Unknown or drifted layouts fail before migration rather than receiving a false
 backup key.
 
+Before any key is published, a catalog-address dependency audit builds the
+provider-owned object set from the public namespace and its PostgreSQL-created
+internal and automatic children. It rejects inbound or outbound edges across
+that boundary, including rewrite rules for external views, cross-schema foreign
+keys, inheritance and partition links, triggers, generated/default expressions,
+and extension membership. Only dependencies on an explicit set of immutable
+system namespaces and built-in languages are allowed. Objects in another schema
+that do not depend on `public` are left alone and are proven to survive restore.
+
 ## Restore and cleanup
 
 Restore validates the key, path components, symlinks, format version, age,

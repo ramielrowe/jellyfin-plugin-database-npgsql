@@ -679,6 +679,195 @@ public sealed class MigrationBackupIntegrationTests
         }
     }
 
+    [Fact]
+    public async Task PopulatedSnapshot_RejectsCrossSchemaDependenciesBeforePublication()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var scratch = Path.Combine(repositoryRoot, ".artifacts", "backup-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            var factory = new TestContextFactory(database.RuntimeConnectionString);
+            long sentinelId;
+            await using (var context = factory.CreateDbContext())
+            {
+                await context.GetService<IMigrator>().MigrateAsync(Successor, cancellationToken);
+                var sentinel = new ActivityLog("dependency-boundary", "MigrationBackup", Guid.Empty);
+                context.ActivityLogs.Add(sentinel);
+                await context.SaveChangesAsync(cancellationToken);
+                sentinelId = sentinel.Id;
+
+                Assert.True(await context.Database.SqlQueryRaw<bool>(
+                    "SELECT NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AS \"Value\" FROM pg_catalog.pg_roles WHERE rolname = current_user")
+                    .SingleAsync(cancellationToken));
+                await context.Database.ExecuteSqlRawAsync(
+                    """
+                    CREATE SCHEMA backup_auxiliary;
+                    CREATE TABLE backup_auxiliary.unrelated (id integer PRIMARY KEY, value text NOT NULL);
+                    INSERT INTO backup_auxiliary.unrelated VALUES (1, 'preserve me');
+                    CREATE VIEW backup_auxiliary.unrelated_view AS SELECT id, value FROM backup_auxiliary.unrelated;
+                    CREATE EXTENSION hstore WITH SCHEMA backup_auxiliary;
+                    """,
+                    cancellationToken);
+
+                await context.Database.ExecuteSqlRawAsync(
+                    "CREATE VIEW backup_auxiliary.public_view AS SELECT \"Id\", \"Name\" FROM public.\"ActivityLogs\"",
+                    cancellationToken);
+                await AssertDependencyBackupRejectedAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken);
+                Assert.True(await RelationExistsAsync(context, "backup_auxiliary.public_view", cancellationToken));
+                await context.Database.ExecuteSqlRawAsync("DROP VIEW backup_auxiliary.public_view", cancellationToken);
+
+                await context.Database.ExecuteSqlRawAsync(
+                    "CREATE MATERIALIZED VIEW backup_auxiliary.public_materialized AS SELECT count(*) AS count FROM public.\"ActivityLogs\"",
+                    cancellationToken);
+                await AssertDependencyBackupRejectedAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken);
+                Assert.True(await RelationExistsAsync(context, "backup_auxiliary.public_materialized", cancellationToken));
+                await context.Database.ExecuteSqlRawAsync("DROP MATERIALIZED VIEW backup_auxiliary.public_materialized", cancellationToken);
+
+                await context.Database.ExecuteSqlRawAsync(
+                    "CREATE TABLE backup_auxiliary.public_reference (id integer PRIMARY KEY, activity_log_id bigint NOT NULL REFERENCES public.\"ActivityLogs\" (\"Id\"))",
+                    cancellationToken);
+                await AssertDependencyBackupRejectedAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken);
+                Assert.True(await RelationExistsAsync(context, "backup_auxiliary.public_reference", cancellationToken));
+                await context.Database.ExecuteSqlRawAsync("DROP TABLE backup_auxiliary.public_reference", cancellationToken);
+
+                await context.Database.ExecuteSqlRawAsync(
+                    """
+                    CREATE TABLE backup_auxiliary.users (id uuid PRIMARY KEY);
+                    INSERT INTO backup_auxiliary.users VALUES ('00000000-0000-0000-0000-000000000000');
+                    ALTER TABLE public."ActivityLogs"
+                      ADD CONSTRAINT "FK_ActivityLogs_BackupAuxiliary_UserId"
+                      FOREIGN KEY ("UserId") REFERENCES backup_auxiliary.users (id);
+                    """,
+                    cancellationToken);
+                await AssertDependencyBackupRejectedAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken);
+                Assert.Equal(1, await context.Database.SqlQueryRaw<int>(
+                    "SELECT count(*)::integer AS \"Value\" FROM pg_catalog.pg_constraint WHERE conname = 'FK_ActivityLogs_BackupAuxiliary_UserId'")
+                    .SingleAsync(cancellationToken));
+                await context.Database.ExecuteSqlRawAsync(
+                    "ALTER TABLE public.\"ActivityLogs\" DROP CONSTRAINT \"FK_ActivityLogs_BackupAuxiliary_UserId\"; DROP TABLE backup_auxiliary.users",
+                    cancellationToken);
+
+                await context.Database.ExecuteSqlRawAsync(
+                    "CREATE TABLE backup_auxiliary.activity_log_child () INHERITS (public.\"ActivityLogs\")",
+                    cancellationToken);
+                await AssertDependencyBackupRejectedAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken);
+                Assert.True(await RelationExistsAsync(context, "backup_auxiliary.activity_log_child", cancellationToken));
+                await context.Database.ExecuteSqlRawAsync("DROP TABLE backup_auxiliary.activity_log_child", cancellationToken);
+
+                await context.Database.ExecuteSqlRawAsync(
+                    "CREATE TABLE public.\"ExtensionMemberProbe\" (id integer); ALTER EXTENSION hstore ADD TABLE public.\"ExtensionMemberProbe\"",
+                    cancellationToken);
+                await AssertDependencyBackupRejectedAsync(factory, database.RuntimeConnectionString, scratch, cancellationToken);
+                Assert.Equal(1, await context.Database.SqlQueryRaw<int>(
+                    "SELECT count(*)::integer AS \"Value\" FROM pg_catalog.pg_depend WHERE classid = 'pg_catalog.pg_class'::regclass AND objid = 'public.\"ExtensionMemberProbe\"'::regclass AND refclassid = 'pg_catalog.pg_extension'::regclass AND deptype = 'e'")
+                    .SingleAsync(cancellationToken));
+                await context.Database.ExecuteSqlRawAsync(
+                    "ALTER EXTENSION hstore DROP TABLE public.\"ExtensionMemberProbe\"; DROP TABLE public.\"ExtensionMemberProbe\"",
+                    cancellationToken);
+            }
+
+            await using (var context = factory.CreateDbContext())
+            {
+                Assert.Equal("dependency-boundary", (await context.ActivityLogs.SingleAsync(row => row.Id == sentinelId, cancellationToken)).Name);
+                Assert.Equal("preserve me", await context.Database.SqlQueryRaw<string>(
+                    "SELECT value AS \"Value\" FROM backup_auxiliary.unrelated_view WHERE id = 1")
+                    .SingleAsync(cancellationToken));
+            }
+
+            Assert.Empty(Directory.EnumerateFileSystemEntries(scratch));
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+            if (Directory.Exists(scratch))
+            {
+                Directory.Delete(scratch, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task PopulatedSnapshot_PreservesUnrelatedCrossSchemaObjectsAndGlobalInvariants()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var scratch = Path.Combine(repositoryRoot, ".artifacts", "backup-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            var factory = new TestContextFactory(database.RuntimeConnectionString);
+            long sentinelId;
+            await using (var context = factory.CreateDbContext())
+            {
+                await context.GetService<IMigrator>().MigrateAsync(Successor, cancellationToken);
+                var sentinel = new ActivityLog("dependency-boundary", "MigrationBackup", Guid.Empty);
+                context.ActivityLogs.Add(sentinel);
+                await context.SaveChangesAsync(cancellationToken);
+                sentinelId = sentinel.Id;
+                await context.Database.ExecuteSqlRawAsync(
+                    """
+                    CREATE SCHEMA backup_auxiliary;
+                    CREATE TABLE backup_auxiliary.unrelated (id integer PRIMARY KEY, value text NOT NULL);
+                    INSERT INTO backup_auxiliary.unrelated VALUES (1, 'preserve me');
+                    CREATE VIEW backup_auxiliary.unrelated_view AS SELECT id, value FROM backup_auxiliary.unrelated;
+                    CREATE EXTENSION hstore WITH SCHEMA backup_auxiliary;
+                    """,
+                    cancellationToken);
+            }
+
+            var key = await NpgsqlMigrationBackup.CreateAsync(
+                factory,
+                database.RuntimeConnectionString,
+                scratch,
+                cancellationToken);
+            await using (var context = factory.CreateDbContext())
+            {
+                await context.Database.ExecuteSqlRawAsync("DELETE FROM public.\"ActivityLogs\"", cancellationToken);
+            }
+
+            await NpgsqlMigrationBackup.RestoreAsync(
+                database.RuntimeConnectionString,
+                scratch,
+                key,
+                cancellationToken);
+
+            await using (var context = factory.CreateDbContext())
+            {
+                Assert.Equal("dependency-boundary", (await context.ActivityLogs.SingleAsync(row => row.Id == sentinelId, cancellationToken)).Name);
+                Assert.Equal("preserve me", await context.Database.SqlQueryRaw<string>(
+                    "SELECT value AS \"Value\" FROM backup_auxiliary.unrelated_view WHERE id = 1")
+                    .SingleAsync(cancellationToken));
+                Assert.Equal(1, await context.Database.SqlQueryRaw<int>(
+                    "SELECT count(*)::integer AS \"Value\" FROM pg_catalog.pg_extension WHERE extname = 'hstore' AND extnamespace = 'backup_auxiliary'::regnamespace")
+                    .SingleAsync(cancellationToken));
+                Assert.Equal("standard public schema", await context.Database.SqlQueryRaw<string>(
+                    "SELECT obj_description('public'::regnamespace, 'pg_namespace') AS \"Value\"")
+                    .SingleAsync(cancellationToken));
+            }
+
+            await NpgsqlMigrationBackup.DeleteAsync(scratch, key);
+            Assert.Empty(Directory.EnumerateFileSystemEntries(scratch));
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+            if (Directory.Exists(scratch))
+            {
+                Directory.Delete(scratch, recursive: true);
+            }
+        }
+    }
+
     [Theory]
     [InlineData("before-delete-completed", true)]
     [InlineData("after-delete-completed", false)]
@@ -1045,6 +1234,27 @@ public sealed class MigrationBackupIntegrationTests
             .SingleAsync(cancellationToken);
         return result;
     }
+
+    private static async Task AssertDependencyBackupRejectedAsync(
+        IDbContextFactory<JellyfinDbContext> factory,
+        string connectionString,
+        string scratch,
+        CancellationToken cancellationToken)
+    {
+        var exception = await Assert.ThrowsAsync<NotSupportedException>(
+            () => NpgsqlMigrationBackup.CreateAsync(factory, connectionString, scratch, cancellationToken));
+        Assert.Contains("dependencies across the provider-owned public schema boundary", exception.Message, StringComparison.Ordinal);
+        Assert.Empty(Directory.EnumerateFileSystemEntries(scratch));
+    }
+
+    private static async Task<bool> RelationExistsAsync(
+        JellyfinDbContext context,
+        string relation,
+        CancellationToken cancellationToken)
+        => await context.Database.SqlQueryRaw<bool>(
+            "SELECT to_regclass({0}) IS NOT NULL AS \"Value\"",
+            relation)
+            .SingleAsync(cancellationToken);
 
     private static async Task<(long DatabaseOid, string SystemIdentifier)> ReadServerIdentityAsync(
         string connectionString,
