@@ -123,6 +123,9 @@ public sealed class ReleaseContractTests
         var relocatedBuild = script.IndexOf(
             "build_without_build_servers \"$RELOCATED/Jellyfin.Plugin.Database.Npgsql.slnx\"",
             StringComparison.Ordinal);
+        var stagedHostPublish = script.IndexOf(
+            "cp --archive --no-target-directory -- \"$JELLYFIN_HOST_PUBLISH\" \"$STAGED_HOST_PUBLISH\"",
+            StringComparison.Ordinal);
         var blackBox = script.IndexOf("\"$RELOCATED/tests/black-box-smoke.sh\"", StringComparison.Ordinal);
         var finalMetadataAssertion = script.LastIndexOf(MetadataAssertion, StringComparison.Ordinal);
         var broadPathScan = script.IndexOf("path_leaks=$(rg", StringComparison.Ordinal);
@@ -141,6 +144,8 @@ public sealed class ReleaseContractTests
             "STANDALONE_RELOCATED_COPY=true",
             "relocated_hash=$(hash_file",
             "relocated_symbol_hash=$(hash_file",
+            "cp --archive --no-target-directory -- \"$JELLYFIN_HOST_PUBLISH\"",
+            "cp --archive --no-target-directory -- \"$UNSUPPORTED_JELLYFIN_HOST_PUBLISH\"",
             "\"$RELOCATED/tests/black-box-smoke.sh\"",
         ];
 
@@ -152,7 +157,8 @@ public sealed class ReleaseContractTests
             StringComparison.Ordinal);
         Assert.True(relocatedRestore < firstMetadataAssertion);
         Assert.True(firstMetadataAssertion < relocatedBuild);
-        Assert.True(relocatedBuild < blackBox);
+        Assert.True(relocatedBuild < stagedHostPublish);
+        Assert.True(stagedHostPublish < blackBox);
         Assert.True(blackBox < finalMetadataAssertion);
         Assert.True(finalMetadataAssertion < broadPathScan);
         Assert.True(broadPathScan < success);
@@ -177,15 +183,12 @@ public sealed class ReleaseContractTests
     {
         var root = FindRepositoryRoot();
         var script = File.ReadAllText(Path.Combine(root, "scripts", "verify-release.sh"));
-        const string BlackBoxBlock =
-            "if [ \"${RUN_BLACK_BOX:-false}\" = true ]; then\n" +
-            "    \"$RELOCATED/tests/black-box-smoke.sh\"\n" +
-            "fi\n\n";
+        const string BlackBoxCommand = "    \"$RELOCATED/tests/black-box-smoke.sh\"\n";
         const string Success = "echo \"Release verification passed:";
 
-        Assert.Contains(BlackBoxBlock, script, StringComparison.Ordinal);
-        var priorOrdering = script.Replace(BlackBoxBlock, string.Empty, StringComparison.Ordinal);
-        priorOrdering = priorOrdering.Replace(Success, BlackBoxBlock + Success, StringComparison.Ordinal);
+        Assert.Contains(BlackBoxCommand, script, StringComparison.Ordinal);
+        var priorOrdering = script.Replace(BlackBoxCommand, string.Empty, StringComparison.Ordinal);
+        priorOrdering = priorOrdering.Replace(Success, BlackBoxCommand + Success, StringComparison.Ordinal);
 
         Assert.False(HasFinalScansAfterBlackBox(priorOrdering));
     }

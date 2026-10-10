@@ -146,6 +146,16 @@ relocated_symbol_hash=$(hash_file "$RELOCATED_HARNESS" "$RELOCATED/artifacts/sym
     || { echo "FAIL: relocated PDB $relocated_symbol_hash differs from source PDB $source_symbol_hash" >&2; exit 1; }
 
 if [ "${RUN_BLACK_BOX:-false}" = true ]; then
+    if [ -n "${JELLYFIN_HOST_PUBLISH:-}" ]; then
+        STAGED_HOST_PUBLISH="$OWNED_ROOT/host-publish-input"
+        cp --archive --no-target-directory -- "$JELLYFIN_HOST_PUBLISH" "$STAGED_HOST_PUBLISH"
+        export JELLYFIN_HOST_PUBLISH="$STAGED_HOST_PUBLISH"
+    fi
+    if [ -n "${UNSUPPORTED_JELLYFIN_HOST_PUBLISH:-}" ]; then
+        STAGED_UNSUPPORTED_HOST_PUBLISH="$OWNED_ROOT/unsupported-host-publish-input"
+        cp --archive --no-target-directory -- "$UNSUPPORTED_JELLYFIN_HOST_PUBLISH" "$STAGED_UNSUPPORTED_HOST_PUBLISH"
+        export UNSUPPORTED_JELLYFIN_HOST_PUBLISH="$STAGED_UNSUPPORTED_HOST_PUBLISH"
+    fi
     "$RELOCATED/tests/black-box-smoke.sh"
 fi
 
