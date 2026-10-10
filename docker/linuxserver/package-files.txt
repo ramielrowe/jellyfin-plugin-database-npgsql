@@ -1,0 +1,7 @@
+Jellyfin.Plugin.Database.Npgsql.deps.json
+Jellyfin.Plugin.Database.Npgsql.dll
+LICENSE
+Npgsql.EntityFrameworkCore.PostgreSQL.dll
+Npgsql.dll
+THIRD-PARTY-NOTICES.md
+meta.json

@@ -1,0 +1,172 @@
+name: LinuxServer.io image
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  # Event-class isolation also prevents a manual run on a release tag from
+  # cancelling or queueing against the corresponding release publication.
+  group: linuxserver-image-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  # Never interrupt publication after registry tags may have been mutated.
+  # Superseded validation runs on branches and pull requests remain cancellable.
+  cancel-in-progress: ${{ github.event_name != 'release' }}
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}-linuxserver
+  LOCAL_IMAGE: jellyfin-npgsql-linuxserver:ci
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate image release contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          version=$(jq -er '.version' build/release-policy.json)
+          install_directory=$(jq -er '.installationDirectory' build/release-policy.json)
+          target_abi=$(jq -er '.targetAbi' build/release-policy.json)
+          test "$version" = "$(jq -er '.version' meta.json)"
+          test "$target_abi" = "$(jq -er '.targetAbi' meta.json)"
+          grep -Fq "<Version>$version</Version>" Directory.Build.props
+          grep -Fq "ARG PLUGIN_VERSION=$version" docker/linuxserver/Dockerfile
+          grep -Fq "ARG INSTALLATION_DIRECTORY=\"$install_directory\"" docker/linuxserver/Dockerfile
+          grep -Fq "linuxserver/jellyfin:12.2ubu2604-ls53@sha256:1bb4f88d822a0510bb3604b68aacb80d77c1d2a30181e500090c65111b98723b" docker/linuxserver/Dockerfile
+          grep -Fq 'org.opencontainers.image.licenses="GPL-3.0-only"' docker/linuxserver/Dockerfile
+          grep -Fq "plugin \`$version\`" docker/linuxserver/README.md
+          grep -Fq "\`$target_abi\`" docker/linuxserver/README.md
+          grep -Fq "ghcr.io/${GITHUB_REPOSITORY}-linuxserver" docker/linuxserver/README.md
+          test "$(printf '%s\n' \
+            Jellyfin.Plugin.Database.Npgsql.deps.json \
+            Jellyfin.Plugin.Database.Npgsql.dll \
+            LICENSE \
+            Npgsql.EntityFrameworkCore.PostgreSQL.dll \
+            Npgsql.dll \
+            THIRD-PARTY-NOTICES.md \
+            meta.json)" = "$(cat docker/linuxserver/package-files.txt)"
+          test "$(cat docker/linuxserver/root/etc/s6-overlay/s6-rc.d/init-npgsql-plugin/up)" = "/etc/s6-overlay/s6-rc.d/init-npgsql-plugin/run"
+          test -f docker/linuxserver/root/etc/s6-overlay/s6-rc.d/init-npgsql-plugin/dependencies.d/init-jellyfin-config
+          test -f docker/linuxserver/root/etc/s6-overlay/s6-rc.d/init-config-end/dependencies.d/init-npgsql-plugin
+          bash -n docker/linuxserver/root/etc/s6-overlay/s6-rc.d/init-npgsql-plugin/run
+          bash -n docker/linuxserver/build-seed.sh
+          bash -n docker/linuxserver/smoke-test.sh
+          if [[ "${{ github.event_name }}" == release ]]; then
+            test "${{ github.event.release.tag_name }}" = "v$version"
+          fi
+
+  build-and-smoke:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
+      - name: Build local image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        with:
+          context: .
+          file: docker/linuxserver/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.LOCAL_IMAGE }}
+          cache-from: type=gha,scope=linuxserver-image
+          cache-to: type=gha,mode=max,scope=linuxserver-image
+      - name: Smoke test PostgreSQL startup and restart
+        run: docker/linuxserver/smoke-test.sh "$LOCAL_IMAGE"
+
+  release-qualification:
+    if: github.event_name == 'release'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 10.0.100
+          cache: true
+          cache-dependency-path: '**/packages.lock.json'
+      - name: Run canonical release qualification
+        run: ./scripts/verify-release.sh
+
+  publish:
+    if: github.event_name == 'release'
+    needs: [validate, build-and-smoke, release-qualification]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
+      - name: Create job-owned Docker configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker_config="$RUNNER_TEMP/docker-publish-config"
+          mkdir -m 0700 "$docker_config"
+          echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
+      - name: Authenticate to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Calculate release tags
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(jq -er '.version' build/release-policy.json)
+          short_sha=${GITHUB_SHA:0:12}
+          {
+            echo 'tags<<EOF'
+            echo "$IMAGE_NAME:$version"
+            echo "$IMAGE_NAME:sha-$short_sha"
+            echo "$IMAGE_NAME:latest"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - name: Publish image, SBOM, and maximum provenance
+        id: push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        with:
+          context: .
+          file: docker/linuxserver/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.release.outputs.tags }}
+          cache-from: type=gha,scope=linuxserver-image
+          cache-to: type=gha,mode=max,scope=linuxserver-image
+          sbom: true
+          provenance: mode=max
+      - name: Attest published image
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Verify anonymous tag and digest access
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io
+          anonymous_config=$(mktemp -d "$RUNNER_TEMP/docker-anonymous.XXXXXX")
+          trap 'rm -rf -- "$anonymous_config"' EXIT
+          version=$(jq -er '.version' build/release-policy.json)
+          DOCKER_CONFIG="$anonymous_config" docker buildx imagetools inspect "$IMAGE_NAME:$version" >/dev/null
+          DOCKER_CONFIG="$anonymous_config" docker buildx imagetools inspect "$IMAGE_NAME@${{ steps.push.outputs.digest }}" >/dev/null

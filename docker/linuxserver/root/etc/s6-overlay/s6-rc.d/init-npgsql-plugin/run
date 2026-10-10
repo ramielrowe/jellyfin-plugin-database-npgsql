@@ -1,0 +1,109 @@
+#!/usr/bin/with-contenv bash
+set -euo pipefail
+
+export LC_ALL=C
+
+seed=/usr/local/share/jellyfin-npgsql
+plugin_root=/config/data/plugins
+expected=$(mktemp)
+actual=$(mktemp)
+stage=
+
+cleanup() {
+    rm -f -- "$expected" "$actual"
+    if [[ -n "$stage" && -d "$stage" ]]; then
+        rm -rf -- "$stage"
+    fi
+}
+trap cleanup EXIT
+
+fail() {
+    printf 'init-npgsql-plugin: %s\n' "$1" >&2
+    exit 1
+}
+
+read_single_line() {
+    local path=$1
+    local value
+
+    [[ -f "$path" && ! -L "$path" ]] || fail "seed metadata is missing or not a regular file"
+    IFS= read -r value < "$path" || true
+    [[ -n "$value" ]] || fail "seed metadata contains an empty value"
+    [[ $(wc -l < "$path") -eq 1 ]] || fail "seed metadata must contain exactly one line"
+    printf '%s' "$value"
+}
+
+version=$(read_single_line "$seed/plugin-version")
+installation_directory=$(read_single_line "$seed/installation-directory")
+
+[[ "$version" != */* ]] || fail "plugin version contains an unsafe character"
+if printf '%s' "$version" | grep -q '[[:cntrl:]]'; then
+    fail "plugin version contains an unsafe character"
+fi
+[[ "$installation_directory" != . && "$installation_directory" != .. ]] || fail "installation directory is unsafe"
+[[ "$installation_directory" != */* ]] || fail "installation directory contains an unsafe character"
+if printf '%s' "$installation_directory" | grep -q '[[:cntrl:]]'; then
+    fail "installation directory contains an unsafe character"
+fi
+
+[[ -f "$seed/package-files.txt" && ! -L "$seed/package-files.txt" ]] || fail "package allowlist is missing"
+[[ -f "$seed/SHA256SUMS" && ! -L "$seed/SHA256SUMS" ]] || fail "package checksum manifest is missing"
+sort "$seed/package-files.txt" > "$expected"
+cmp -s "$seed/package-files.txt" "$expected" || fail "package allowlist is not sorted or contains duplicates"
+[[ -s "$expected" ]] || fail "package allowlist is empty"
+while IFS= read -r name; do
+    [[ -n "$name" && "$name" != . && "$name" != .. ]] || fail "package allowlist contains an unsafe name"
+    [[ "$name" != */* ]] || fail "package allowlist contains an unsafe character"
+    if printf '%s' "$name" | grep -q '[[:cntrl:]]'; then
+        fail "package allowlist contains an unsafe character"
+    fi
+done < "$expected"
+
+[[ -d "$seed/package" && ! -L "$seed/package" ]] || fail "seed package directory is invalid"
+find "$seed/package" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort > "$actual"
+cmp -s "$expected" "$actual" || fail "seed package does not match the exact allowlist"
+[[ -z $(find "$seed/package" -mindepth 1 -maxdepth 1 ! -type f -print -quit) ]] || fail "seed package contains a non-regular entry"
+sed -n 's/^[0-9a-fA-F]\{64\}  //p' "$seed/SHA256SUMS" | sort > "$actual"
+cmp -s "$expected" "$actual" || fail "checksum manifest does not match the package allowlist"
+(cd "$seed/package" && sha256sum -c -- "$seed/SHA256SUMS") >/dev/null || fail "seed package checksum verification failed"
+
+mkdir -p -- "$plugin_root"
+[[ -d "$plugin_root" && ! -L "$plugin_root" ]] || fail "Jellyfin plugin root is invalid"
+destination="$plugin_root/$installation_directory"
+
+validate_destination() {
+    [[ -d "$destination" && ! -L "$destination" ]] || fail "existing plugin destination is not a directory"
+    find "$destination" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort > "$actual"
+    cmp -s "$expected" "$actual" || fail "existing plugin destination conflicts with this image"
+    [[ -z $(find "$destination" -mindepth 1 -maxdepth 1 ! -type f -print -quit) ]] || fail "existing plugin destination contains a non-regular entry"
+    while IFS= read -r name; do
+        cmp -s -- "$seed/package/$name" "$destination/$name" || fail "existing plugin destination has different content"
+    done < "$expected"
+}
+
+if [[ -e "$destination" || -L "$destination" ]]; then
+    validate_destination
+else
+    stage="$plugin_root/.init-npgsql-plugin.$$"
+    [[ ! -e "$stage" && ! -L "$stage" ]] || fail "staging destination already exists"
+    install -d -m 0750 -- "$stage"
+    while IFS= read -r name; do
+        install -m 0640 -- "$seed/package/$name" "$stage/$name"
+    done < "$expected"
+    chown -R abc:abc -- "$stage"
+    # --no-clobber closes the check/rename race without ever replacing a path.
+    # validate_destination then distinguishes our successful rename from a
+    # concurrently created conflicting destination.
+    mv -T --no-clobber -- "$stage" "$destination"
+    validate_destination
+    stage=
+fi
+
+chown abc:abc -- "$destination"
+chmod 0750 -- "$destination"
+while IFS= read -r name; do
+    chown abc:abc -- "$destination/$name"
+    chmod 0640 -- "$destination/$name"
+done < "$expected"
+
+printf 'init-npgsql-plugin: installed %s in %s\n' "$version" "$destination"
