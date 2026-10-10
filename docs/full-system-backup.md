@@ -62,13 +62,28 @@ It uses bounded 16 MiB sort chunks and at most 32 merge readers, threads the
 operation cancellation token through ingestion, sorting, run creation, and
 multi-pass merge, uses cancellation-aware comparison checkpoints inside both
 CPU sorting and priority-queue merge, needs no SQLite library from the host, and fails
-deterministically if its real write accounting exceeds quota. Owner
-markers bind the random owner generation, exact basename, and directory
-device/inode with a SHA-256 proof. Dead validation directories are scavenged on
-the next validation while live/concurrent, forged, or unmarked published
-directories are never removed. Empty pre-marker staging generations use a reserved name and
-are reclaimed only after a one-hour inactivity bound; nonempty unknown staging
-is preserved fail closed. ZIP central-directory size and count are checked before `ZipArchive`
+deterministically if its real write accounting exceeds quota. A separately
+stored, append-only 256-bit root key authenticates owner markers, deletion
+claims, per-entry claims, and initialization receipts with HMAC-SHA-256. Proofs
+bind purpose, canonical basename, key generation, directory identity, and
+marker identity and, on Linux, device, inode, mount ID, and birth time when the
+filesystem reports it. Linux `statx` does not expose an inode-generation field
+on every supported kernel/filesystem, so mount ID and birth time supplement but
+do not overstate the kernel identity available. Key rotation appends a durable
+new key and retains old keys; a torn new record does not invalidate old proofs.
+If every key record is torn or lost, startup appends a fresh key for new work
+while retaining all older generations as unprovable data; the fresh key cannot
+authorize them because every marker binds its original random key ID.
+The key protects against corruption and cross-root copying, not a hostile
+process running as the Jellyfin OS account, which can read owner-private files
+and is outside this trust boundary. Dead validation directories are scavenged
+on the next validation while live/concurrent, forged, or unmarked published
+directories are never mutated. Empty pre-marker staging generations use a
+reserved name and are reclaimed only after a one-hour inactivity bound and a
+separately authenticated creation receipt. Unknown empty, unknown nonempty,
+and malformed staging generations are preserved fail closed and isolated per
+candidate. Retention is capped at 1,024 namespace entries or 64 MiB; exceeding either
+bound disables new scratch work without deleting unknown data. ZIP central-directory size and count are checked before `ZipArchive`
 materializes entries.
 
 A process-wide provider gate serializes backup and restore from preflight
@@ -111,16 +126,21 @@ the journal and marker and idempotently completes either the exact new file
 state (committed marker) or the exact old file state (no marker). Once the
 committed journal is durable, marker and snapshot cleanup are best effort and
 retryable; cleanup failure cannot misreport a committed restore as failed.
-Terminal cleanup first validates the owner marker through an open no-follow
-directory handle, atomically renames that exact device/inode generation with
-`renameat2(RENAME_NOREPLACE)` to a unique, owner-bound same-parent tombstone,
-fsyncs that already-open parent, and only then performs handle-relative
-deletion. Children, tombstone roots, and claim sidecars are independently
-claimed and revalidated against their pinned handles immediately before
-unlink. Kernels without the no-replace primitive fail closed before a cleanup
-claim. A replacement at any old or claimed name is therefore never deleted.
-Interrupted tombstones and durable claim sidecars are idempotently scavenged
-with parent-fsync ordering. Recovery itself is serialized across processes by
+Terminal cleanup first validates the HMAC owner marker through an open
+no-follow directory handle, atomically renames that exact generation with
+`renameat2(RENAME_NOREPLACE)` to a unique same-parent tombstone, and fsyncs the
+already-open parent. Each child is recorded in a durable authenticated claim,
+renamed to a private retained name, and regular-file payload bytes are reduced
+to zero only through the pinned file handle. POSIX has no general operation to
+unlink the exact object represented by an open descriptor; checking identity
+and then unlinking a mutable name would retain a final TOCTOU. The plugin
+therefore never unlinks scratch names on Linux. It deliberately retains small
+authenticated tombstones, entry claims, directory metadata, and symlinks under
+the bounded retention policy. Windows similarly retains a same-parent claimed
+generation because the managed recursive-delete API cannot provide the same
+exact-object guarantee. A replacement at an old, retained, root, or sidecar
+name is never truncated or deleted. Interrupted tombstones are idempotently
+replayed from their durable claims with parent-fsync ordering. Recovery itself is serialized across processes by
 an OS lock held on the stable application-data directory inode; the separately
 held recovery-root handle and its generation are revalidated throughout replay,
 so swapping the configured recovery root cannot establish a second lease
@@ -128,10 +148,10 @@ namespace. Kernel lease release after a crash permits the next startup to resume
 Missing, corrupt, escaping, or root-identity-mismatched journals fail startup
 closed. A separate process is killed with `Environment.FailFast` immediately
 after each durable journal transition (including both visible and absent commit
-marker outcomes). Separate processes are also killed at every scratch
-claim/delete boundary, including `flush-scratch-claim-sidecar-parent`; restart
-scavenging must converge without deleting file, directory, symlink, root, or
-sidecar replacements. Recovery is then exercised against real PostgreSQL and
+marker outcomes). Separate processes are also killed at all 19 scratch
+publication, sidecar, rename, stable-handle reclamation, and fsync boundaries;
+restart scavenging must converge without mutating file, directory, symlink,
+root, or sidecar replacements. Recovery is then exercised against real PostgreSQL and
 rerun to prove idempotence.
 
 If the ordinary plugin metadata is disabled, deleted, malformed, or mismatched

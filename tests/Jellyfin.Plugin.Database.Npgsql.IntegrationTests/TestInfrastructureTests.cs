@@ -743,9 +743,18 @@ public sealed class TestInfrastructureTests
     [InlineData("scratch-before-claim-rename")]
     [InlineData("scratch-after-claim-rename")]
     [InlineData("flush-scratch-claim-parent")]
+    [InlineData("scratch-before-claim-sidecar")]
     [InlineData("flush-scratch-claim-sidecar-parent")]
+    [InlineData("scratch-after-claim-sidecar")]
+    [InlineData("scratch-before-entry-claim")]
+    [InlineData("flush-scratch-entry-claim-parent")]
+    [InlineData("scratch-after-entry-claim")]
     [InlineData("scratch-before-child-rename")]
+    [InlineData("scratch-before-child-unlink")]
+    [InlineData("scratch-before-reclaim")]
     [InlineData("scratch-after-pinned-unlink-check")]
+    [InlineData("flush-scratch-reclaimed-payload")]
+    [InlineData("scratch-after-reclaim")]
     [InlineData("scratch-after-child-delete")]
     [InlineData("scratch-before-delete-root")]
     [InlineData("flush-scratch-delete-parent")]
@@ -777,7 +786,14 @@ public sealed class TestInfrastructureTests
                 NpgsqlScratchSpace.ScavengeValidationDirectories(root);
             }
 
-            Assert.Empty(Directory.EnumerateFileSystemEntries(root));
+            Assert.DoesNotContain(
+                Directory.EnumerateDirectories(root),
+                path => Path.GetFileName(path).StartsWith("validation-", StringComparison.Ordinal));
+            Assert.All(
+                Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+                    .Where(path => Path.GetFileName(path).StartsWith(".retained-", StringComparison.Ordinal)
+                        && !Path.GetFileName(path).EndsWith(".json", StringComparison.Ordinal)),
+                path => Assert.Equal(0, new FileInfo(path).Length));
         }
         finally
         {
