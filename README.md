@@ -200,6 +200,10 @@ audits, hashing, and cleanup. It compares both ZIP and PDB bytes with the source
 build. Builds are isolated from an enclosing Git repository so moving the
 workspace does not change the release binary. `build.yaml` lists the
 same seven package artifacts for the official Jellyfin plugin packager.
+The verifier disables persistent .NET/MSBuild build servers and node reuse for
+both phases, then checks relocated NuGet/MSBuild `obj` metadata before and after
+the relocated build so a source-checkout path cannot be supplied by cached
+build-server state.
 `build/release-policy.json` is the machine-readable release identity, install
 directory, output, vulnerability-audit scope, redistribution, and license
 contract. The checksummed PDB is a separate diagnostic artifact and is not

@@ -16,9 +16,24 @@ export DOTNET_CLI_TELEMETRY_OPTOUT=1
 export DOTNET_GENERATE_ASPNET_CERTIFICATE=false
 export DOTNET_NOLOGO=1
 export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+export DOTNET_CLI_USE_MSBUILD_SERVER=0
+export MSBUILDDISABLENODEREUSE=1
+export UseSharedCompilation=false
 export NUGET_PACKAGES="$PLUGIN_ROOT/.packages"
 export NUGET_HTTP_CACHE_PATH="$PLUGIN_ROOT/.nuget-http"
 export XDG_DATA_HOME="$PLUGIN_ROOT/.artifacts/xdg-data"
+
+restore_without_build_servers() {
+    dotnet restore "$@" --disable-build-servers
+}
+
+build_without_build_servers() {
+    dotnet build "$@" --disable-build-servers
+}
+
+msbuild_without_build_servers() {
+    dotnet msbuild "$@" -nodeReuse:false -property:UseSharedCompilation=false
+}
 
 hash_file() {
     local harness=$1
@@ -30,14 +45,31 @@ hash_file() {
     printf '%s' "$value"
 }
 
-dotnet restore "$SOLUTION" --locked-mode
-dotnet build "$SOLUTION" --configuration Release --no-restore
-dotnet build "$HARNESS_PROJECT" --configuration Release --no-restore
+assert_relocated_obj_metadata() {
+    local forbidden_root=$1
+    local relocated_root=$2
+    local metadata_leaks
+    metadata_leaks=$(rg --hidden --no-ignore -a -l -F "$forbidden_root" \
+        --glob 'project.assets.json' \
+        --glob '*.nuget.dgspec.json' \
+        "$relocated_root" || true)
+    if [ -n "$metadata_leaks" ]; then
+        while IFS= read -r leaked_path; do
+            echo "FAIL: relocated obj metadata contains source checkout path: ${leaked_path#"$relocated_root/"}" >&2
+        done <<<"$metadata_leaks"
+        echo "FAIL: source and relocated release phases did not use isolated build-server state" >&2
+        exit 1
+    fi
+}
+
+restore_without_build_servers "$SOLUTION" --locked-mode
+build_without_build_servers "$SOLUTION" --configuration Release --no-restore
+build_without_build_servers "$HARNESS_PROJECT" --configuration Release --no-restore
 dotnet test --project "$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.UnitTests/Jellyfin.Plugin.Database.Npgsql.UnitTests.csproj" --configuration Release --no-build
 python3 -m unittest discover -s "$PLUGIN_ROOT/tests/scripts" -p 'test_*.py' -v
-dotnet msbuild "$PLUGIN_ROOT/build/Package.proj" -target:Package -property:Configuration=Release
+msbuild_without_build_servers "$PLUGIN_ROOT/build/Package.proj" -target:Package -property:Configuration=Release
 first_hash=$(hash_file "$HARNESS" "$PLUGIN_ROOT/artifacts/$PACKAGE_NAME")
-dotnet msbuild "$PLUGIN_ROOT/build/Package.proj" -target:Package -property:Configuration=Release
+msbuild_without_build_servers "$PLUGIN_ROOT/build/Package.proj" -target:Package -property:Configuration=Release
 second_hash=$(hash_file "$HARNESS" "$PLUGIN_ROOT/artifacts/$PACKAGE_NAME")
 [ "$first_hash" = "$second_hash" ] || { echo "FAIL: two clean package executions were not reproducible" >&2; exit 1; }
 source_symbol_hash=$(hash_file "$HARNESS" "$PLUGIN_ROOT/artifacts/symbols/$SYMBOL_NAME")
@@ -85,9 +117,10 @@ export NUGET_PACKAGES="$RELOCATED/.packages"
 export NUGET_HTTP_CACHE_PATH="$RELOCATED/.nuget-http"
 export XDG_DATA_HOME="$RELOCATED/.artifacts/xdg-data"
 cd "$RELOCATED"
-dotnet restore "$RELOCATED/Jellyfin.Plugin.Database.Npgsql.slnx" --locked-mode
-dotnet build "$RELOCATED/Jellyfin.Plugin.Database.Npgsql.slnx" --configuration Release --no-restore
-dotnet msbuild "$RELOCATED/build/Package.proj" -target:Package -property:Configuration=Release
+restore_without_build_servers "$RELOCATED/Jellyfin.Plugin.Database.Npgsql.slnx" --locked-mode
+assert_relocated_obj_metadata "$ORIGINAL_CHECKOUT" "$RELOCATED"
+build_without_build_servers "$RELOCATED/Jellyfin.Plugin.Database.Npgsql.slnx" --configuration Release --no-restore
+msbuild_without_build_servers "$RELOCATED/build/Package.proj" -target:Package -property:Configuration=Release
 dotnet test --project "$RELOCATED/tests/Jellyfin.Plugin.Database.Npgsql.UnitTests/Jellyfin.Plugin.Database.Npgsql.UnitTests.csproj" --configuration Release --no-build
 dotnet test --project "$RELOCATED/tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests.csproj" --configuration Release --no-build
 python3 -m unittest discover -s "$RELOCATED/tests/scripts" -p 'test_*.py' -v
@@ -112,6 +145,7 @@ relocated_symbol_hash=$(hash_file "$RELOCATED_HARNESS" "$RELOCATED/artifacts/sym
 [ "$source_symbol_hash" = "$relocated_symbol_hash" ] \
     || { echo "FAIL: relocated PDB $relocated_symbol_hash differs from source PDB $source_symbol_hash" >&2; exit 1; }
 
+assert_relocated_obj_metadata "$ORIGINAL_CHECKOUT" "$RELOCATED"
 path_leaks=$(rg --hidden --no-ignore -a -l -F "$ORIGINAL_CHECKOUT" \
     --glob '!.dotnet-cli/**' \
     --glob '!.nuget-http/**' \

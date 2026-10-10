@@ -94,6 +94,35 @@ public sealed class ReleaseContractTests
         Assert.Contains("tools/Jellyfin.Plugin.Database.Npgsql.Packaging/Jellyfin.Plugin.Database.Npgsql.Packaging.csproj", projects);
     }
 
+    [Fact]
+    public void ReleaseVerifierIsolatesSourceAndRelocatedBuildServersAndChecksGeneratedMetadata()
+    {
+        var root = FindRepositoryRoot();
+        var script = File.ReadAllText(Path.Combine(root, "scripts", "verify-release.sh"));
+
+        Assert.Contains("export DOTNET_CLI_USE_MSBUILD_SERVER=0", script, StringComparison.Ordinal);
+        Assert.Contains("export MSBUILDDISABLENODEREUSE=1", script, StringComparison.Ordinal);
+        Assert.Contains("export UseSharedCompilation=false", script, StringComparison.Ordinal);
+        Assert.Contains("dotnet restore \"$@\" --disable-build-servers", script, StringComparison.Ordinal);
+        Assert.Contains("dotnet build \"$@\" --disable-build-servers", script, StringComparison.Ordinal);
+        Assert.Contains("-nodeReuse:false -property:UseSharedCompilation=false", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("\ndotnet restore ", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("\ndotnet build ", script, StringComparison.Ordinal);
+
+        const string MetadataAssertion = "assert_relocated_obj_metadata \"$ORIGINAL_CHECKOUT\" \"$RELOCATED\"";
+        Assert.Equal(2, script.Split(MetadataAssertion, StringSplitOptions.None).Length - 1);
+        Assert.Contains("--glob 'project.assets.json'", script, StringComparison.Ordinal);
+        Assert.Contains("--glob '*.nuget.dgspec.json'", script, StringComparison.Ordinal);
+
+        var sourcePhase = script.IndexOf("restore_without_build_servers \"$SOLUTION\"", StringComparison.Ordinal);
+        var relocation = script.IndexOf("relocate-isolated", StringComparison.Ordinal);
+        var relocatedPhase = script.IndexOf(
+            "restore_without_build_servers \"$RELOCATED/Jellyfin.Plugin.Database.Npgsql.slnx\"",
+            StringComparison.Ordinal);
+        Assert.True(sourcePhase >= 0 && sourcePhase < relocation);
+        Assert.True(relocation < relocatedPhase);
+    }
+
     private static string FindRepositoryRoot()
     {
         var current = new DirectoryInfo(AppContext.BaseDirectory);
