@@ -58,22 +58,25 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         JellyfinHostLayout layout,
         LoopbackPortReservation httpPortReservation,
         SensitiveDataRedactor redactor,
-        string? ffmpegPath = null)
-        => StartCore(layout, httpPortReservation, redactor, ffmpegPath, preserveLayoutOnDispose: false);
+        string? ffmpegPath = null,
+        IReadOnlyList<string>? additionalArguments = null)
+        => StartCore(layout, httpPortReservation, redactor, ffmpegPath, preserveLayoutOnDispose: false, additionalArguments);
 
     internal static JellyfinHostProcess StartForRestartableLifecycle(
         JellyfinHostLayout layout,
         LoopbackPortReservation httpPortReservation,
         SensitiveDataRedactor redactor,
-        string? ffmpegPath = null)
-        => StartCore(layout, httpPortReservation, redactor, ffmpegPath, preserveLayoutOnDispose: true);
+        string? ffmpegPath = null,
+        IReadOnlyList<string>? additionalArguments = null)
+        => StartCore(layout, httpPortReservation, redactor, ffmpegPath, preserveLayoutOnDispose: true, additionalArguments);
 
     private static JellyfinHostProcess StartCore(
         JellyfinHostLayout layout,
         LoopbackPortReservation httpPortReservation,
         SensitiveDataRedactor redactor,
         string? ffmpegPath,
-        bool preserveLayoutOnDispose)
+        bool preserveLayoutOnDispose,
+        IReadOnlyList<string>? additionalArguments)
     {
         ArgumentNullException.ThrowIfNull(layout);
         ArgumentNullException.ThrowIfNull(httpPortReservation);
@@ -99,6 +102,11 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         {
             command.Add("--ffmpeg");
             command.Add(Path.GetFullPath(ffmpegPath));
+        }
+
+        if (additionalArguments is not null)
+        {
+            command.AddRange(additionalArguments);
         }
 
         httpPortReservation.ReleaseSocketForLaunch();
@@ -226,7 +234,8 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         {
             await WaitUntilReadyAsync(timeout, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception exception) when (exception is InvalidOperationException or TimeoutException)
+        catch (Exception exception) when (exception is InvalidOperationException or TimeoutException
+            || (exception is TaskCanceledException && !cancellationToken.IsCancellationRequested))
         {
             return;
         }

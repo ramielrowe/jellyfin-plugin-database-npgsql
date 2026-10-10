@@ -25,6 +25,26 @@ fi
 [ -f "$PACKAGE_ZIP" ] || fail "package ZIP is missing; run the package command first"
 [ -d "$PACKAGE_DIR" ] || fail "staged package directory is missing"
 
+grep -F '"status": "Active"' "$PACKAGE_DIR/meta.json" >/dev/null \
+    || fail "packaged metadata must keep the full-system restore guard active"
+grep -F 'full-system restore is unsupported' "$PACKAGE_DIR/meta.json" >/dev/null \
+    || fail "packaged metadata must prominently disclose the restore policy"
+
+for forbidden_restore_symbol in \
+    NpgsqlBackupArchive \
+    NpgsqlRestoreCoordinator \
+    NpgsqlRestoreFileSnapshot \
+    NpgsqlScratchSpace \
+    NpgsqlBackupTransactionInterceptor \
+    NpgsqlRestoreSaveChangesInterceptor; do
+    if grep -R -F "$forbidden_restore_symbol" "$PLUGIN_ROOT/src" >/dev/null; then
+        fail "experimental full-system restore symbol '$forbidden_restore_symbol' is present in release source"
+    fi
+    if grep -a -F "$forbidden_restore_symbol" "$PACKAGE_DIR/Jellyfin.Plugin.Database.Npgsql.dll" >/dev/null; then
+        fail "experimental full-system restore symbol '$forbidden_restore_symbol' is compiled into the package"
+    fi
+done
+
 [ -f "$PREDECESSOR_ROOT/fixture-manifest.json" ] || fail "predecessor integrity manifest is missing"
 [ "$(grep -F -c '<Compile Include="source-tree/**/*.cs" />' "$PREDECESSOR_PROJECT")" = "1" ] \
     || fail "predecessor fixture must compile exactly its immutable source-tree"

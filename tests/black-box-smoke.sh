@@ -1022,7 +1022,7 @@ dotnet build \
     -p:PackagingFailureMigration=true
 
 mkdir -p "$OLD_PLUGIN_FOLDER" "$AMBIGUOUS_PLUGIN_FOLDER"
-cp "$PLUGIN_ROOT/meta.json" "$OLD_PLUGIN_FOLDER/meta.json"
+sed 's/"status": "Active"/"status": "Disabled"/' "$PLUGIN_ROOT/meta.json" >"$OLD_PLUGIN_FOLDER/meta.json"
 cp "$PLUGIN_ROOT/meta.json" "$AMBIGUOUS_PLUGIN_FOLDER/meta.json"
 cp "$PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.dll" "$AMBIGUOUS_PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.dll"
 cp "$PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.deps.json" "$AMBIGUOUS_PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.deps.json"
@@ -1111,6 +1111,7 @@ grep -F "requires the exact folder and PluginName '$PLUGIN_FOLDER_NAME'" "$RUN_R
 grep -F "No database connection was attempted" "$RUN_ROOT/ambiguous-folder.log" >/dev/null \
     || fail "ambiguous prefix selection did not state its pre-connection boundary"
 mv "$RUN_ROOT/canonical-package-hold" "$PLUGIN_FOLDER"
+sed 's/"status": "Active"/"status": "Disabled"/' "$PLUGIN_ROOT/meta.json" >"$AMBIGUOUS_PLUGIN_FOLDER/meta.json"
 
 if [ "$HOST_INPUT_MODE" = "legacy-repository" ] || [ -n "$UNSUPPORTED_HOST_PUBLISH" ]; then
     start_unsupported_host "$RUN_ROOT/unsupported-abi.log"
@@ -1359,8 +1360,11 @@ assert_log_origin "$RUN_ROOT/first-start.log" "Npgsql EF" "$PLUGIN_FOLDER/Npgsql
 assert_log_origin "$RUN_ROOT/first-start.log" "Npgsql" "$PLUGIN_FOLDER/Npgsql.dll"
 assert_log_origin "$RUN_ROOT/first-start.log" "host database" "$RUN_ROOT/host-publish/Jellyfin.Database.Implementations.dll"
 assert_log_origin "$RUN_ROOT/first-start.log" "EF Core" "$RUN_ROOT/host-publish/Microsoft.EntityFrameworkCore.dll"
-grep -q 'Skipping disabled plugin.*Npgsql Database' "$RUN_ROOT/first-start.log" \
-    || fail "normal plugin loading did not honor the disabled manifest"
+grep -F 'Registering whitelisted assemblies for plugin "Npgsql Database"' "$RUN_ROOT/first-start.log" >/dev/null \
+    || fail "normal plugin loading did not register the required restore guard assembly"
+grep -F "Loaded assembly Jellyfin.Plugin.Database.Npgsql" "$RUN_ROOT/first-start.log" \
+    | grep -F " from <redacted>/runtime/data/plugins/$PLUGIN_FOLDER_NAME/Jellyfin.Plugin.Database.Npgsql.dll" >/dev/null \
+    || fail "normal PluginLoadContext scan did not report the restore guard assembly origin"
 grep -q 'Deleted PostgreSQL migration snapshot' "$RUN_ROOT/first-start.log" \
     || fail "successful migration did not exercise DeleteBackup"
 
@@ -1391,7 +1395,6 @@ stop_host "$HTTP_PORT" "$FIRST_TOKEN" || fail "first host did not stop cleanly"
 FOREIGN_KEY_COUNT=$(psql_value "SELECT COUNT(*) FROM pg_catalog.pg_constraint c JOIN pg_catalog.pg_class r ON r.oid=c.conrelid JOIN pg_catalog.pg_namespace n ON n.oid=r.relnamespace WHERE n.nspname='public' AND c.contype='f'")
 [ "$FOREIGN_KEY_COUNT" -gt 0 ] || fail "baseline contains no foreign keys"
 
-sed 's/"status": "Disabled"/"status": "Active"/' "$PLUGIN_ROOT/meta.json" >"$PLUGIN_FOLDER/meta.json"
 start_host "$RUN_ROOT/active-scan.log"
 wait_for_health "$HTTP_PORT" || fail "vanilla Jellyfin did not survive the later active plugin scan"
 grep -F 'Registering whitelisted assemblies for plugin "Npgsql Database"' "$RUN_ROOT/active-scan.log" >/dev/null \
@@ -1408,12 +1411,11 @@ stop_host "$HTTP_PORT" "$RESTART_TOKEN" || fail "active-scan host did not stop c
 
 printf '{ malformed plugin metadata\n' >"$PLUGIN_FOLDER/meta.json"
 start_host "$RUN_ROOT/malformed-metadata.log"
-wait_for_health "$HTTP_PORT" || fail "early provider did not survive malformed ordinary-plugin metadata"
-grep -F 'Error deserializing' "$RUN_ROOT/malformed-metadata.log" >/dev/null \
-    || fail "normal plugin scan did not report malformed metadata"
-MALFORMED_TOKEN=$(authenticate "$HTTP_PORT" "npgsql-malformed-metadata")
-[ -n "$MALFORMED_TOKEN" ] || fail "persisted user could not authenticate after malformed metadata recovery"
-stop_host "$HTTP_PORT" "$MALFORMED_TOKEN" || fail "malformed-metadata host did not stop cleanly"
+wait_for_host_exit || fail "host did not stop after malformed ordinary-plugin metadata removed the restore guard"
+grep -F 'ordinary plugin metadata is missing, disabled, malformed' "$RUN_ROOT/malformed-metadata.log" >/dev/null \
+    || fail "malformed metadata did not produce the pre-restore fail-closed diagnostic"
+grep -F 'No database connection or restore was attempted' "$RUN_ROOT/malformed-metadata.log" >/dev/null \
+    || fail "malformed metadata did not state its pre-connection and pre-restore boundary"
 cp "$PLUGIN_ROOT/meta.json" "$PLUGIN_FOLDER/meta.json"
 
 mapfile -t SEQUENCE_PROBES < <(psql_value "SELECT format('%I.%I', schemaname, sequencename) FROM pg_catalog.pg_sequences WHERE schemaname = 'public' ORDER BY sequencename LIMIT 4")
@@ -1501,7 +1503,7 @@ assert_pristine_host_unchanged
     echo "package_dlls=${package_dlls[*]}"
     echo "canonical_plugin_folder=$PLUGIN_FOLDER_NAME"
     echo "early_failure_guards=missing-npgsql-driver,missing-npgsql-ef-provider,ambiguous-prefix,unsupported-abi"
-    echo "normal_plugin_scans=disabled,active,malformed-metadata"
+    echo "normal_plugin_scans=active-guard,active-restart,malformed-metadata-fail-closed"
     echo "passfile_multi_host_failover=true"
     echo "credential_file_modes=0600-accepted,0640-0644-0666-rejected"
 } | tee "$RUN_ROOT/evidence.txt"

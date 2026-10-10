@@ -8,6 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup Label="Host-provided compile contracts">
+    <PackageReference Include="Jellyfin.Controller" ExcludeAssets="runtime" Private="false" />
     <PackageReference Include="Jellyfin.Database.Implementations" ExcludeAssets="runtime" Private="false" />
     <PackageReference Include="Microsoft.EntityFrameworkCore" ExcludeAssets="runtime" Private="false" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" ExcludeAssets="runtime" Private="false" />

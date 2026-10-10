@@ -2,11 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Runtime.Loader;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Plugin.Database.Npgsql.ValueConverters;
+using Jellyfin.Server.Implementations.SystemBackupService;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -27,6 +29,7 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     ];
 
     private readonly ILogger<NpgsqlDatabaseProvider> logger;
+    private readonly IServiceProvider? services;
     private readonly string? applicationDataPath;
     private string? backupRoot;
     private string? connectionString;
@@ -47,6 +50,7 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
         : this(logger)
     {
         ArgumentNullException.ThrowIfNull(services);
+        this.services = services;
         const string ApplicationPathsTypeName = "MediaBrowser.Common.Configuration.IApplicationPaths, MediaBrowser.Common";
         var applicationPathsType = Type.GetType(ApplicationPathsTypeName, throwOnError: false);
         var applicationPaths = applicationPathsType is null ? null : services.GetService(applicationPathsType);
@@ -72,6 +76,19 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(databaseConfiguration);
+
+        if (HasFullSystemRestoreArgument(Environment.GetCommandLineArgs()))
+        {
+            throw new NotSupportedException(NpgsqlFullSystemRestoreGuard.UnsupportedRestoreMessage);
+        }
+
+        if (this.applicationDataPath is not null)
+        {
+            var earlyPluginDirectory = Path.GetDirectoryName(this.GetType().Assembly.Location)
+                ?? throw MissingOrdinaryPluginMetadata();
+            ValidateOrdinaryPluginMetadata(earlyPluginDirectory);
+            ValidateFullSystemRestoreGuard(this.services!);
+        }
 
         var hostDatabaseAssembly = typeof(JellyfinDbContext).Assembly;
         var hostDatabaseVersion = hostDatabaseAssembly.GetName().Version
@@ -234,6 +251,116 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <returns><see langword="true" /> when the ABI is supported.</returns>
     internal static bool SupportsHostDatabaseAbi(Version version)
         => version == new Version(12, 2, 0, 0);
+
+    /// <summary>Detects Jellyfin's public command-line full-system restore entry point without reading its archive path.</summary>
+    /// <param name="arguments">The process command line.</param>
+    /// <returns><see langword="true"/> when a restore archive option is present.</returns>
+    internal static bool HasFullSystemRestoreArgument(IReadOnlyList<string> arguments)
+    {
+        ArgumentNullException.ThrowIfNull(arguments);
+        for (var index = 0; index < arguments.Count; index++)
+        {
+            var argument = arguments[index];
+            if (string.Equals(argument, "--restore-archive", StringComparison.OrdinalIgnoreCase)
+                || argument.StartsWith("--restore-archive=", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>Validates the exact active metadata required for late restore-guard registration.</summary>
+    /// <param name="pluginDirectory">The early provider's installation directory.</param>
+    internal static void ValidateOrdinaryPluginMetadata(string pluginDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(pluginDirectory);
+        const int MaximumMetadataBytes = 64 * 1024;
+        try
+        {
+            var metadataPath = Path.Combine(pluginDirectory, "meta.json");
+            using var stream = new FileStream(
+                metadataPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                4096,
+                FileOptions.SequentialScan);
+            if (stream.Length is <= 0 or > MaximumMetadataBytes)
+            {
+                throw MissingOrdinaryPluginMetadata();
+            }
+
+            using var document = JsonDocument.Parse(stream);
+            var root = document.RootElement;
+            var assemblies = root.GetProperty("assemblies").EnumerateArray().Select(item => item.GetString()).ToArray();
+            if (!string.Equals(root.GetProperty("guid").GetString(), PluginMetadata.Id.ToString(), StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(root.GetProperty("name").GetString(), PluginMetadata.Name, StringComparison.Ordinal)
+                || !string.Equals(root.GetProperty("version").GetString(), PluginMetadata.Version, StringComparison.Ordinal)
+                || !string.Equals(root.GetProperty("targetAbi").GetString(), PluginMetadata.SupportedDatabaseAbi, StringComparison.Ordinal)
+                || !string.Equals(root.GetProperty("status").GetString(), "Active", StringComparison.Ordinal)
+                || assemblies.Length != 1
+                || !string.Equals(assemblies[0], PluginMetadata.AssemblyFileName, StringComparison.Ordinal))
+            {
+                throw MissingOrdinaryPluginMetadata();
+            }
+        }
+        catch (Exception exception) when (exception is IOException
+            or UnauthorizedAccessException
+            or JsonException
+            or KeyNotFoundException
+            or InvalidOperationException)
+        {
+            throw MissingOrdinaryPluginMetadata(exception);
+        }
+    }
+
+    private static InvalidOperationException MissingOrdinaryPluginMetadata(Exception? innerException = null)
+        => new(
+            "The Npgsql ordinary plugin metadata is missing, disabled, malformed, or does not match this provider build. "
+            + "Jellyfin is refusing to start before any dashboard, API, scheduled, or startup restore can change Config, Data, Root, "
+            + "migration history, PostgreSQL, or SQLite. Restore the complete matching package with meta.json status Active and restart, "
+            + "or select a different database provider. No database connection or restore was attempted.",
+            innerException);
+
+    /// <summary>
+    /// Proves that late plugin discovery installed this exact build's pre-mutation restore guard.
+    /// </summary>
+    /// <param name="services">The completed host service provider.</param>
+    internal static void ValidateFullSystemRestoreGuard(IServiceProvider services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        var serviceProbe = services.GetService<IServiceProviderIsService>();
+        if (serviceProbe is not null && !serviceProbe.IsService(typeof(IBackupService)))
+        {
+            // Jellyfin's separate pre-initialisation migration container has
+            // no backup entry point. The complete host container is checked
+            // before it opens PostgreSQL or serves dashboard/API requests.
+            return;
+        }
+
+        const string RegistrationTypeName = "Jellyfin.Plugin.Database.Npgsql.NpgsqlRestoreGuardRegistration";
+        var providerModuleId = typeof(NpgsqlDatabaseProvider).Assembly.ManifestModule.ModuleVersionId;
+        var registrationIsExact = AppDomain.CurrentDomain.GetAssemblies()
+            .Where(assembly => !assembly.IsDynamic && assembly.ManifestModule.ModuleVersionId == providerModuleId)
+            .Select(assembly => assembly.GetType(RegistrationTypeName, throwOnError: false))
+            .Where(type => type is not null)
+            .Select(type => services.GetService(type!))
+            .Where(instance => instance is not null)
+            .Any(instance => instance!.GetType().GetMethod(
+                    "IsExactFinalRegistration",
+                    BindingFlags.Instance | BindingFlags.NonPublic)?.Invoke(instance, null) is true);
+        if (!registrationIsExact)
+        {
+            throw new InvalidOperationException(
+                "The Npgsql full-system restore guard is unavailable or was replaced. The ordinary plugin may be disabled, deleted, "
+                + "malformed, absent, or its service registration may have failed. Jellyfin is refusing to start with this PostgreSQL "
+                + "provider before any dashboard, API, scheduled, or startup restore can change Config, Data, Root, migration history, "
+                + "PostgreSQL, or SQLite. Restore the complete matching plugin package with status Active and restart, or select a "
+                + "different database provider. No database connection or restore was attempted.");
+        }
+    }
 
     /// <summary>
     /// Validates the unmodified Jellyfin database configuration contract.

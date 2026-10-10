@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO.Compression;
+using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -269,11 +270,178 @@ public sealed class StockServerLifecycleTests
             deleteAssembly: false,
             deleteMetadata: true,
             pluginName: PluginMetadata.InstallationDirectory,
-            expectedDiagnostic: "28P01",
+            expectedDiagnostic: "ordinary plugin metadata is missing, disabled, malformed",
             wrongPassword,
             cancellationToken);
 
         Assert.Equal(originalSchema, await ReadPublicSchemaAsync(database.RuntimeConnectionString, cancellationToken));
+        await publish.VerifyUnchangedAsync(cancellationToken);
+    }
+
+    [Fact]
+    public async Task StockHost_FullSystemRestoreEntryPointsRejectBeforeProtectedStateMutation()
+    {
+        var databaseOptions = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(
+            databaseOptions.IsConfigured && IsCurrentHostConfigured(),
+            "Configure PostgreSQL and the integrity-pinned current stock host to run the full-system restore guard proof.");
+
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(databaseOptions, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        using var artifacts = HostTestArtifactScope.Create("stock-restore-guard");
+        var publish = await PristineJellyfinPublish.CreateAsync(
+            PristineJellyfinPublishOptions.FromEnvironment(),
+            Path.Combine(artifacts.CaseDirectory, "host"),
+            cancellationToken);
+        var layout = JellyfinHostLayout.Create(artifacts.CaseDirectory, publish, "restore-guard");
+        var package = CurrentPackage(repositoryRoot);
+        var pluginDirectory = layout.InstallPluginZip(package, PluginMetadata.InstallationDirectory);
+        layout.WriteDatabaseConfiguration(
+            database.RuntimeConnectionString,
+            PluginMetadata.InstallationDirectory,
+            PluginMetadata.AssemblyFileName);
+        var leaseRoot = Path.Combine(layout.RunRoot, ".port-leases");
+        using var initialHttpPort = LoopbackPortReservation.Acquire(leaseRoot);
+        using var initialHttpsPort = LoopbackPortReservation.Acquire(leaseRoot);
+        layout.WriteNetworkConfiguration(initialHttpPort.Port, initialHttpsPort.Port);
+        var adminPassword = "restore-guard-admin-" + Guid.NewGuid().ToString("N");
+        var databasePassword = new NpgsqlConnectionStringBuilder(database.RuntimeConnectionString).Password!;
+        var redactor = new SensitiveDataRedactor(database.RuntimeConnectionString, databasePassword, adminPassword);
+        var ffmpeg = PrepareFakeMediaTools(repositoryRoot, artifacts.CaseDirectory);
+        string adminToken;
+
+        await using (var host = JellyfinHostProcess.StartForRestartableLifecycle(
+            layout,
+            initialHttpPort,
+            redactor,
+            ffmpeg))
+        {
+            await host.WaitUntilReadyAsync(TimeSpan.FromMinutes(2), cancellationToken);
+            _ = await host.GetStringAsync("Startup/User", cancellationToken);
+            await host.PostJsonAsync(
+                "Startup/User",
+                JsonSerializer.Serialize(new { Name = "restore-guard-admin", Password = adminPassword }),
+                authorization: null,
+                cancellationToken);
+            await host.PostJsonAsync("Startup/Complete", "{}", authorization: null, cancellationToken);
+            adminToken = await AuthenticateAsync(host, "restore-guard-admin", adminPassword, "restore-guard", cancellationToken);
+            redactor.Add(adminToken);
+
+            var backupDirectory = Path.Combine(layout.DataDirectory, "data", "backups");
+            Directory.CreateDirectory(backupDirectory);
+            var archives = new[]
+            {
+                WriteDatabaseRestoreArchive(backupDirectory, "postgresql-database.zip", "postgresql"),
+                WriteDatabaseRestoreArchive(backupDirectory, "sqlite-database.zip", "sqlite"),
+                WriteDatabaseRestoreArchive(backupDirectory, "unknown-database.zip", "unknown"),
+                WriteCorruptRestoreArchive(backupDirectory, "corrupt-database.zip"),
+            };
+            var protectedState = await WaitForProtectedStateStableAsync(
+                layout,
+                database.RuntimeConnectionString,
+                cancellationToken);
+            foreach (var archive in archives)
+            {
+                var exception = await Assert.ThrowsAsync<HttpRequestException>(() => host.PostJsonAsync(
+                    "Backup/Restore",
+                    JsonSerializer.Serialize(new { ArchiveFileName = Path.GetFileName(archive) }),
+                    Authorization(adminToken),
+                    cancellationToken));
+                Assert.Equal(HttpStatusCode.InternalServerError, exception.StatusCode);
+                Assert.False(host.HasExited);
+                var after = await CaptureProtectedStateAsync(layout, database.RuntimeConnectionString, cancellationToken);
+                Assert.Equal(protectedState.FilesystemHash, after.FilesystemHash);
+                Assert.Equal(protectedState.DatabaseHash, after.DatabaseHash);
+                Assert.Empty(FindSqliteFiles(layout));
+            }
+
+            await host.StopGracefullyAsync(adminToken, TimeSpan.FromSeconds(30), cancellationToken);
+        }
+
+        var startupArchive = Path.Combine(layout.DataDirectory, "data", "backups", "postgresql-database.zip");
+        await AssertStartupRestoreRejectedWithoutMutationAsync(
+            layout,
+            database.RuntimeConnectionString,
+            leaseRoot,
+            redactor,
+            ffmpeg,
+            startupArchive,
+            expectedDiagnostic: NpgsqlFullSystemRestoreGuard.UnsupportedRestoreMessage,
+            cancellationToken);
+
+        var metadataPath = Path.Combine(pluginDirectory, "meta.json");
+        var activeMetadata = await File.ReadAllTextAsync(metadataPath, cancellationToken);
+        var disabledMetadata = activeMetadata.Replace(
+            "\"status\": \"Active\"",
+            "\"status\": \"Disabled\"",
+            StringComparison.Ordinal);
+        Assert.NotEqual(activeMetadata, disabledMetadata);
+        await File.WriteAllTextAsync(metadataPath, disabledMetadata, cancellationToken);
+        await AssertStartupRestoreRejectedWithoutMutationAsync(
+            layout,
+            database.RuntimeConnectionString,
+            leaseRoot,
+            redactor,
+            ffmpeg,
+            startupArchive,
+            expectedDiagnostic: NpgsqlFullSystemRestoreGuard.UnsupportedRestoreMessage,
+            cancellationToken);
+
+        await File.WriteAllTextAsync(metadataPath, activeMetadata, cancellationToken);
+        var heldMetadata = Path.Combine(artifacts.CaseDirectory, "held-meta.json");
+        File.Move(metadataPath, heldMetadata);
+        try
+        {
+            await AssertStartupRestoreRejectedWithoutMutationAsync(
+                layout,
+                database.RuntimeConnectionString,
+                leaseRoot,
+                redactor,
+                ffmpeg,
+                startupArchive,
+                expectedDiagnostic: NpgsqlFullSystemRestoreGuard.UnsupportedRestoreMessage,
+                cancellationToken);
+        }
+        finally
+        {
+            File.Move(heldMetadata, metadataPath);
+        }
+
+        await File.WriteAllTextAsync(metadataPath, "{ malformed ordinary plugin metadata", cancellationToken);
+        try
+        {
+            await AssertStartupRestoreRejectedWithoutMutationAsync(
+                layout,
+                database.RuntimeConnectionString,
+                leaseRoot,
+                redactor,
+                ffmpeg,
+                startupArchive,
+                expectedDiagnostic: NpgsqlFullSystemRestoreGuard.UnsupportedRestoreMessage,
+                cancellationToken);
+        }
+        finally
+        {
+            await File.WriteAllTextAsync(metadataPath, activeMetadata, CancellationToken.None);
+        }
+
+        await File.WriteAllBytesAsync(
+            Path.Combine(pluginDirectory, "MalformedLateRegistration.dll"),
+            "not a managed assembly"u8.ToArray(),
+            cancellationToken);
+        await AssertStartupRestoreRejectedWithoutMutationAsync(
+            layout,
+            database.RuntimeConnectionString,
+            leaseRoot,
+            redactor,
+            ffmpeg,
+            startupArchive,
+            expectedDiagnostic: NpgsqlFullSystemRestoreGuard.UnsupportedRestoreMessage,
+            cancellationToken);
+
+        Assert.Empty(FindSqliteFiles(layout));
         await publish.VerifyUnchangedAsync(cancellationToken);
     }
 
@@ -511,6 +679,283 @@ public sealed class StockServerLifecycleTests
             NpgsqlConnection.ClearAllPools();
         }
     }
+
+    private static string WriteDatabaseRestoreArchive(string backupDirectory, string fileName, string origin)
+    {
+        var path = Path.Combine(backupDirectory, fileName);
+        using var archive = ZipFile.Open(path, ZipArchiveMode.Create);
+        var manifest = archive.CreateEntry("manifest.json", CompressionLevel.NoCompression);
+        using (var writer = new StreamWriter(manifest.Open(), new UTF8Encoding(false)))
+        {
+            writer.Write(JsonSerializer.Serialize(new
+            {
+                ServerVersion = "12.2.0",
+                BackupEngineVersion = "0.2.0",
+                DateCreated = DateTimeOffset.UnixEpoch,
+                DatabaseTables = Array.Empty<string>(),
+                Options = new { Database = true, Metadata = false, Trickplay = false, Subtitles = false },
+                Origin = origin,
+            }));
+        }
+
+        var config = archive.CreateEntry("Config/restore-mutation-sentinel.xml", CompressionLevel.NoCompression);
+        using (var writer = new StreamWriter(config.Open(), new UTF8Encoding(false)))
+        {
+            writer.Write("restore must never extract this file");
+        }
+
+        var database = archive.CreateEntry("Database/HistoryRow.json", CompressionLevel.NoCompression);
+        using (var writer = new StreamWriter(database.Open(), new UTF8Encoding(false)))
+        {
+            writer.Write("[]");
+        }
+
+        return path;
+    }
+
+    private static string WriteCorruptRestoreArchive(string backupDirectory, string fileName)
+    {
+        var path = Path.Combine(backupDirectory, fileName);
+        File.WriteAllBytes(path, "corrupt archive with database provenance"u8.ToArray());
+        return path;
+    }
+
+    private static async Task AssertStartupRestoreRejectedWithoutMutationAsync(
+        JellyfinHostLayout layout,
+        string connectionString,
+        string leaseRoot,
+        SensitiveDataRedactor redactor,
+        string ffmpeg,
+        string archivePath,
+        string? expectedDiagnostic,
+        CancellationToken cancellationToken)
+    {
+        using var httpPort = LoopbackPortReservation.Acquire(leaseRoot);
+        using var httpsPort = LoopbackPortReservation.Acquire(leaseRoot);
+        layout.WriteNetworkConfiguration(httpPort.Port, httpsPort.Port);
+        var before = await CaptureProtectedStateAsync(layout, connectionString, cancellationToken);
+        await using var host = JellyfinHostProcess.StartForRestartableLifecycle(
+            layout,
+            httpPort,
+            redactor,
+            ffmpeg,
+            ["--restore-archive", archivePath]);
+        await host.WaitForExpectedStartupFailureAsync(TimeSpan.FromSeconds(25), cancellationToken);
+        await host.TerminateAsync();
+        var after = await CaptureProtectedStateAsync(layout, connectionString, cancellationToken);
+        Assert.Equal(before.FilesystemHash, after.FilesystemHash);
+        Assert.Equal(before.DatabaseHash, after.DatabaseHash);
+        Assert.Empty(FindSqliteFiles(layout));
+        if (expectedDiagnostic is not null)
+        {
+            var diagnostics = ReadCollectedLogs(layout);
+            if (!diagnostics.Contains(expectedDiagnostic, StringComparison.OrdinalIgnoreCase))
+            {
+                var tail = diagnostics.Length > 16_384 ? diagnostics[^16_384..] : diagnostics;
+                throw new InvalidOperationException(
+                    $"Expected startup diagnostic '{expectedDiagnostic}' was absent. Sanitized diagnostic tail:\n{tail}");
+            }
+        }
+    }
+
+    private static async Task<ProtectedState> CaptureProtectedStateAsync(
+        JellyfinHostLayout layout,
+        string connectionString,
+        CancellationToken cancellationToken)
+    {
+        var filesystemHash = await HashProtectedTreesAsync(
+            [
+                ("Config", layout.ConfigurationDirectory),
+                ("Data", Path.Combine(layout.DataDirectory, "data")),
+                ("Root", Path.Combine(layout.DataDirectory, "root")),
+            ],
+            cancellationToken);
+        var databaseHash = await HashDatabaseStateAsync(connectionString, cancellationToken);
+        return new ProtectedState(filesystemHash, databaseHash);
+    }
+
+    private static async Task<ProtectedState> WaitForProtectedStateStableAsync(
+        JellyfinHostLayout layout,
+        string connectionString,
+        CancellationToken cancellationToken)
+    {
+        var previous = await CaptureProtectedStateAsync(layout, connectionString, cancellationToken);
+        var stableObservations = 0;
+        for (var attempt = 0; attempt < 30; attempt++)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
+            var current = await CaptureProtectedStateAsync(layout, connectionString, cancellationToken);
+            if (current == previous)
+            {
+                stableObservations++;
+                if (stableObservations == 3)
+                {
+                    return current;
+                }
+            }
+            else
+            {
+                previous = current;
+                stableObservations = 0;
+            }
+        }
+
+        throw new InvalidOperationException("The stock host protected state did not become stable before restore testing.");
+    }
+
+    private static async Task<string> HashProtectedTreesAsync(
+        IReadOnlyList<(string Name, string Path)> roots,
+        CancellationToken cancellationToken)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        foreach (var root in roots.OrderBy(item => item.Name, StringComparer.Ordinal))
+        {
+            Append(root.Name);
+            if (!Directory.Exists(root.Path))
+            {
+                Append("missing");
+                continue;
+            }
+
+            foreach (var directory in Directory.EnumerateDirectories(root.Path, "*", SearchOption.AllDirectories)
+                         .Prepend(root.Path)
+                         .OrderBy(path => Path.GetRelativePath(root.Path, path), StringComparer.Ordinal))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Append("D:" + Path.GetRelativePath(root.Path, directory).Replace(Path.DirectorySeparatorChar, '/'));
+                Append(GetMode(directory));
+            }
+
+            foreach (var file in Directory.EnumerateFiles(root.Path, "*", SearchOption.AllDirectories)
+                         .OrderBy(path => Path.GetRelativePath(root.Path, path), StringComparer.Ordinal))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                Append("F:" + Path.GetRelativePath(root.Path, file).Replace(Path.DirectorySeparatorChar, '/'));
+                Append(GetMode(file));
+                await using var stream = new FileStream(
+                    file,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete,
+                    64 * 1024,
+                    FileOptions.Asynchronous | FileOptions.SequentialScan);
+                var buffer = new byte[64 * 1024];
+                int count;
+                while ((count = await stream.ReadAsync(buffer, cancellationToken)) != 0)
+                {
+                    hash.AppendData(buffer, 0, count);
+                }
+            }
+        }
+
+        return Convert.ToHexStringLower(hash.GetHashAndReset());
+
+        void Append(string value)
+        {
+            hash.AppendData(Encoding.UTF8.GetBytes(value));
+            hash.AppendData([0]);
+        }
+
+        static string GetMode(string path)
+            => OperatingSystem.IsWindows()
+                ? "windows"
+                : Convert.ToString((int)File.GetUnixFileMode(path), 8);
+    }
+
+    private static async Task<string> HashDatabaseStateAsync(
+        string connectionString,
+        CancellationToken cancellationToken)
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var connectionBuilder = new NpgsqlConnectionStringBuilder(connectionString) { Pooling = false };
+        await using var connection = new NpgsqlConnection(connectionBuilder.ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await AppendQueryAsync(
+            """
+            SELECT table_name || '|' || ordinal_position::text || '|' || column_name || '|' || data_type || '|' || udt_name || '|' || is_nullable || '|' || coalesce(column_default, '') || '|' || is_identity || '|' || is_generated
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+            ORDER BY table_name, ordinal_position
+            """);
+        await AppendQueryAsync(
+            """
+            SELECT c.relname || '|' || coalesce(pg_get_constraintdef(con.oid, true), '')
+            FROM pg_catalog.pg_constraint con
+            JOIN pg_catalog.pg_class c ON c.oid = con.conrelid
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public'
+            ORDER BY c.relname, con.conname
+            """);
+        await AppendQueryAsync(
+            "SELECT indexname || '|' || indexdef FROM pg_catalog.pg_indexes WHERE schemaname = 'public' ORDER BY indexname");
+        await AppendQueryAsync(
+            """
+            SELECT p.proname || '|' || pg_get_function_identity_arguments(p.oid) || '|' || p.prokind::text || '|' || p.prorettype::regtype::text || '|' || p.prosrc || '|' || coalesce(p.probin, '')
+            FROM pg_catalog.pg_proc p
+            JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname = 'public'
+            ORDER BY p.proname, pg_get_function_identity_arguments(p.oid)
+            """);
+
+        var tables = new List<string>();
+        await using (var tableCommand = connection.CreateCommand())
+        {
+            tableCommand.CommandText = "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public' ORDER BY tablename";
+            await using var reader = await tableCommand.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                tables.Add(reader.GetString(0));
+            }
+        }
+
+        foreach (var table in tables)
+        {
+            Append("TABLE:" + table);
+            var quoted = '"' + table.Replace("\"", "\"\"", StringComparison.Ordinal) + '"';
+            await AppendQueryAsync(
+                $"SELECT row_to_json(snapshot_row)::text FROM (SELECT * FROM {quoted}) snapshot_row ORDER BY row_to_json(snapshot_row)::text");
+        }
+
+        var sequences = new List<string>();
+        await using (var sequenceCommand = connection.CreateCommand())
+        {
+            sequenceCommand.CommandText = "SELECT sequencename FROM pg_catalog.pg_sequences WHERE schemaname = 'public' ORDER BY sequencename";
+            await using var reader = await sequenceCommand.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                sequences.Add(reader.GetString(0));
+            }
+        }
+
+        foreach (var sequence in sequences)
+        {
+            Append("SEQUENCE:" + sequence);
+            var quoted = '"' + sequence.Replace("\"", "\"\"", StringComparison.Ordinal) + '"';
+            await AppendQueryAsync($"SELECT last_value::text || '|' || is_called::text FROM {quoted}");
+        }
+
+        return Convert.ToHexStringLower(hash.GetHashAndReset());
+
+        async Task AppendQueryAsync(string sql)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                Append(reader.IsDBNull(0) ? "<null>" : reader.GetString(0));
+            }
+        }
+
+        void Append(string value)
+        {
+            hash.AppendData(Encoding.UTF8.GetBytes(value));
+            hash.AppendData([0]);
+        }
+    }
+
+    private sealed record ProtectedState(string FilesystemHash, string DatabaseHash);
 
     private static bool IsCurrentHostConfigured()
         => !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(

@@ -9,9 +9,8 @@ installation constraints below.**
 
 > This report supersedes the original exploratory result where it described
 > behavior not present in the current branch. The package supports only the
-> Jellyfin 12.2 ABI. Migration backup remains deliberately unsupported pending
-> bead `jellyfin-38k.8`, so the current package is not a usable production
-> database backend.
+> Jellyfin 12.2 ABI. Provider migration backup and rollback have since landed;
+> stock full-system restore remains deliberately unsupported.
 
 This is a partial contract proof, not a production release. It establishes the
 vanilla early-loader, packaging, provider configuration, and model-finalization
@@ -50,12 +49,14 @@ the package. Runtime logging confirmed:
 - the installed package contained exactly three DLLs: the provider and the two
   Npgsql DLLs.
 
-The ordinary plugin manager runs later and would create a second collectible load
-context. The safe package contract is therefore a `meta.json` whose status is
-`Disabled` and whose assembly allowlist contains only the provider DLL. The normal
-plugin manager then skips it, while the early database loader still loads it. This
-also proves that normal plugin enabled/disabled state does **not** control a custom
-database provider; `database.xml` is the effective enablement switch.
+The ordinary plugin manager runs later and creates a second collectible load
+context. The provider does not use that copy for database configuration, model
+construction, migrations, or persistence. The release metadata is nevertheless
+`Active` so the late copy can install the small full-system restore guard. The
+early provider proves the exact final guard registration before the full host
+opens PostgreSQL. Disabled or failed normal loading therefore stops startup
+rather than weakening the early provider path; `database.xml` remains the switch
+that selects PostgreSQL.
 
 The loader selects the first sorted plugin folder whose name starts with
 `PluginName`. Installation must ensure there is only one matching folder. Also,
@@ -64,8 +65,10 @@ The loader selects the first sorted plugin folder whose name starts with
 `Jellyfin.Plugin.Database.dll`.
 
 The early constructor may depend on services registered in the temporary startup
-container. The probe uses only `ILogger<T>` and succeeds in both migration and full
-host startup. It cannot depend on services registered later by ordinary plugins.
+container. The core provider uses only early host services and succeeds in both
+migration and full-host startup. Restore protection is separately verified from
+the completed full-host service collection and skipped only in Jellyfin's
+migration-only container, which has no backup service or restore entry point.
 
 ## Model-finalization result
 

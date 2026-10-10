@@ -1,16 +1,16 @@
 {
   "guid": "8a6e4c5e-2185-45df-a30f-cc828529330b",
   "name": "Npgsql Database",
-  "description": "Npgsql Entity Framework database provider for Jellyfin.",
-  "overview": "Provides a PostgreSQL-backed Jellyfin database through the vanilla custom-provider loader.",
+  "description": "Npgsql Entity Framework database provider for Jellyfin. Database-inclusive full-system restore is unsupported.",
+  "overview": "Provides a PostgreSQL-backed Jellyfin database through the vanilla custom-provider loader. Keep this plugin active: its small restore guard is required for safe startup.",
   "owner": "ramielrowe",
   "category": "Database",
   "imageUrl": "",
   "versions": [],
-  "status": "Disabled",
+  "status": "Active",
   "targetAbi": "12.2.0.0",
   "version": "0.1.0.0",
-  "changelog": "Initial standalone provider package.",
+  "changelog": "Initial standalone provider package. Full-system restore is disabled while PostgreSQL is selected; provider migration rollback remains supported.",
   "autoUpdate": false,
   "assemblies": [
     "Jellyfin.Plugin.Database.Npgsql.dll"

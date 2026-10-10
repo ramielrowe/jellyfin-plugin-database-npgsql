@@ -17,9 +17,24 @@ Npgsql 10.0.3, matching the successful feasibility run documented in
 assemblies are host-owned compile contracts; only the provider and Npgsql runtime
 assemblies belong in the plugin package.
 
-The provider is loaded before Jellyfin's ordinary plugin initialization. Its
-constructor consequently depends only on the early `ILogger<T>` service and it
-does not use `IPluginServiceRegistrator`.
+> **Full-system restore is not supported.** While this provider is selected,
+> every dashboard, API, scheduled, and startup full-system restore request is
+> rejected before Jellyfin can change Config, Data, Root, migration history,
+> PostgreSQL, or create/fall back to SQLite. This includes PostgreSQL-origin,
+> SQLite-origin, unknown, and corrupt archives. Provider migration snapshots
+> used for automatic migration rollback remain supported; they are a separate
+> internal format and workflow.
+
+The provider assembly is loaded before Jellyfin's ordinary plugin
+initialization. Its provider constructor consequently depends only on early
+host services. The same assembly also contains a very small ordinary
+`IPluginServiceRegistrator` which replaces only `IBackupService` with the
+fail-closed restore guard. Before opening PostgreSQL, the early provider proves
+that this exact guard is the final registration. If the ordinary plugin is
+disabled, deleted, malformed, absent, throws during registration, or its guard
+is replaced, startup stops before database or restore access.
+The `--restore-archive` entry point is rejected even earlier, before Jellyfin's
+preliminary migration container can change PostgreSQL.
 
 ## Installation and version selection
 
@@ -37,10 +52,13 @@ If startup reports a missing dependency or unsupported database ABI, restore the
 prior `PluginName` (or the prior Jellyfin version) and restart. Do not partially
 overwrite a live version directory.
 
-The packaged `meta.json` is disabled deliberately. `database.xml`, not normal
-plugin enablement, activates an early database provider. Keeping the ordinary
-plugin entry disabled avoids loading a redundant collectible copy later in the
-same process. No ordinary `IPlugin` descriptor or service registrator is needed.
+The packaged `meta.json` must remain `Active`. `database.xml` selects the early
+database provider, while active ordinary discovery installs the independent
+restore guard. Do not disable the plugin entry: the early provider treats a
+missing or disabled late registration as an unsafe partial installation and
+refuses startup. Jellyfin may load a collectible copy of the same assembly for
+service registration; the database provider itself still runs only from the
+early default load context.
 
 ## Database configuration
 
@@ -125,6 +143,21 @@ Before vanilla Jellyfin runs a pending database migration, the provider creates
 a managed, streamed, rollback-capable snapshot below the Jellyfin data path. It
 does not invoke external PostgreSQL clients or require elevated database
 privileges. Unsupported populated layouts fail before mutation.
+
+## Backup and restore policy
+
+The provider supports its own migration backup, rollback, and cleanup protocol
+documented in [`docs/migration-backups.md`](docs/migration-backups.md). That
+protocol is invoked by Jellyfin migrations and is not a user-selectable
+full-system restore.
+
+Stock full-system backup creation, manifest inspection, and backup listing are
+left unchanged. A database-inclusive full-system backup is therefore an export,
+not a restorable recovery artifact for this provider. Every stock full-system
+restore is disabled—even one claiming not to contain a database—because a
+restart-time handoff cannot safely preserve and re-prove that distinction
+without implementing a cross-resource restore engine. See
+[`docs/full-system-restore.md`](docs/full-system-restore.md).
 
 ## Build and test
 
