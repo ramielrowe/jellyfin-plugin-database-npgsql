@@ -13,6 +13,9 @@ jobs:
   release-contract:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Keep setup-dotnet's cache path aligned with verify-release.sh.
+      NUGET_PACKAGES: ${{ github.workspace }}/.packages
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
@@ -26,6 +29,9 @@ jobs:
   vanilla-jellyfin-black-box:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # The verifier runs from the plugin checkout and uses this same path.
+      NUGET_PACKAGES: ${{ github.workspace }}/plugin/.packages
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
