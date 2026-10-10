@@ -1023,13 +1023,14 @@ public sealed class TestInfrastructureTests
                 new SensitiveDataRedactor("supervisor-regression-secret"),
                 [
                     "/bin/sh", "-c",
-                    $"(sh -c \"setsid sh -c 'trap \\\"\\\" TERM; echo \\$\\$ > \\\"{pidFile}\\\"; printf supervisor-; sleep 0.05; printf regression-secret-inherited-pipe-output; sleep 30' & exit 0\" &) ; exit 0"
+                    $"(sh -c \"setsid sh -c 'trap \\\"\\\" TERM; echo \\$\\$ > \\\"{pidFile}\\\"; printf supervisor-; sleep 0.05; printf regression-secret-inherited-pipe-output; sleep 30' & exit 0\" &) ; "
+                    + $"attempt=0; while [ ! -s \"{pidFile}\" ] && [ \"$attempt\" -lt 500 ]; do attempt=$((attempt + 1)); sleep 0.01; done; test -s \"{pidFile}\""
                 ]);
             Assert.False(LinuxProcessSupervisor.IdentityMatches(
                 supervisor.SupervisorIdentity.ProcessId,
                 supervisor.SupervisorIdentity.StartTime + 1));
 
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
             await supervisor.Process.WaitForExitAsync(timeout.Token);
             Assert.True(File.Exists(pidFile));
             var detachedPid = int.Parse(await File.ReadAllTextAsync(pidFile, TestContext.Current.CancellationToken));
