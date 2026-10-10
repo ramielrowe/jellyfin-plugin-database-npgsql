@@ -116,11 +116,92 @@ public sealed class ReleaseContractTests
 
         var sourcePhase = script.IndexOf("restore_without_build_servers \"$SOLUTION\"", StringComparison.Ordinal);
         var relocation = script.IndexOf("relocate-isolated", StringComparison.Ordinal);
-        var relocatedPhase = script.IndexOf(
+        var relocatedRestore = script.IndexOf(
             "restore_without_build_servers \"$RELOCATED/Jellyfin.Plugin.Database.Npgsql.slnx\"",
             StringComparison.Ordinal);
+        var firstMetadataAssertion = script.IndexOf(MetadataAssertion, StringComparison.Ordinal);
+        var relocatedBuild = script.IndexOf(
+            "build_without_build_servers \"$RELOCATED/Jellyfin.Plugin.Database.Npgsql.slnx\"",
+            StringComparison.Ordinal);
+        var blackBox = script.IndexOf("\"$RELOCATED/tests/black-box-smoke.sh\"", StringComparison.Ordinal);
+        var finalMetadataAssertion = script.LastIndexOf(MetadataAssertion, StringComparison.Ordinal);
+        var broadPathScan = script.IndexOf("path_leaks=$(rg", StringComparison.Ordinal);
+        var success = script.IndexOf("echo \"Release verification passed:", StringComparison.Ordinal);
+        var cleanupTrap = script.IndexOf("trap cleanup EXIT", StringComparison.Ordinal);
+
+        string[] relocatedArtifactOperations =
+        [
+            "build_without_build_servers \"$RELOCATED/Jellyfin.Plugin.Database.Npgsql.slnx\"",
+            "msbuild_without_build_servers \"$RELOCATED/build/Package.proj\"",
+            "dotnet test --project \"$RELOCATED/tests/Jellyfin.Plugin.Database.Npgsql.UnitTests",
+            "dotnet test --project \"$RELOCATED/tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests",
+            "python3 -m unittest discover -s \"$RELOCATED/tests/scripts\"",
+            "--project \"$RELOCATED/Jellyfin.Plugin.Database.Npgsql.slnx\"",
+            "python3 \"$RELOCATED/scripts/audit-vulnerabilities.py\"",
+            "STANDALONE_RELOCATED_COPY=true",
+            "relocated_hash=$(hash_file",
+            "relocated_symbol_hash=$(hash_file",
+            "\"$RELOCATED/tests/black-box-smoke.sh\"",
+        ];
+
         Assert.True(sourcePhase >= 0 && sourcePhase < relocation);
-        Assert.True(relocation < relocatedPhase);
+        Assert.True(relocation < relocatedRestore);
+        Assert.Contains(
+            "restore_without_build_servers \"$RELOCATED/Jellyfin.Plugin.Database.Npgsql.slnx\" --locked-mode\n" + MetadataAssertion,
+            script,
+            StringComparison.Ordinal);
+        Assert.True(relocatedRestore < firstMetadataAssertion);
+        Assert.True(firstMetadataAssertion < relocatedBuild);
+        Assert.True(relocatedBuild < blackBox);
+        Assert.True(blackBox < finalMetadataAssertion);
+        Assert.True(finalMetadataAssertion < broadPathScan);
+        Assert.True(broadPathScan < success);
+        Assert.True(HasFinalScansAfterBlackBox(script));
+        Assert.True(cleanupTrap >= 0 && cleanupTrap < relocatedRestore);
+        Assert.All(
+            relocatedArtifactOperations,
+            operation =>
+            {
+                var operationIndex = script.LastIndexOf(operation, StringComparison.Ordinal);
+                Assert.True(operationIndex > firstMetadataAssertion, $"Missing or misplaced relocated operation: {operation}");
+                Assert.True(operationIndex < finalMetadataAssertion, $"Relocated operation runs after final metadata scan: {operation}");
+            });
+        Assert.DoesNotContain(
+            "\"$RELOCATED/tests/black-box-smoke.sh\"",
+            script[(finalMetadataAssertion + MetadataAssertion.Length)..success],
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ReleaseVerifierRejectsThePriorPrematureFinalScanOrdering()
+    {
+        var root = FindRepositoryRoot();
+        var script = File.ReadAllText(Path.Combine(root, "scripts", "verify-release.sh"));
+        const string BlackBoxBlock =
+            "if [ \"${RUN_BLACK_BOX:-false}\" = true ]; then\n" +
+            "    \"$RELOCATED/tests/black-box-smoke.sh\"\n" +
+            "fi\n\n";
+        const string Success = "echo \"Release verification passed:";
+
+        Assert.Contains(BlackBoxBlock, script, StringComparison.Ordinal);
+        var priorOrdering = script.Replace(BlackBoxBlock, string.Empty, StringComparison.Ordinal);
+        priorOrdering = priorOrdering.Replace(Success, BlackBoxBlock + Success, StringComparison.Ordinal);
+
+        Assert.False(HasFinalScansAfterBlackBox(priorOrdering));
+    }
+
+    private static bool HasFinalScansAfterBlackBox(string script)
+    {
+        const string MetadataAssertion = "assert_relocated_obj_metadata \"$ORIGINAL_CHECKOUT\" \"$RELOCATED\"";
+        var blackBox = script.IndexOf("\"$RELOCATED/tests/black-box-smoke.sh\"", StringComparison.Ordinal);
+        var finalMetadataAssertion = script.LastIndexOf(MetadataAssertion, StringComparison.Ordinal);
+        var broadPathScan = script.IndexOf("path_leaks=$(rg", StringComparison.Ordinal);
+        var success = script.IndexOf("echo \"Release verification passed:", StringComparison.Ordinal);
+
+        return blackBox >= 0 &&
+            blackBox < finalMetadataAssertion &&
+            finalMetadataAssertion < broadPathScan &&
+            broadPathScan < success;
     }
 
     private static string FindRepositoryRoot()

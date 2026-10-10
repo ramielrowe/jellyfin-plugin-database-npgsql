@@ -145,6 +145,10 @@ relocated_symbol_hash=$(hash_file "$RELOCATED_HARNESS" "$RELOCATED/artifacts/sym
 [ "$source_symbol_hash" = "$relocated_symbol_hash" ] \
     || { echo "FAIL: relocated PDB $relocated_symbol_hash differs from source PDB $source_symbol_hash" >&2; exit 1; }
 
+if [ "${RUN_BLACK_BOX:-false}" = true ]; then
+    "$RELOCATED/tests/black-box-smoke.sh"
+fi
+
 assert_relocated_obj_metadata "$ORIGINAL_CHECKOUT" "$RELOCATED"
 path_leaks=$(rg --hidden --no-ignore -a -l -F "$ORIGINAL_CHECKOUT" \
     --glob '!.dotnet-cli/**' \
@@ -157,10 +161,6 @@ if [ -n "$path_leaks" ]; then
     done <<<"$path_leaks"
     echo "FAIL: isolated source/build/artifacts contain a path back to the original checkout" >&2
     exit 1
-fi
-
-if [ "${RUN_BLACK_BOX:-false}" = true ]; then
-    "$RELOCATED/tests/black-box-smoke.sh"
 fi
 
 echo "Release verification passed: isolated reproducible ZIP SHA-256 $first_hash and PDB SHA-256 $source_symbol_hash"
