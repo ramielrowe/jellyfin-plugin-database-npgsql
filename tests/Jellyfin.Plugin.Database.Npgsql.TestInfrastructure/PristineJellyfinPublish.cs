@@ -177,34 +177,7 @@ public sealed class PristineJellyfinPublish
     }
 
     public static async Task<string> HashDirectoryAsync(string directory, CancellationToken cancellationToken)
-    {
-        var root = Path.GetFullPath(directory);
-        if (!Directory.Exists(root))
-        {
-            throw new DirectoryNotFoundException("The Jellyfin publish directory was not found.");
-        }
-
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
-                     .OrderBy(path => Path.GetRelativePath(root, path), StringComparer.Ordinal))
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var relativePath = Path.GetRelativePath(root, file).Replace(Path.DirectorySeparatorChar, '/');
-            hash.AppendData(Encoding.UTF8.GetBytes(relativePath));
-            hash.AppendData(new byte[] { 0 });
-            await using var stream = File.OpenRead(file);
-            var buffer = new byte[64 * 1024];
-            int count;
-            while ((count = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) != 0)
-            {
-                hash.AppendData(buffer, 0, count);
-            }
-
-            hash.AppendData(new byte[] { 0 });
-        }
-
-        return Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant();
-    }
+        => await SafeHostPublishStager.HashDirectoryAsync(directory, cancellationToken).ConfigureAwait(false);
 
     public static async Task<string> HashFileAsync(string path, CancellationToken cancellationToken)
     {

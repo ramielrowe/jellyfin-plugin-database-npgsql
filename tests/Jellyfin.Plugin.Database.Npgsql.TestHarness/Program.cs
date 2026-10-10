@@ -37,8 +37,37 @@ if (args.Length == 2 && args[0] == "delete-isolated-artifacts")
     {
         var ownedRoot = Path.GetFullPath(args[1]);
         RequireIsolatedTemporaryRoot(ownedRoot);
+        RequireRealOwnedRoot(ownedRoot);
         await VerifyOwnershipMarkerAsync(ownedRoot).ConfigureAwait(false);
         Directory.Delete(ownedRoot, recursive: true);
+        return 0;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        return 1;
+    }
+}
+
+if (args.Length == 5 && args[0] == "stage-host-publish")
+{
+    try
+    {
+        var source = Path.GetFullPath(args[1]);
+        var ownedRoot = Path.GetFullPath(args[2]);
+        var destinationName = args[3];
+        if (destinationName is not ("host-publish-input" or "unsupported-host-publish-input"))
+        {
+            throw new InvalidOperationException("The staged host destination name is not allowlisted.");
+        }
+
+        RequireIsolatedTemporaryRoot(ownedRoot);
+        RequireRealOwnedRoot(ownedRoot);
+        await VerifyOwnershipMarkerAsync(ownedRoot).ConfigureAwait(false);
+        var destination = Path.Combine(ownedRoot, destinationName);
+        RequireDirectChild(ownedRoot, destination);
+        await SafeHostPublishStager.StageAsync(source, destination, args[4], CancellationToken.None).ConfigureAwait(false);
+        Console.WriteLine(destination);
         return 0;
     }
     catch (Exception ex)
@@ -177,6 +206,7 @@ if (args.Length != 2 || args[0] is not ("hash-publish" or "hash-archive"))
     Console.Error.WriteLine("   or: dotnet run --project tests/Jellyfin.Plugin.Database.Npgsql.TestHarness -- relocate-isolated <source> <isolated-temp-root>");
     Console.Error.WriteLine("   or: dotnet run --project tests/Jellyfin.Plugin.Database.Npgsql.TestHarness -- delete-owned-artifacts <source> <owned-artifact-root>");
     Console.Error.WriteLine("   or: dotnet run --project tests/Jellyfin.Plugin.Database.Npgsql.TestHarness -- delete-isolated-artifacts <isolated-temp-root>");
+    Console.Error.WriteLine("   or: dotnet run --project tests/Jellyfin.Plugin.Database.Npgsql.TestHarness -- stage-host-publish <source> <isolated-temp-root> <host-publish-input|unsupported-host-publish-input> <sha256>");
     return 2;
 }
 
@@ -241,6 +271,17 @@ static bool IsLowercaseHex(ReadOnlySpan<char> value)
     return true;
 }
 
+static void RequireRealOwnedRoot(string ownedRoot)
+{
+    var ownedRootInfo = new DirectoryInfo(ownedRoot);
+    if (!ownedRootInfo.Exists
+        || ownedRootInfo.LinkTarget is not null
+        || (ownedRootInfo.Attributes & FileAttributes.ReparsePoint) != 0)
+    {
+        throw new InvalidOperationException("The marker-owned root must be a real directory, not a symbolic link.");
+    }
+}
+
 static void RequireChild(string parent, string child)
 {
     var parentPrefix = Path.TrimEndingDirectorySeparator(Path.GetFullPath(parent)) + Path.DirectorySeparatorChar;
@@ -248,6 +289,17 @@ static void RequireChild(string parent, string child)
         || string.Equals(child, parentPrefix, StringComparison.Ordinal))
     {
         throw new InvalidOperationException("The owned artifact directory must be below the repository .artifacts directory.");
+    }
+}
+
+static void RequireDirectChild(string parent, string child)
+{
+    var parentPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(parent));
+    var childPath = Path.TrimEndingDirectorySeparator(Path.GetFullPath(child));
+    var comparison = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+    if (!string.Equals(Path.GetDirectoryName(childPath), parentPath, comparison))
+    {
+        throw new InvalidOperationException("The staged host publish must be a direct child of the marker-owned root.");
     }
 }
 

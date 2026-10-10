@@ -306,6 +306,199 @@ public sealed class TestInfrastructureTests
     }
 
     [Fact]
+    public async Task SafeHostPublishStager_RejectsRootAndNestedLinksAndSpecialNodes()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var tempRoot = CreateTemporaryDirectory();
+        try
+        {
+            var source = Path.Combine(tempRoot, "source");
+            Directory.CreateDirectory(source);
+            await File.WriteAllTextAsync(Path.Combine(source, "jellyfin.dll"), "host", TestContext.Current.CancellationToken);
+            var hash = await SafeHostPublishStager.HashDirectoryAsync(source, TestContext.Current.CancellationToken);
+
+            var rootLink = Path.Combine(tempRoot, "root-link");
+            Directory.CreateSymbolicLink(rootLink, source);
+            var rootException = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => SafeHostPublishStager.StageAsync(
+                    rootLink,
+                    Path.Combine(tempRoot, "root-link-copy"),
+                    hash,
+                    TestContext.Current.CancellationToken));
+            Assert.Contains("symbolic link", rootException.Message, StringComparison.OrdinalIgnoreCase);
+
+            var nestedLink = Path.Combine(source, "nested-link");
+            File.CreateSymbolicLink(nestedLink, Path.Combine(source, "jellyfin.dll"));
+            var nestedException = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => SafeHostPublishStager.StageAsync(
+                    source,
+                    Path.Combine(tempRoot, "nested-link-copy"),
+                    hash,
+                    TestContext.Current.CancellationToken));
+            Assert.Contains("symbolic link", nestedException.Message, StringComparison.OrdinalIgnoreCase);
+            File.Delete(nestedLink);
+
+            var fifo = Path.Combine(source, "unexpected-pipe");
+            var mkfifo = await ExternalCommand.RunAsync(
+                "/usr/bin/mkfifo",
+                [fifo],
+                TimeSpan.FromSeconds(5),
+                TestContext.Current.CancellationToken);
+            Assert.Equal(0, mkfifo.ExitCode);
+            var fifoException = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => SafeHostPublishStager.StageAsync(
+                    source,
+                    Path.Combine(tempRoot, "fifo-copy"),
+                    hash,
+                    TestContext.Current.CancellationToken));
+            Assert.Contains("special filesystem node", fifoException.Message, StringComparison.Ordinal);
+            Assert.False(Directory.Exists(Path.Combine(tempRoot, "fifo-copy")));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SafeHostPublishStager_RejectsOverlapBadHashAndPostValidationMutationBeforeCopying()
+    {
+        var tempRoot = CreateTemporaryDirectory();
+        try
+        {
+            var source = Path.Combine(tempRoot, "source");
+            Directory.CreateDirectory(source);
+            var assembly = Path.Combine(source, "jellyfin.dll");
+            await File.WriteAllTextAsync(assembly, "host", TestContext.Current.CancellationToken);
+            var sentinel = Path.Combine(source, "large-sentinel.bin");
+            await using (var stream = new FileStream(sentinel, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                stream.SetLength(32L * 1024 * 1024);
+            }
+
+            var hash = await SafeHostPublishStager.HashDirectoryAsync(source, TestContext.Current.CancellationToken);
+            var overlapException = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => SafeHostPublishStager.StageAsync(
+                    source,
+                    Path.Combine(source, "escaped-copy"),
+                    hash,
+                    TestContext.Current.CancellationToken));
+            Assert.Contains("must not overlap", overlapException.Message, StringComparison.Ordinal);
+            Assert.False(Directory.Exists(Path.Combine(source, "escaped-copy")));
+
+            var badHashDestination = Path.Combine(tempRoot, "bad-hash-copy");
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => SafeHostPublishStager.StageAsync(
+                    source,
+                    badHashDestination,
+                    new string('0', 64),
+                    TestContext.Current.CancellationToken));
+            Assert.False(Directory.Exists(badHashDestination));
+
+            var racedDestination = Path.Combine(tempRoot, "raced-copy");
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => SafeHostPublishStager.StageAsync(
+                    source,
+                    racedDestination,
+                    hash,
+                    TestContext.Current.CancellationToken,
+                    () => File.WriteAllText(assembly, "evil")));
+            Assert.False(Directory.Exists(racedDestination));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task StageHostPublishCommand_NormalizesRestrictiveModesRejectsEscapeAndMarkerCleanupSucceeds()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var repository = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var helper = Path.Combine(repository, "tests", "Jellyfin.Plugin.Database.Npgsql.TestHarness", "bin", "Release", "net10.0", "Jellyfin.Plugin.Database.Npgsql.TestHarness.dll");
+        var sourceRoot = CreateTemporaryDirectory();
+        var ownedRoot = Path.Combine(Path.GetTempPath(), "jellyfin-npgsql-release-verify-" + Guid.NewGuid().ToString("N"));
+        var escapedDestination = Path.Combine(Path.GetTempPath(), "jellyfin-npgsql-stage-escape-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var nested = Path.Combine(sourceRoot, "nested");
+            Directory.CreateDirectory(nested);
+            var assembly = Path.Combine(sourceRoot, "jellyfin.dll");
+            var dependency = Path.Combine(nested, "dependency.dll");
+            await File.WriteAllTextAsync(assembly, "host", TestContext.Current.CancellationToken);
+            await File.WriteAllTextAsync(dependency, "dependency", TestContext.Current.CancellationToken);
+            var hash = await SafeHostPublishStager.HashDirectoryAsync(sourceRoot, TestContext.Current.CancellationToken);
+            File.SetUnixFileMode(sourceRoot, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+            File.SetUnixFileMode(nested, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+            File.SetUnixFileMode(assembly, UnixFileMode.UserRead);
+            File.SetUnixFileMode(dependency, UnixFileMode.UserRead);
+            Directory.CreateDirectory(ownedRoot);
+            await File.WriteAllTextAsync(
+                Path.Combine(ownedRoot, ".jellyfin-npgsql-owned-artifacts"),
+                "Owned by Jellyfin.Plugin.Database.Npgsql.TestHarness\n",
+                TestContext.Current.CancellationToken);
+
+            var escape = await ExternalCommand.RunAsync(
+                "dotnet",
+                [helper, "stage-host-publish", sourceRoot, ownedRoot, "../" + Path.GetFileName(escapedDestination), hash],
+                TimeSpan.FromSeconds(10),
+                TestContext.Current.CancellationToken);
+            Assert.NotEqual(0, escape.ExitCode);
+            Assert.False(Directory.Exists(escapedDestination));
+
+            var stage = await ExternalCommand.RunAsync(
+                "dotnet",
+                [helper, "stage-host-publish", sourceRoot, ownedRoot, "host-publish-input", hash],
+                TimeSpan.FromSeconds(30),
+                TestContext.Current.CancellationToken);
+            Assert.Equal(0, stage.ExitCode);
+            var staged = Path.Combine(ownedRoot, "host-publish-input");
+            Assert.Equal(
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute,
+                File.GetUnixFileMode(staged));
+            Assert.Equal(
+                UnixFileMode.UserRead | UnixFileMode.UserWrite,
+                File.GetUnixFileMode(Path.Combine(staged, "jellyfin.dll")));
+
+            var cleanup = await ExternalCommand.RunAsync(
+                "dotnet",
+                [helper, "delete-isolated-artifacts", ownedRoot],
+                TimeSpan.FromSeconds(30),
+                TestContext.Current.CancellationToken);
+            Assert.Equal(0, cleanup.ExitCode);
+            Assert.False(Directory.Exists(ownedRoot));
+        }
+        finally
+        {
+            if (Directory.Exists(sourceRoot))
+            {
+                File.SetUnixFileMode(sourceRoot, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                var nested = Path.Combine(sourceRoot, "nested");
+                if (Directory.Exists(nested))
+                {
+                    File.SetUnixFileMode(nested, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                }
+
+                Directory.Delete(sourceRoot, recursive: true);
+            }
+
+            if (Directory.Exists(ownedRoot))
+            {
+                Directory.Delete(ownedRoot, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
     public async Task PristinePublish_RejectsArchiveMutationDuringExtractionWindow()
     {
         var tempRoot = CreateTemporaryDirectory();

@@ -124,7 +124,7 @@ public sealed class ReleaseContractTests
             "build_without_build_servers \"$RELOCATED/Jellyfin.Plugin.Database.Npgsql.slnx\"",
             StringComparison.Ordinal);
         var stagedHostPublish = script.IndexOf(
-            "cp --archive --no-target-directory -- \"$JELLYFIN_HOST_PUBLISH\" \"$STAGED_HOST_PUBLISH\"",
+            "stage-host-publish \\",
             StringComparison.Ordinal);
         var blackBox = script.IndexOf("\"$RELOCATED/tests/black-box-smoke.sh\"", StringComparison.Ordinal);
         var finalMetadataAssertion = script.LastIndexOf(MetadataAssertion, StringComparison.Ordinal);
@@ -144,8 +144,7 @@ public sealed class ReleaseContractTests
             "STANDALONE_RELOCATED_COPY=true",
             "relocated_hash=$(hash_file",
             "relocated_symbol_hash=$(hash_file",
-            "cp --archive --no-target-directory -- \"$JELLYFIN_HOST_PUBLISH\"",
-            "cp --archive --no-target-directory -- \"$UNSUPPORTED_JELLYFIN_HOST_PUBLISH\"",
+            "stage-host-publish \\",
             "\"$RELOCATED/tests/black-box-smoke.sh\"",
         ];
 
@@ -164,6 +163,9 @@ public sealed class ReleaseContractTests
         Assert.True(broadPathScan < success);
         Assert.True(HasFinalScansAfterBlackBox(script));
         Assert.True(cleanupTrap >= 0 && cleanupTrap < relocatedRestore);
+        Assert.DoesNotContain("cp --archive", script, StringComparison.Ordinal);
+        Assert.Contains("${JELLYFIN_HOST_SHA256:-}", script, StringComparison.Ordinal);
+        Assert.Contains("${UNSUPPORTED_JELLYFIN_HOST_SHA256:-}", script, StringComparison.Ordinal);
         Assert.All(
             relocatedArtifactOperations,
             operation =>

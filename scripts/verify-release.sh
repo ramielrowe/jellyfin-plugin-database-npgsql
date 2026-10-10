@@ -147,13 +147,19 @@ relocated_symbol_hash=$(hash_file "$RELOCATED_HARNESS" "$RELOCATED/artifacts/sym
 
 if [ "${RUN_BLACK_BOX:-false}" = true ]; then
     if [ -n "${JELLYFIN_HOST_PUBLISH:-}" ]; then
-        STAGED_HOST_PUBLISH="$OWNED_ROOT/host-publish-input"
-        cp --archive --no-target-directory -- "$JELLYFIN_HOST_PUBLISH" "$STAGED_HOST_PUBLISH"
+        STAGED_HOST_PUBLISH=$(dotnet "$ISOLATED_CLEANER" stage-host-publish \
+            "$JELLYFIN_HOST_PUBLISH" \
+            "$OWNED_ROOT" \
+            host-publish-input \
+            "${JELLYFIN_HOST_SHA256:-}")
         export JELLYFIN_HOST_PUBLISH="$STAGED_HOST_PUBLISH"
     fi
     if [ -n "${UNSUPPORTED_JELLYFIN_HOST_PUBLISH:-}" ]; then
-        STAGED_UNSUPPORTED_HOST_PUBLISH="$OWNED_ROOT/unsupported-host-publish-input"
-        cp --archive --no-target-directory -- "$UNSUPPORTED_JELLYFIN_HOST_PUBLISH" "$STAGED_UNSUPPORTED_HOST_PUBLISH"
+        STAGED_UNSUPPORTED_HOST_PUBLISH=$(dotnet "$ISOLATED_CLEANER" stage-host-publish \
+            "$UNSUPPORTED_JELLYFIN_HOST_PUBLISH" \
+            "$OWNED_ROOT" \
+            unsupported-host-publish-input \
+            "${UNSUPPORTED_JELLYFIN_HOST_SHA256:-}")
         export UNSUPPORTED_JELLYFIN_HOST_PUBLISH="$STAGED_UNSUPPORTED_HOST_PUBLISH"
     fi
     "$RELOCATED/tests/black-box-smoke.sh"
