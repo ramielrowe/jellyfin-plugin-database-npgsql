@@ -233,10 +233,29 @@ public sealed class ReleaseContractTests
         Assert.True(login < push);
         Assert.True(push < attest);
         Assert.DoesNotContain("$GITHUB_ENV", publish, StringComparison.Ordinal);
+        Assert.Contains("index:org.opencontainers.image.source=", publish, StringComparison.Ordinal);
+        Assert.Contains("index:org.opencontainers.image.description=", publish, StringComparison.Ordinal);
+        Assert.Contains("index:org.opencontainers.image.licenses=GPL-3.0-only", publish, StringComparison.Ordinal);
         Assert.Contains(
             "DOCKER_CONFIG=\"$anonymous_config\" docker buildx imagetools inspect",
             publish,
             StringComparison.Ordinal);
+        Assert.Contains("EXPECTED_DIGEST: ${{ steps.push.outputs.digest }}", publish, StringComparison.Ordinal);
+        Assert.Contains("--format '{{json .Manifest}}'", publish, StringComparison.Ordinal);
+        Assert.Contains("[[ \"$actual_digest\" != \"$EXPECTED_DIGEST\" ]]", publish, StringComparison.Ordinal);
+        Assert.Contains("verify_anonymous_ref \"$IMAGE_NAME:$version\"", publish, StringComparison.Ordinal);
+        Assert.Contains("verify_anonymous_ref \"$IMAGE_NAME:sha-$short_sha\"", publish, StringComparison.Ordinal);
+        Assert.Contains("verify_anonymous_ref \"$IMAGE_NAME:latest\"", publish, StringComparison.Ordinal);
+        Assert.Contains("verify_anonymous_ref \"$IMAGE_NAME@$EXPECTED_DIGEST\"", publish, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ContinuousIntegrationRunsOnTheDefaultBranch()
+    {
+        var root = FindRepositoryRoot();
+        var workflow = File.ReadAllText(Path.Combine(root, ".github", "workflows", "ci.yml"));
+
+        Assert.Contains("branches: [main, master]", workflow, StringComparison.Ordinal);
     }
 
     private static bool HasFinalScansAfterBlackBox(string script)

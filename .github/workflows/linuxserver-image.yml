@@ -152,6 +152,10 @@ jobs:
           tags: ${{ steps.release.outputs.tags }}
           cache-from: type=gha,scope=linuxserver-image
           cache-to: type=gha,mode=max,scope=linuxserver-image
+          annotations: |
+            index:org.opencontainers.image.source=https://github.com/ramielrowe/jellyfin-plugin-database-npgsql
+            index:org.opencontainers.image.description=Unofficial LinuxServer.io Jellyfin derivative with the Npgsql database provider pre-installed
+            index:org.opencontainers.image.licenses=GPL-3.0-only
           sbom: true
           provenance: mode=max
       - name: Attest published image
@@ -161,6 +165,8 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
       - name: Verify anonymous tag and digest access
+        env:
+          EXPECTED_DIGEST: ${{ steps.push.outputs.digest }}
         shell: bash
         run: |
           set -euo pipefail
@@ -168,5 +174,18 @@ jobs:
           anonymous_config=$(mktemp -d "$RUNNER_TEMP/docker-anonymous.XXXXXX")
           trap 'rm -rf -- "$anonymous_config"' EXIT
           version=$(jq -er '.version' build/release-policy.json)
-          DOCKER_CONFIG="$anonymous_config" docker buildx imagetools inspect "$IMAGE_NAME:$version" >/dev/null
-          DOCKER_CONFIG="$anonymous_config" docker buildx imagetools inspect "$IMAGE_NAME@${{ steps.push.outputs.digest }}" >/dev/null
+          short_sha=${GITHUB_SHA:0:12}
+          verify_anonymous_ref() {
+            local reference=$1 actual_digest
+            actual_digest=$(DOCKER_CONFIG="$anonymous_config" docker buildx imagetools inspect \
+              "$reference" --format '{{json .Manifest}}' | jq -er '.digest')
+            if [[ "$actual_digest" != "$EXPECTED_DIGEST" ]]; then
+              printf 'published reference %s resolved to %s, expected %s\n' \
+                "$reference" "$actual_digest" "$EXPECTED_DIGEST" >&2
+              return 1
+            fi
+          }
+          verify_anonymous_ref "$IMAGE_NAME:$version"
+          verify_anonymous_ref "$IMAGE_NAME:sha-$short_sha"
+          verify_anonymous_ref "$IMAGE_NAME:latest"
+          verify_anonymous_ref "$IMAGE_NAME@$EXPECTED_DIGEST"

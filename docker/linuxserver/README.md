@@ -23,9 +23,10 @@ Images are published to:
 ghcr.io/ramielrowe/jellyfin-plugin-database-npgsql-linuxserver
 ```
 
-A published release has three tags: the immutable plugin version (for example
-`0.1.0.0`), `sha-<12-character-commit>`, and `latest`. Production deployments
-should resolve the version tag once and then pull by digest:
+A published release has three tags: the plugin version (for example `0.1.0.0`),
+`sha-<12-character-commit>`, and `latest`. Registry tags can be moved by a
+subsequent publish, so production deployments should resolve a tag once and
+then pull by its immutable digest:
 
 ```sh
 docker pull ghcr.io/ramielrowe/jellyfin-plugin-database-npgsql-linuxserver:0.1.0.0

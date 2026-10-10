@@ -12,9 +12,10 @@ ghcr.io/ramielrowe/jellyfin-plugin-database-npgsql-seed
 ```
 
 Release tags are the plugin version, `sha-<12-character-commit>`, and `latest`.
-Resolve a release tag once and deploy its immutable digest. The first package
-published to GHCR must be made public in the repository package settings; the
-release workflow deliberately fails its anonymous-access check until it is.
+Registry tags can be moved by a subsequent publish, so resolve a release tag
+once and deploy its immutable digest. The first package published to GHCR must
+be made public in the repository package settings; the release workflow
+deliberately fails its anonymous-access check until it is.
 
 ## Deployment contract
 
