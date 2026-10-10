@@ -532,6 +532,113 @@ public sealed class TestInfrastructureTests
     }
 
     [Fact]
+    public async Task SafeHostPublishStager_RejectsTemporaryDirectoryReplacementBeforeOpeningWithoutTouchingIt()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var tempRoot = CreateTemporaryDirectory();
+        try
+        {
+            var source = Path.Combine(tempRoot, "source");
+            Directory.CreateDirectory(source);
+            await File.WriteAllTextAsync(Path.Combine(source, "jellyfin.dll"), "host", TestContext.Current.CancellationToken);
+            var hash = await SafeHostPublishStager.HashDirectoryAsync(source, TestContext.Current.CancellationToken);
+            var ownedRoot = Path.Combine(tempRoot, "owned");
+            await CreateOwnedArtifactRootAsync(ownedRoot);
+            var destination = Path.Combine(ownedRoot, "host-publish-input");
+            string? replacedPath = null;
+            string? replacementSentinel = null;
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => SafeHostPublishStager.StageAsync(
+                    source,
+                    destination,
+                    hash,
+                    TestContext.Current.CancellationToken,
+                    openingTemporaryDirectoryForTest: () =>
+                    {
+                        var temporaryPath = Assert.Single(
+                            Directory.EnumerateDirectories(ownedRoot, ".host-publish-stage-*", SearchOption.TopDirectoryOnly));
+                        replacedPath = temporaryPath + "-original";
+                        Directory.Move(temporaryPath, replacedPath);
+                        Directory.CreateDirectory(temporaryPath);
+                        replacementSentinel = Path.Combine(temporaryPath, "attacker-sentinel.txt");
+                        File.WriteAllText(replacementSentinel, "do not touch");
+                    }));
+
+            Assert.Contains("changed identity", exception.Message, StringComparison.Ordinal);
+            Assert.False(Directory.Exists(destination));
+            Assert.NotNull(replacedPath);
+            Assert.True(Directory.Exists(replacedPath));
+            Assert.Empty(Directory.EnumerateFileSystemEntries(replacedPath));
+            Assert.NotNull(replacementSentinel);
+            Assert.Equal("do not touch", await File.ReadAllTextAsync(replacementSentinel, TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SafeHostPublishStager_RejectsTemporaryDirectoryReplacementImmediatelyBeforePublishWithoutTouchingIt()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var tempRoot = CreateTemporaryDirectory();
+        try
+        {
+            var source = Path.Combine(tempRoot, "source");
+            Directory.CreateDirectory(source);
+            await File.WriteAllTextAsync(Path.Combine(source, "jellyfin.dll"), "host", TestContext.Current.CancellationToken);
+            await File.WriteAllTextAsync(Path.Combine(source, "dependency.dll"), "dependency", TestContext.Current.CancellationToken);
+            var hash = await SafeHostPublishStager.HashDirectoryAsync(source, TestContext.Current.CancellationToken);
+            var ownedRoot = Path.Combine(tempRoot, "owned");
+            await CreateOwnedArtifactRootAsync(ownedRoot);
+            var destination = Path.Combine(ownedRoot, "host-publish-input");
+            string? replacedPath = null;
+            string? replacementSentinel = null;
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => SafeHostPublishStager.StageAsync(
+                    source,
+                    destination,
+                    hash,
+                    TestContext.Current.CancellationToken,
+                    publishingTemporaryDirectoryForTest: () =>
+                    {
+                        var temporaryPath = Assert.Single(
+                            Directory.EnumerateDirectories(ownedRoot, ".host-publish-stage-*", SearchOption.TopDirectoryOnly));
+                        replacedPath = temporaryPath + "-original";
+                        Directory.Move(temporaryPath, replacedPath);
+                        Directory.CreateDirectory(temporaryPath);
+                        replacementSentinel = Path.Combine(temporaryPath, "attacker-sentinel.txt");
+                        File.WriteAllText(replacementSentinel, "do not touch");
+                    }));
+
+            Assert.Contains("changed identity", exception.Message, StringComparison.Ordinal);
+            Assert.False(Directory.Exists(destination));
+            Assert.NotNull(replacedPath);
+            Assert.True(Directory.Exists(replacedPath));
+            Assert.Equal(
+                ["dependency.dll", "jellyfin.dll"],
+                Directory.EnumerateFiles(replacedPath).Select(Path.GetFileName).Order(StringComparer.Ordinal).ToArray());
+            Assert.NotNull(replacementSentinel);
+            Assert.Equal("do not touch", await File.ReadAllTextAsync(replacementSentinel, TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task SafeHostPublishStager_ContainsConcurrentIntermediateSourceAndDestinationLinkSwaps()
     {
         if (!OperatingSystem.IsLinux())

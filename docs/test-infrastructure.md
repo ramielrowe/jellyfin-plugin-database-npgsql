@@ -184,4 +184,10 @@ requires `JELLYFIN_HOST_PUBLISH` and a 64-hex `JELLYFIN_HOST_SHA256`, and copies
 the publish into its marker-owned isolated root using `openat2` beneath
 directory descriptors. Intermediate symbolic-link swaps cannot escape the
 source root, the completed directory is published with a no-replace rename, and
-partial cleanup enumerates descriptors without following links.
+partial cleanup enumerates descriptors without following links. The stager
+records the temporary directory's device and inode when it creates it, requires
+the descriptor opened by name to have that exact identity before copying, and
+revalidates the pathname against that descriptor immediately before and after
+publication. Cleanup only traverses that validated descriptor and only removes
+a pathname whose identity still matches, so a swapped-in directory is neither
+copied, published successfully, nor deleted.

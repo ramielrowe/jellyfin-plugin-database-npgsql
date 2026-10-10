@@ -28,7 +28,8 @@ public static class SafeHostPublishStager
         string expectedSha256,
         CancellationToken cancellationToken,
         Action? inputVerifiedForTest = null,
-        Action? openingTemporaryDirectoryForTest = null)
+        Action? openingTemporaryDirectoryForTest = null,
+        Action? publishingTemporaryDirectoryForTest = null)
     {
         RequireLinux();
         ValidateExpectedHash(expectedSha256);
@@ -59,16 +60,19 @@ public static class SafeHostPublishStager
         var temporaryName = ".host-publish-stage-" + Guid.NewGuid().ToString("N");
         SafeFileHandle? temporaryRoot = null;
         FileIdentity? temporaryIdentity = null;
-        var temporaryExists = false;
+        var temporaryDescriptorValidated = false;
+        string? cleanupName = null;
         try
         {
             CreateDirectoryAt(ownedRoot, temporaryName);
-            temporaryExists = true;
+            cleanupName = temporaryName;
             var temporaryStatus = InspectEntryAt(ownedRoot, temporaryName);
             RequireDirectory(temporaryStatus, temporaryName);
             temporaryIdentity = temporaryStatus.Identity;
             openingTemporaryDirectoryForTest?.Invoke();
             temporaryRoot = OpenDirectoryAt(ownedRoot, temporaryName);
+            RequireSameDirectory(InspectDescriptor(temporaryRoot), temporaryIdentity.Value, temporaryName);
+            temporaryDescriptorValidated = true;
             SetMode(temporaryRoot, DirectoryMode);
             foreach (var directory in sourceManifest.Directories)
             {
@@ -107,20 +111,40 @@ public static class SafeHostPublishStager
             }
 
             EnsureHash(expectedSha256, stagedManifest.Hash, "Staged Jellyfin host publish");
+            publishingTemporaryDirectoryForTest?.Invoke();
+            RequireNamedDirectoryMatchesDescriptor(
+                ownedRoot,
+                temporaryName,
+                temporaryRoot,
+                temporaryIdentity.Value,
+                "staged Jellyfin host publish temporary directory");
             EnsureMissing(ownedRoot, destinationName);
             RenameNoReplace(ownedRoot, temporaryName, destinationName);
-            temporaryExists = false;
+            cleanupName = destinationName;
+            using var publishedRoot = OpenDirectoryAt(ownedRoot, destinationName);
+            RequireNamedDirectoryMatchesDescriptor(
+                ownedRoot,
+                destinationName,
+                publishedRoot,
+                temporaryIdentity.Value,
+                "published Jellyfin host directory");
+            cleanupName = null;
         }
         finally
         {
-            if (temporaryExists && temporaryIdentity is not null)
+            if (cleanupName is not null && temporaryIdentity is not null)
             {
-                if (temporaryRoot is not null)
+                var cleanupStatus = TryInspectEntryAt(ownedRoot, cleanupName);
+                if (temporaryRoot is not null
+                    && temporaryDescriptorValidated
+                    && InspectDescriptor(temporaryRoot).Identity == temporaryIdentity.Value
+                    && cleanupStatus is { Kind: NodeKind.Directory }
+                    && cleanupStatus.Value.Identity == temporaryIdentity.Value)
                 {
                     DeleteContentsWithoutFollowingLinks(temporaryRoot);
                 }
 
-                TryRemoveExactDirectory(ownedRoot, temporaryName, temporaryIdentity.Value);
+                TryRemoveExactDirectory(ownedRoot, cleanupName, temporaryIdentity.Value);
             }
 
             temporaryRoot?.Dispose();
@@ -524,6 +548,26 @@ public static class SafeHostPublishStager
         {
             throw new InvalidOperationException($"The {description} is not a real directory.");
         }
+    }
+
+    private static void RequireSameDirectory(DescriptorStatus status, FileIdentity expectedIdentity, string description)
+    {
+        RequireDirectory(status, description);
+        if (status.Identity != expectedIdentity)
+        {
+            throw new InvalidOperationException($"The {description} changed identity while the Jellyfin host publish was staged.");
+        }
+    }
+
+    private static void RequireNamedDirectoryMatchesDescriptor(
+        SafeFileHandle parent,
+        string name,
+        SafeFileHandle descriptor,
+        FileIdentity expectedIdentity,
+        string description)
+    {
+        RequireSameDirectory(InspectDescriptor(descriptor), expectedIdentity, description);
+        RequireSameDirectory(InspectEntryAt(parent, name), expectedIdentity, description);
     }
 
     private static void RequireRegular(DescriptorStatus status, string description)
