@@ -1,6 +1,52 @@
 using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
 
 const string OwnershipMarker = ".jellyfin-npgsql-owned-artifacts";
+const string IsolatedPrefix = "jellyfin-npgsql-release-verify-";
+
+if (args.Length == 3 && args[0] == "relocate-isolated")
+{
+    var ownedRoot = Path.GetFullPath(args[2]);
+    var createdRoot = false;
+    try
+    {
+        var source = Path.GetFullPath(args[1]);
+        RequireIsolatedTemporaryRoot(ownedRoot);
+        await CreateOwnedRootUncheckedAsync(ownedRoot).ConfigureAwait(false);
+        createdRoot = true;
+        CopyStandalone(source, Path.Combine(ownedRoot, "repository"));
+        CopyDirectoryExactly(AppContext.BaseDirectory, Path.Combine(ownedRoot, "cleanup-tool"));
+        Console.WriteLine(Path.Combine(ownedRoot, "repository"));
+        return 0;
+    }
+    catch (Exception ex)
+    {
+        if (createdRoot && Directory.Exists(ownedRoot))
+        {
+            await VerifyOwnershipMarkerAsync(ownedRoot).ConfigureAwait(false);
+            Directory.Delete(ownedRoot, recursive: true);
+        }
+
+        Console.Error.WriteLine(ex.Message);
+        return 1;
+    }
+}
+
+if (args.Length == 2 && args[0] == "delete-isolated-artifacts")
+{
+    try
+    {
+        var ownedRoot = Path.GetFullPath(args[1]);
+        RequireIsolatedTemporaryRoot(ownedRoot);
+        await VerifyOwnershipMarkerAsync(ownedRoot).ConfigureAwait(false);
+        Directory.Delete(ownedRoot, recursive: true);
+        return 0;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        return 1;
+    }
+}
 
 if (args.Length == 3 && args[0] is "create-owned-artifacts" or "relocate-standalone")
 {
@@ -35,16 +81,7 @@ if (args.Length == 3 && args[0] == "delete-owned-artifacts")
         var source = Path.GetFullPath(args[1]);
         var ownedRoot = Path.GetFullPath(args[2]);
         RequireChild(Path.Combine(source, ".artifacts"), ownedRoot);
-        var marker = Path.Combine(ownedRoot, OwnershipMarker);
-        if (!File.Exists(marker)
-            || !string.Equals(
-                await File.ReadAllTextAsync(marker, CancellationToken.None).ConfigureAwait(false),
-                "Owned by Jellyfin.Plugin.Database.Npgsql.TestHarness\n",
-                StringComparison.Ordinal))
-        {
-            throw new InvalidOperationException("Refusing to delete a directory without the exact ownership marker.");
-        }
-
+        await VerifyOwnershipMarkerAsync(ownedRoot).ConfigureAwait(false);
         Directory.Delete(ownedRoot, recursive: true);
         return 0;
     }
@@ -137,13 +174,20 @@ if (args.Length != 2 || args[0] is not ("hash-publish" or "hash-archive"))
     Console.Error.WriteLine("   or: dotnet run --project tests/Jellyfin.Plugin.Database.Npgsql.TestHarness -- cluster-lease-expect-blocked");
     Console.Error.WriteLine("   or: dotnet run --project tests/Jellyfin.Plugin.Database.Npgsql.TestHarness -- create-owned-artifacts <source> <owned-artifact-root>");
     Console.Error.WriteLine("   or: dotnet run --project tests/Jellyfin.Plugin.Database.Npgsql.TestHarness -- relocate-standalone <source> <owned-artifact-root>");
+    Console.Error.WriteLine("   or: dotnet run --project tests/Jellyfin.Plugin.Database.Npgsql.TestHarness -- relocate-isolated <source> <isolated-temp-root>");
     Console.Error.WriteLine("   or: dotnet run --project tests/Jellyfin.Plugin.Database.Npgsql.TestHarness -- delete-owned-artifacts <source> <owned-artifact-root>");
+    Console.Error.WriteLine("   or: dotnet run --project tests/Jellyfin.Plugin.Database.Npgsql.TestHarness -- delete-isolated-artifacts <isolated-temp-root>");
     return 2;
 }
 
 static async Task CreateOwnedRootAsync(string source, string ownedRoot)
 {
     RequireChild(Path.Combine(source, ".artifacts"), ownedRoot);
+    await CreateOwnedRootUncheckedAsync(ownedRoot).ConfigureAwait(false);
+}
+
+static async Task CreateOwnedRootUncheckedAsync(string ownedRoot)
+{
     if (Directory.Exists(ownedRoot) || File.Exists(ownedRoot))
     {
         throw new InvalidOperationException("The owned artifact destination must not already exist.");
@@ -154,6 +198,47 @@ static async Task CreateOwnedRootAsync(string source, string ownedRoot)
         Path.Combine(ownedRoot, ".jellyfin-npgsql-owned-artifacts"),
         "Owned by Jellyfin.Plugin.Database.Npgsql.TestHarness\n",
         CancellationToken.None).ConfigureAwait(false);
+}
+
+static async Task VerifyOwnershipMarkerAsync(string ownedRoot)
+{
+    var marker = Path.Combine(ownedRoot, OwnershipMarker);
+    if (!File.Exists(marker)
+        || !string.Equals(
+            await File.ReadAllTextAsync(marker, CancellationToken.None).ConfigureAwait(false),
+            "Owned by Jellyfin.Plugin.Database.Npgsql.TestHarness\n",
+            StringComparison.Ordinal))
+    {
+        throw new InvalidOperationException("Refusing to delete a directory without the exact ownership marker.");
+    }
+}
+
+static void RequireIsolatedTemporaryRoot(string ownedRoot)
+{
+    var temporaryRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.GetTempPath()));
+    var parent = Path.GetDirectoryName(ownedRoot);
+    var name = Path.GetFileName(ownedRoot);
+    if (!string.Equals(parent, temporaryRoot, StringComparison.Ordinal)
+        || !name.StartsWith(IsolatedPrefix, StringComparison.Ordinal)
+        || name.Length != IsolatedPrefix.Length + 32
+        || !IsLowercaseHex(name.AsSpan(IsolatedPrefix.Length)))
+    {
+        throw new InvalidOperationException(
+            $"The isolated artifact root must be a direct temporary-directory child named {IsolatedPrefix}<32 lowercase hex characters>.");
+    }
+}
+
+static bool IsLowercaseHex(ReadOnlySpan<char> value)
+{
+    foreach (var character in value)
+    {
+        if ((character < '0' || character > '9') && (character < 'a' || character > 'f'))
+        {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 static void RequireChild(string parent, string child)
@@ -178,7 +263,9 @@ static void CopyStandalone(string source, string destination)
         ".nuget-http",
         ".nuget-packages",
         ".packages",
+        ".pytest_cache",
         ".vs",
+        "__pycache__",
         "artifacts",
         "bin",
         "obj",
@@ -208,6 +295,32 @@ static void CopyStandalone(string source, string destination)
         if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
         {
             throw new InvalidOperationException($"The standalone source contains a file link: {info.Name}");
+        }
+
+        File.Copy(file, Path.Combine(destination, info.Name), overwrite: false);
+    }
+}
+
+static void CopyDirectoryExactly(string source, string destination)
+{
+    Directory.CreateDirectory(destination);
+    foreach (var directory in Directory.EnumerateDirectories(source, "*", SearchOption.TopDirectoryOnly))
+    {
+        var info = new DirectoryInfo(directory);
+        if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new InvalidOperationException($"The cleanup tool contains a directory link: {info.Name}");
+        }
+
+        CopyDirectoryExactly(directory, Path.Combine(destination, info.Name));
+    }
+
+    foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.TopDirectoryOnly))
+    {
+        var info = new FileInfo(file);
+        if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new InvalidOperationException($"The cleanup tool contains a file link: {info.Name}");
         }
 
         File.Copy(file, Path.Combine(destination, info.Name), overwrite: false);

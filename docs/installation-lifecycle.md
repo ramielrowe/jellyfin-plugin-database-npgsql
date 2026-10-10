@@ -22,7 +22,10 @@ rollback is no longer required.
 
 ## Fresh install
 
-1. Verify the ZIP against its adjacent `.zip.sha256` file.
+1. Verify the ZIP against its adjacent `.zip.sha256` file. If retaining
+   diagnostics, independently verify the portable PDB against its adjacent
+   `.pdb.sha256` file; the release audit also proves that its portable debug ID
+   matches the provider DLL.
 2. Extract all seven ZIP entries into `Npgsql Database_0.1.0.0`. Do not copy
    host-owned Jellyfin, EF Core, or Microsoft.Extensions assemblies there.
 3. Write `database.xml` atomically with `DatabaseType=PLUGIN_PROVIDER`, the exact
@@ -69,6 +72,7 @@ To recover, stop Jellyfin and either:
   and restore its matching migration snapshot when necessary; or
 - deliberately configure a different supported provider after migrating data.
 
-The portable PDB under `artifacts/symbols` is for diagnostics and is not
-installed. The ZIP contains exactly the runtime allowlist in
-`build/release-policy.json`.
+The portable PDB and its checksum under `artifacts/symbols` are for diagnostics
+and are not installed. The ZIP contains exactly the runtime allowlist in
+`build/release-policy.json`; its checksum does not cover the separately shipped
+PDB, so both sidecars must be retained and verified.

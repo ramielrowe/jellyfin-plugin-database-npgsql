@@ -10,6 +10,7 @@
 **/[Bb]in/
 **/[Oo]bj/
 **/TestResults/
+**/__pycache__/
 *.user
 *.suo
 

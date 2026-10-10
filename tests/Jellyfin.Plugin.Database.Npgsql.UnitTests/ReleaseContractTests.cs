@@ -64,9 +64,34 @@ public sealed class ReleaseContractTests
             "scripts/audit-dependencies.py",
             "scripts/audit-vulnerabilities.py",
             "scripts/verify-release.sh",
+            "tests/scripts/test_audit_vulnerabilities.py",
         };
 
         Assert.All(required, relative => Assert.True(File.Exists(Path.Combine(root, relative)), relative));
+    }
+
+    [Fact]
+    public void ReleasePolicyPinsSymbolChecksumAndVulnerabilityAuditScope()
+    {
+        var root = FindRepositoryRoot();
+        using var policy = JsonDocument.Parse(File.ReadAllText(Path.Combine(root, "build", "release-policy.json")));
+        var document = policy.RootElement;
+
+        Assert.Equal("Jellyfin.Plugin.Database.Npgsql.pdb", document.GetProperty("symbolFile").GetString());
+        Assert.Equal("Jellyfin.Plugin.Database.Npgsql.pdb.sha256", document.GetProperty("symbolChecksumFile").GetString());
+        Assert.Equal(
+            ["https://api.nuget.org/v3/index.json"],
+            document.GetProperty("vulnerabilitySources").EnumerateArray().Select(item => item.GetString()).ToArray());
+
+        var projects = document
+            .GetProperty("vulnerabilityAuditProjects")
+            .EnumerateArray()
+            .Select(item => item.GetString())
+            .ToArray();
+        Assert.Equal(8, projects.Length);
+        Assert.Equal(projects.Length, projects.Distinct(StringComparer.Ordinal).Count());
+        Assert.Contains("src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj", projects);
+        Assert.Contains("tools/Jellyfin.Plugin.Database.Npgsql.Packaging/Jellyfin.Plugin.Database.Npgsql.Packaging.csproj", projects);
     }
 
     private static string FindRepositoryRoot()

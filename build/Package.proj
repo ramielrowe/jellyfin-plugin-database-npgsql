@@ -11,6 +11,8 @@
     <SymbolsDirectory>$(ArtifactsDirectory)symbols/</SymbolsDirectory>
     <PackagePath>$(ArtifactsDirectory)jellyfin-plugin-database-npgsql_0.1.0.0.zip</PackagePath>
     <PackageChecksumPath>$(PackagePath).sha256</PackageChecksumPath>
+    <SymbolPath>$(SymbolsDirectory)Jellyfin.Plugin.Database.Npgsql.pdb</SymbolPath>
+    <SymbolChecksumPath>$(SymbolPath).sha256</SymbolChecksumPath>
   </PropertyGroup>
 
   <Target Name="CleanPackage">
@@ -51,6 +53,8 @@
     <Copy
       SourceFiles="$(PublishDirectory)Jellyfin.Plugin.Database.Npgsql.pdb"
       DestinationFolder="$(SymbolsDirectory)" />
+    <Exec
+      Command="dotnet &quot;$(PackagingTool)&quot; verify-symbols &quot;$(PublishDirectory)Jellyfin.Plugin.Database.Npgsql.dll&quot; &quot;$(SymbolPath)&quot;" />
     <ItemGroup>
       <StagedArtifact Include="$(PackageDirectory)*" />
       <ForbiddenHostAssembly Include="$(PackageDirectory)Jellyfin.Database.Implementations.dll" Condition="Exists('$(PackageDirectory)Jellyfin.Database.Implementations.dll')" />
@@ -66,7 +70,7 @@
       Condition="'@(UnexpectedArtifact)' != ''"
       Text="The staged package contains an artifact outside the release allowlist: @(UnexpectedArtifact, ', ')" />
     <Touch Files="@(StagedArtifact)" Time="2000-01-01T00:00:00Z" />
-    <Touch Files="$(SymbolsDirectory)Jellyfin.Plugin.Database.Npgsql.pdb" Time="2000-01-01T00:00:00Z" />
+    <Touch Files="$(SymbolPath)" Time="2000-01-01T00:00:00Z" />
     <Exec Command="dotnet &quot;$(PackagingTool)&quot; &quot;$(PackageDirectory)&quot; &quot;$(PackagePath)&quot;" />
     <GetFileHash Files="$(PackagePath)" Algorithm="SHA256" HashEncoding="hex">
       <Output TaskParameter="Items" ItemName="PackageHash" />
@@ -76,8 +80,17 @@
       Lines="%(PackageHash.FileHash)  $([System.IO.Path]::GetFileName('$(PackagePath)'))"
       Overwrite="true"
       WriteOnlyWhenDifferent="true" />
+    <GetFileHash Files="$(SymbolPath)" Algorithm="SHA256" HashEncoding="hex">
+      <Output TaskParameter="Items" ItemName="SymbolHash" />
+    </GetFileHash>
+    <WriteLinesToFile
+      File="$(SymbolChecksumPath)"
+      Lines="%(SymbolHash.FileHash)  $([System.IO.Path]::GetFileName('$(SymbolPath)'))"
+      Overwrite="true"
+      WriteOnlyWhenDifferent="true" />
     <Touch Files="$(PackageChecksumPath)" Time="2000-01-01T00:00:00Z" />
+    <Touch Files="$(SymbolChecksumPath)" Time="2000-01-01T00:00:00Z" />
     <Message Importance="high" Text="Created $(PackagePath)" />
-    <Message Importance="high" Text="Created $(PackageChecksumPath) and portable symbols in $(SymbolsDirectory)" />
+    <Message Importance="high" Text="Created checksums for the package and bound portable symbols in $(SymbolsDirectory)" />
   </Target>
 </Project>

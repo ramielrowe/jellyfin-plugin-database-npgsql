@@ -6,6 +6,8 @@ PACKAGE_DIR="$PLUGIN_ROOT/artifacts/package"
 PACKAGE_ZIP="$PLUGIN_ROOT/artifacts/jellyfin-plugin-database-npgsql_0.1.0.0.zip"
 PACKAGE_CHECKSUM="$PACKAGE_ZIP.sha256"
 SYMBOL_FILE="$PLUGIN_ROOT/artifacts/symbols/Jellyfin.Plugin.Database.Npgsql.pdb"
+SYMBOL_CHECKSUM="$SYMBOL_FILE.sha256"
+PACKAGING_TOOL="$PLUGIN_ROOT/tools/Jellyfin.Plugin.Database.Npgsql.Packaging/bin/Release/net10.0/Jellyfin.Plugin.Database.Npgsql.Packaging.dll"
 PROVIDER_PROJECT="$PLUGIN_ROOT/src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj"
 NEGATIVE_CONTROL_PROJECT="$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests.csproj"
 REFERENCE_REPORT_DIR="$PLUGIN_ROOT/artifacts/evaluated-references"
@@ -28,9 +30,11 @@ fi
 [ -f "$PACKAGE_ZIP" ] || fail "package ZIP is missing; run the package command first"
 [ -f "$PACKAGE_CHECKSUM" ] || fail "package SHA-256 sidecar is missing"
 [ -f "$SYMBOL_FILE" ] || fail "portable provider symbols are missing"
+[ -f "$SYMBOL_CHECKSUM" ] || fail "portable provider symbol SHA-256 sidecar is missing"
+[ -f "$PACKAGING_TOOL" ] || fail "packaging verification tool is missing"
 [ -d "$PACKAGE_DIR" ] || fail "staged package directory is missing"
 
-python3 - "$PACKAGE_ZIP" "$PACKAGE_CHECKSUM" "$SYMBOL_FILE" <<'PY'
+python3 - "$PACKAGE_ZIP" "$PACKAGE_CHECKSUM" "$SYMBOL_FILE" "$SYMBOL_CHECKSUM" <<'PY'
 import hashlib
 import pathlib
 import re
@@ -38,21 +42,44 @@ import sys
 import zipfile
 
 package = pathlib.Path(sys.argv[1])
-checksum = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 symbol = pathlib.Path(sys.argv[3])
-match = re.fullmatch(r"([0-9A-Fa-f]{64})  ([^/\\\r\n]+)\r?\n?", checksum)
-if match is None or match.group(2) != package.name:
-    raise SystemExit("FAIL: package checksum sidecar is not canonical SHA256SUMS format")
-actual = hashlib.sha256(package.read_bytes()).hexdigest()
-if actual != match.group(1).lower():
-    raise SystemExit("FAIL: package checksum sidecar does not match the ZIP")
-if symbol.read_bytes()[:4] != b"BSJB":
-    raise SystemExit("FAIL: provider symbol artifact is not a portable PDB")
+
+def verify_checksum(artifact, checksum_path, label):
+    checksum = pathlib.Path(checksum_path).read_text(encoding="utf-8")
+    match = re.fullmatch(r"([0-9A-Fa-f]{64})  ([^/\\\r\n]+)\r?\n?", checksum)
+    if match is None or match.group(2) != artifact.name:
+        raise SystemExit(f"FAIL: {label} checksum sidecar is not canonical SHA256SUMS format")
+    actual = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    if actual != match.group(1).lower():
+        raise SystemExit(f"FAIL: {label} checksum sidecar does not match the artifact")
+
+verify_checksum(package, sys.argv[2], "package")
+verify_checksum(symbol, sys.argv[4], "symbol")
 with zipfile.ZipFile(package) as archive:
     for entry in archive.infolist():
         if entry.date_time != (2000, 1, 1, 0, 0, 0):
             raise SystemExit(f"FAIL: non-reproducible ZIP timestamp for {entry.filename}: {entry.date_time}")
 PY
+
+dotnet "$PACKAGING_TOOL" verify-symbols \
+    "$PACKAGE_DIR/Jellyfin.Plugin.Database.Npgsql.dll" \
+    "$SYMBOL_FILE" >/dev/null \
+    || fail "portable provider symbols do not match the packaged provider DLL"
+
+stale_symbol="$PLUGIN_ROOT/tests/fixtures/predecessor/bin/Release/net10.0/Jellyfin.Plugin.Database.Npgsql.pdb"
+unrelated_symbol="$PLUGIN_ROOT/tools/Jellyfin.Plugin.Database.Npgsql.Packaging/bin/Release/net10.0/Jellyfin.Plugin.Database.Npgsql.Packaging.pdb"
+[ -f "$stale_symbol" ] || fail "stale-provider symbol negative control is missing; build the Release solution first"
+[ -f "$unrelated_symbol" ] || fail "unrelated symbol negative control is missing"
+if dotnet "$PACKAGING_TOOL" verify-symbols \
+    "$PACKAGE_DIR/Jellyfin.Plugin.Database.Npgsql.dll" \
+    "$stale_symbol" >/dev/null 2>&1; then
+    fail "symbol binding negative control accepted a stale provider PDB"
+fi
+if dotnet "$PACKAGING_TOOL" verify-symbols \
+    "$PACKAGE_DIR/Jellyfin.Plugin.Database.Npgsql.dll" \
+    "$unrelated_symbol" >/dev/null 2>&1; then
+    fail "symbol binding negative control accepted an unrelated PDB"
+fi
 
 python3 - "$PLUGIN_ROOT/build.yaml" "$PLUGIN_ROOT/meta.json" "$PLUGIN_ROOT/build/release-policy.json" <<'PY'
 import json
@@ -81,6 +108,15 @@ if metadata.get("status") != "Active" or metadata.get("autoUpdate") is not False
     raise SystemExit("FAIL: metadata must be Active and must not claim catalog auto-update support")
 if metadata.get("assemblies") != ["Jellyfin.Plugin.Database.Npgsql.dll"]:
     raise SystemExit("FAIL: metadata ordinary-plugin assembly allowlist changed")
+expected_release_files = {
+    "packageFile": "jellyfin-plugin-database-npgsql_0.1.0.0.zip",
+    "checksumFile": "jellyfin-plugin-database-npgsql_0.1.0.0.zip.sha256",
+    "symbolFile": "Jellyfin.Plugin.Database.Npgsql.pdb",
+    "symbolChecksumFile": "Jellyfin.Plugin.Database.Npgsql.pdb.sha256",
+}
+for key, expected in expected_release_files.items():
+    if policy.get(key) != expected:
+        raise SystemExit(f"FAIL: release policy has unexpected {key}")
 PY
 
 grep -F '"status": "Active"' "$PACKAGE_DIR/meta.json" >/dev/null \
@@ -252,4 +288,4 @@ if ! grep -F "ProjectReference escapes the standalone repository:" "$negative_lo
     fail "negative control failed for an unexpected reason"
 fi
 
-echo "Build audit passed: metadata, licenses, symbols, checksum, staged package, and ZIP match the release policy; all evaluated project references are internal; and the external-reference negative control was rejected."
+echo "Build audit passed: metadata, licenses, DLL-bound symbols, checksums, staged package, and ZIP match the release policy; stale/unrelated PDBs and external references were rejected."

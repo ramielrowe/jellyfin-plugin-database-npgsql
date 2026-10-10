@@ -9,6 +9,20 @@
   "packageFile": "jellyfin-plugin-database-npgsql_0.1.0.0.zip",
   "checksumFile": "jellyfin-plugin-database-npgsql_0.1.0.0.zip.sha256",
   "symbolFile": "Jellyfin.Plugin.Database.Npgsql.pdb",
+  "symbolChecksumFile": "Jellyfin.Plugin.Database.Npgsql.pdb.sha256",
+  "vulnerabilitySources": [
+    "https://api.nuget.org/v3/index.json"
+  ],
+  "vulnerabilityAuditProjects": [
+    "src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj",
+    "tests/fixtures/predecessor/Jellyfin.Plugin.Database.Npgsql.PredecessorFixture.csproj",
+    "tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests.csproj",
+    "tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/Jellyfin.Plugin.Database.Npgsql.TestHarness.csproj",
+    "tests/Jellyfin.Plugin.Database.Npgsql.TestInfrastructure/Jellyfin.Plugin.Database.Npgsql.TestInfrastructure.csproj",
+    "tests/Jellyfin.Plugin.Database.Npgsql.UnitTests/Jellyfin.Plugin.Database.Npgsql.UnitTests.csproj",
+    "tools/Jellyfin.Plugin.Database.Npgsql.Migrations/Jellyfin.Plugin.Database.Npgsql.Migrations.csproj",
+    "tools/Jellyfin.Plugin.Database.Npgsql.Packaging/Jellyfin.Plugin.Database.Npgsql.Packaging.csproj"
+  ],
   "zipArtifacts": [
     "Jellyfin.Plugin.Database.Npgsql.deps.json",
     "Jellyfin.Plugin.Database.Npgsql.dll",

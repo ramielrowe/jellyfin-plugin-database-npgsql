@@ -183,17 +183,27 @@ dotnet msbuild build/Package.proj -target:Package -property:Configuration=Releas
 ```
 
 The package target writes a staged, allowlisted layout and reproducible ZIP,
-SHA-256 sidecar, and portable PDB beneath `artifacts/`; the audit rejects
+portable PDB, and a SHA-256 sidecar for each beneath `artifacts/`. The package
+tool binds the PDB to the provider DLL by matching the complete portable-PDB
+debug identifier recorded in the DLL's CodeView entry; stale or unrelated PDBs
+are rejected. The audit rejects
 host-owned runtime assemblies, any ZIP entry
 outside the seven-file allowlist, and external project
 references in every solution project after MSBuild resolves them. The audit also
 runs a negative control that injects a known external project reference and proves
-the guard rejects it. Builds are isolated from an enclosing Git repository so
-moving the workspace does not change the release binary. `build.yaml` lists the
+the guard rejects it. The vulnerability audit validates NuGet's report schema,
+required parameters and source, and exact release project set before accepting a
+no-findings result. `scripts/verify-release.sh` copies the source to a marker-owned
+direct child of the system temporary directory, blocks discovery of an enclosing
+Git checkout, and uses only copied or newly built tools for restore, build, tests,
+audits, hashing, and cleanup. It compares both ZIP and PDB bytes with the source
+build. Builds are isolated from an enclosing Git repository so moving the
+workspace does not change the release binary. `build.yaml` lists the
 same seven package artifacts for the official Jellyfin plugin packager.
 `build/release-policy.json` is the machine-readable release identity, install
-directory, output, redistribution, and license contract. The PDB is a separate
-diagnostic artifact and is not installed in the plugin directory.
+directory, output, vulnerability-audit scope, redistribution, and license
+contract. The checksummed PDB is a separate diagnostic artifact and is not
+installed in the plugin directory.
 
 Reusable opt-in PostgreSQL and pristine-host infrastructure is documented in
 [`docs/test-infrastructure.md`](docs/test-infrastructure.md). Default test runs
