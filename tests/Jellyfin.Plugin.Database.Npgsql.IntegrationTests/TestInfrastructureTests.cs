@@ -426,6 +426,112 @@ public sealed class TestInfrastructureTests
     }
 
     [Fact]
+    public async Task HostPublishDigest_FramesEntryBoundariesPathsAndBinaryContentUnambiguously()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var tempRoot = CreateTemporaryDirectory();
+        try
+        {
+            var twoFiles = Path.Combine(tempRoot, "two-files");
+            Directory.CreateDirectory(twoFiles);
+            await File.WriteAllTextAsync(Path.Combine(twoFiles, "jellyfin.dll"), "host", TestContext.Current.CancellationToken);
+            await File.WriteAllTextAsync(Path.Combine(twoFiles, "z.txt"), "evil", TestContext.Current.CancellationToken);
+
+            var oneFile = Path.Combine(tempRoot, "one-file");
+            Directory.CreateDirectory(oneFile);
+            await File.WriteAllBytesAsync(
+                Path.Combine(oneFile, "jellyfin.dll"),
+                "host\0z.txt\0evil"u8.ToArray(),
+                TestContext.Current.CancellationToken);
+
+            var twoFileHash = await SafeHostPublishStager.HashDirectoryAsync(twoFiles, TestContext.Current.CancellationToken);
+            var oneFileHash = await SafeHostPublishStager.HashDirectoryAsync(oneFile, TestContext.Current.CancellationToken);
+            Assert.NotEqual(twoFileHash, oneFileHash);
+
+            var ownedRoot = Path.Combine(tempRoot, "owned");
+            await CreateOwnedArtifactRootAsync(ownedRoot);
+            var destination = Path.Combine(ownedRoot, "host-publish-input");
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                () => SafeHostPublishStager.StageAsync(
+                    oneFile,
+                    destination,
+                    twoFileHash,
+                    TestContext.Current.CancellationToken));
+            Assert.False(Directory.Exists(destination));
+
+            var edgeTree = Path.Combine(tempRoot, "edge-tree");
+            var equivalentTree = Path.Combine(tempRoot, "equivalent-tree");
+            Directory.CreateDirectory(Path.Combine(edgeTree, "empty directory"));
+            Directory.CreateDirectory(equivalentTree);
+            await File.WriteAllBytesAsync(Path.Combine(edgeTree, "jellyfin.dll"), [], TestContext.Current.CancellationToken);
+            await File.WriteAllBytesAsync(Path.Combine(equivalentTree, "line\nbinary-λ.bin"), [0, 255, 1, 0], TestContext.Current.CancellationToken);
+            await File.WriteAllBytesAsync(Path.Combine(equivalentTree, "jellyfin.dll"), [], TestContext.Current.CancellationToken);
+            await File.WriteAllBytesAsync(Path.Combine(edgeTree, "line\nbinary-λ.bin"), [0, 255, 1, 0], TestContext.Current.CancellationToken);
+
+            var edgeHash = await SafeHostPublishStager.HashDirectoryAsync(edgeTree, TestContext.Current.CancellationToken);
+            Assert.Equal(
+                edgeHash,
+                await SafeHostPublishStager.HashDirectoryAsync(edgeTree, TestContext.Current.CancellationToken));
+            Assert.Equal(
+                edgeHash,
+                await SafeHostPublishStager.HashDirectoryAsync(equivalentTree, TestContext.Current.CancellationToken));
+
+            await File.WriteAllBytesAsync(Path.Combine(equivalentTree, "line\nbinary-λ.bin"), [0, 255, 1, 1], TestContext.Current.CancellationToken);
+            Assert.NotEqual(
+                edgeHash,
+                await SafeHostPublishStager.HashDirectoryAsync(equivalentTree, TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SafeHostPublishStager_RemovesExactEmptyTemporaryDirectoryWhenItsFirstOpenFails()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var tempRoot = CreateTemporaryDirectory();
+        try
+        {
+            var source = Path.Combine(tempRoot, "source");
+            Directory.CreateDirectory(source);
+            await File.WriteAllTextAsync(Path.Combine(source, "jellyfin.dll"), "host", TestContext.Current.CancellationToken);
+            var hash = await SafeHostPublishStager.HashDirectoryAsync(source, TestContext.Current.CancellationToken);
+            var ownedRoot = Path.Combine(tempRoot, "owned");
+            await CreateOwnedArtifactRootAsync(ownedRoot);
+            var destination = Path.Combine(ownedRoot, "host-publish-input");
+
+            var exception = await Assert.ThrowsAsync<IOException>(
+                () => SafeHostPublishStager.StageAsync(
+                    source,
+                    destination,
+                    hash,
+                    TestContext.Current.CancellationToken,
+                    openingTemporaryDirectoryForTest: () => throw new IOException("Injected temporary-directory open failure.")));
+
+            Assert.Contains("Injected", exception.Message, StringComparison.Ordinal);
+            Assert.False(Directory.Exists(destination));
+            Assert.Empty(Directory.EnumerateDirectories(ownedRoot));
+            Assert.Equal(
+                [".jellyfin-npgsql-owned-artifacts"],
+                Directory.EnumerateFiles(ownedRoot).Select(Path.GetFileName).ToArray());
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task SafeHostPublishStager_ContainsConcurrentIntermediateSourceAndDestinationLinkSwaps()
     {
         if (!OperatingSystem.IsLinux())

@@ -440,7 +440,7 @@ cleanup() {
             "${SECRET_FILE_MARKER:-}" "${PASSFILE_UNRELATED_SECRET:-}" \
             "${PASSFILE_FIRST_HOST_SECRET:-}" "${PASSFILE_LOWER_PRECEDENCE_SECRET:-}" \
             "${RUNTIME_PASSFILE:-}" "${FIRST_TOKEN:-}" "${RESTART_TOKEN:-}" \
-            "${MALFORMED_TOKEN:-}" "${RECOVERY_TOKEN:-}" "$RUN_ROOT" >"$redaction_secrets"
+            "${MALFORMED_TOKEN:-}" "${RECOVERY_TOKEN:-}" "${FORBIDDEN_PARENT_CHECKOUT:-}" "$RUN_ROOT" >"$redaction_secrets"
         chmod 600 "$redaction_secrets"
         python3 - "$RUN_ROOT" "$retained" "$redaction_secrets" <<'PY'
 import pathlib, sys
@@ -634,7 +634,7 @@ launch_host_process() {
         "${SECRET_FILE_MARKER:-}" "${PASSFILE_UNRELATED_SECRET:-}" \
         "${PASSFILE_FIRST_HOST_SECRET:-}" "${PASSFILE_LOWER_PRECEDENCE_SECRET:-}" \
         "${RUNTIME_PASSFILE:-}" "${FIRST_TOKEN:-}" "${RESTART_TOKEN:-}" \
-        "${MALFORMED_TOKEN:-}" "${RECOVERY_TOKEN:-}" "$RUN_ROOT" >"$secrets_file"
+        "${MALFORMED_TOKEN:-}" "${RECOVERY_TOKEN:-}" "${FORBIDDEN_PARENT_CHECKOUT:-}" "$RUN_ROOT" >"$secrets_file"
     chmod 600 "$secrets_file"
     python3 "$PLUGIN_ROOT/tests/process-supervisor.py" \
         --identity-file "$identity_file" \

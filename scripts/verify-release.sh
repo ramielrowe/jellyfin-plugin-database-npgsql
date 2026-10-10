@@ -181,6 +181,7 @@ if [ "${RUN_BLACK_BOX:-false}" = true ]; then
             "${UNSUPPORTED_JELLYFIN_HOST_SHA256:-}")
         export UNSUPPORTED_JELLYFIN_HOST_PUBLISH="$STAGED_UNSUPPORTED_HOST_PUBLISH"
     fi
+    export FORBIDDEN_PARENT_CHECKOUT="$ORIGINAL_CHECKOUT"
     "$RELOCATED/tests/black-box-smoke.sh"
 fi
 

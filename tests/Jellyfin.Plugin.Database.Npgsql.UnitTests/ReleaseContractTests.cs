@@ -172,6 +172,14 @@ public sealed class ReleaseContractTests
         Assert.Contains("release verification rejects UNSUPPORTED_JELLYFIN_HOST_REPOSITORY", script, StringComparison.Ordinal);
         Assert.Contains("RUN_BLACK_BOX=true requires an exact prebuilt JELLYFIN_HOST_PUBLISH", script, StringComparison.Ordinal);
         Assert.Contains("RUN_BLACK_BOX=true requires a 64-hex JELLYFIN_HOST_SHA256", script, StringComparison.Ordinal);
+        Assert.Contains(
+            "export FORBIDDEN_PARENT_CHECKOUT=\"$ORIGINAL_CHECKOUT\"\n    \"$RELOCATED/tests/black-box-smoke.sh\"",
+            script,
+            StringComparison.Ordinal);
+        var blackBoxScript = File.ReadAllText(Path.Combine(root, "tests", "black-box-smoke.sh"));
+        Assert.Equal(
+            2,
+            blackBoxScript.Split("${FORBIDDEN_PARENT_CHECKOUT:-}", StringSplitOptions.None).Length - 1);
         Assert.DoesNotContain("if [ -n \"${JELLYFIN_HOST_PUBLISH:-}\" ]", script, StringComparison.Ordinal);
         Assert.All(
             relocatedArtifactOperations,

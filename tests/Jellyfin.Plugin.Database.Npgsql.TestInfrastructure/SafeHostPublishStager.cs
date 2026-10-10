@@ -5,7 +5,6 @@ using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -28,7 +27,8 @@ public static class SafeHostPublishStager
         string destination,
         string expectedSha256,
         CancellationToken cancellationToken,
-        Action? inputVerifiedForTest = null)
+        Action? inputVerifiedForTest = null,
+        Action? openingTemporaryDirectoryForTest = null)
     {
         RequireLinux();
         ValidateExpectedHash(expectedSha256);
@@ -58,11 +58,16 @@ public static class SafeHostPublishStager
         inputVerifiedForTest?.Invoke();
         var temporaryName = ".host-publish-stage-" + Guid.NewGuid().ToString("N");
         SafeFileHandle? temporaryRoot = null;
+        FileIdentity? temporaryIdentity = null;
         var temporaryExists = false;
         try
         {
             CreateDirectoryAt(ownedRoot, temporaryName);
             temporaryExists = true;
+            var temporaryStatus = InspectEntryAt(ownedRoot, temporaryName);
+            RequireDirectory(temporaryStatus, temporaryName);
+            temporaryIdentity = temporaryStatus.Identity;
+            openingTemporaryDirectoryForTest?.Invoke();
             temporaryRoot = OpenDirectoryAt(ownedRoot, temporaryName);
             SetMode(temporaryRoot, DirectoryMode);
             foreach (var directory in sourceManifest.Directories)
@@ -108,10 +113,14 @@ public static class SafeHostPublishStager
         }
         finally
         {
-            if (temporaryExists && temporaryRoot is not null)
+            if (temporaryExists && temporaryIdentity is not null)
             {
-                DeleteContentsWithoutFollowingLinks(temporaryRoot);
-                TryRemoveExactDirectory(ownedRoot, temporaryName, temporaryRoot);
+                if (temporaryRoot is not null)
+                {
+                    DeleteContentsWithoutFollowingLinks(temporaryRoot);
+                }
+
+                TryRemoveExactDirectory(ownedRoot, temporaryName, temporaryIdentity.Value);
             }
 
             temporaryRoot?.Dispose();
@@ -193,12 +202,11 @@ public static class SafeHostPublishStager
 
         directories.Sort(StringComparer.Ordinal);
         files.Sort((left, right) => StringComparer.Ordinal.Compare(left.RelativePath, right.RelativePath));
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        using var digest = new HostPublishDigest(files.Count);
         var budget = new ReadBudget();
         foreach (var file in files)
         {
-            hash.AppendData(Encoding.UTF8.GetBytes(file.RelativePath));
-            hash.AppendData([0]);
+            digest.BeginFile(file.RelativePath, file.Length);
             using var stream = OpenRegularFileAt(root, file);
             await ReadExactAsync(
                 stream,
@@ -207,13 +215,12 @@ public static class SafeHostPublishStager
                 cancellationToken,
                 memory =>
                 {
-                    hash.AppendData(memory.Span);
+                    digest.AppendFileContent(memory.Span);
                     return Task.CompletedTask;
                 }).ConfigureAwait(false);
-            hash.AppendData([0]);
         }
 
-        return new DirectoryManifest(directories, files, Convert.ToHexString(hash.GetHashAndReset()).ToLowerInvariant());
+        return new DirectoryManifest(directories, files, digest.Complete());
     }
 
     private static async Task ReadExactAsync(
@@ -394,10 +401,10 @@ public static class SafeHostPublishStager
         }
     }
 
-    private static void TryRemoveExactDirectory(SafeFileHandle parent, string name, SafeFileHandle expected)
+    private static void TryRemoveExactDirectory(SafeFileHandle parent, string name, FileIdentity expectedIdentity)
     {
         var current = TryInspectEntryAt(parent, name);
-        if (current?.Identity == InspectDescriptor(expected).Identity)
+        if (current is { Kind: NodeKind.Directory } && current.Value.Identity == expectedIdentity)
         {
             UnlinkAt(parent, name, Native.AtRemoveDirectory);
         }

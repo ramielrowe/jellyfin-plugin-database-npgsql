@@ -90,6 +90,18 @@ First build the hash helper while dependencies are available, then run the
 prebuilt helper offline. Its stdout is exactly one lowercase 64-hex digest;
 diagnostics use stderr:
 
+Directory hashes use the canonical host-publish format version 1. All unsigned
+integers are big-endian. The stream contains a length-prefixed UTF-8 domain,
+the 32-bit format version, the 64-bit regular-file entry count, then every
+regular file in ordinal relative-path order. Each entry contains a one-byte
+regular-file type, a 32-bit UTF-8 path-byte length and path, and a 64-bit
+content length followed immediately by the exact file bytes. This framing makes
+paths, empty files, binary contents, and entry boundaries unambiguous. Empty
+directories are intentionally excluded: file paths already bind functional
+directory structure, while vanilla Jellyfin creates an empty `Dictionaries`
+directory beside its assemblies at runtime. Recompute the pin whenever the
+format or publish files change.
+
 ```sh
 dotnet build tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/Jellyfin.Plugin.Database.Npgsql.TestHarness.csproj \
   --configuration Release --no-restore
