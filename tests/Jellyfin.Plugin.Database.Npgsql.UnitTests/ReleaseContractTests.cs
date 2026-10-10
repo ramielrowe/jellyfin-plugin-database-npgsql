@@ -166,6 +166,13 @@ public sealed class ReleaseContractTests
         Assert.DoesNotContain("cp --archive", script, StringComparison.Ordinal);
         Assert.Contains("${JELLYFIN_HOST_SHA256:-}", script, StringComparison.Ordinal);
         Assert.Contains("${UNSUPPORTED_JELLYFIN_HOST_SHA256:-}", script, StringComparison.Ordinal);
+        Assert.Contains("validate_black_box_inputs", script, StringComparison.Ordinal);
+        Assert.Contains("release verification rejects JELLYFIN_HOST_REPOSITORY", script, StringComparison.Ordinal);
+        Assert.Contains("release verification rejects JELLYFIN_UNSUPPORTED_HOST_REPOSITORY", script, StringComparison.Ordinal);
+        Assert.Contains("release verification rejects UNSUPPORTED_JELLYFIN_HOST_REPOSITORY", script, StringComparison.Ordinal);
+        Assert.Contains("RUN_BLACK_BOX=true requires an exact prebuilt JELLYFIN_HOST_PUBLISH", script, StringComparison.Ordinal);
+        Assert.Contains("RUN_BLACK_BOX=true requires a 64-hex JELLYFIN_HOST_SHA256", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("if [ -n \"${JELLYFIN_HOST_PUBLISH:-}\" ]", script, StringComparison.Ordinal);
         Assert.All(
             relocatedArtifactOperations,
             operation =>

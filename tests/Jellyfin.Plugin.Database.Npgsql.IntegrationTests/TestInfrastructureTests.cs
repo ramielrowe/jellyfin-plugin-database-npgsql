@@ -320,23 +320,26 @@ public sealed class TestInfrastructureTests
             Directory.CreateDirectory(source);
             await File.WriteAllTextAsync(Path.Combine(source, "jellyfin.dll"), "host", TestContext.Current.CancellationToken);
             var hash = await SafeHostPublishStager.HashDirectoryAsync(source, TestContext.Current.CancellationToken);
+            var ownedRoot = Path.Combine(tempRoot, "owned");
+            await CreateOwnedArtifactRootAsync(ownedRoot);
+            var destination = Path.Combine(ownedRoot, "host-publish-input");
 
             var rootLink = Path.Combine(tempRoot, "root-link");
             Directory.CreateSymbolicLink(rootLink, source);
             var rootException = await Assert.ThrowsAsync<InvalidOperationException>(
                 () => SafeHostPublishStager.StageAsync(
                     rootLink,
-                    Path.Combine(tempRoot, "root-link-copy"),
+                    destination,
                     hash,
                     TestContext.Current.CancellationToken));
-            Assert.Contains("symbolic link", rootException.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("symbolic-link components", rootException.Message, StringComparison.OrdinalIgnoreCase);
 
             var nestedLink = Path.Combine(source, "nested-link");
             File.CreateSymbolicLink(nestedLink, Path.Combine(source, "jellyfin.dll"));
             var nestedException = await Assert.ThrowsAsync<InvalidOperationException>(
                 () => SafeHostPublishStager.StageAsync(
                     source,
-                    Path.Combine(tempRoot, "nested-link-copy"),
+                    destination,
                     hash,
                     TestContext.Current.CancellationToken));
             Assert.Contains("symbolic link", nestedException.Message, StringComparison.OrdinalIgnoreCase);
@@ -352,11 +355,11 @@ public sealed class TestInfrastructureTests
             var fifoException = await Assert.ThrowsAsync<InvalidOperationException>(
                 () => SafeHostPublishStager.StageAsync(
                     source,
-                    Path.Combine(tempRoot, "fifo-copy"),
+                    destination,
                     hash,
                     TestContext.Current.CancellationToken));
             Assert.Contains("special filesystem node", fifoException.Message, StringComparison.Ordinal);
-            Assert.False(Directory.Exists(Path.Combine(tempRoot, "fifo-copy")));
+            Assert.False(Directory.Exists(destination));
         }
         finally
         {
@@ -377,20 +380,27 @@ public sealed class TestInfrastructureTests
             var sentinel = Path.Combine(source, "large-sentinel.bin");
             await using (var stream = new FileStream(sentinel, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
-                stream.SetLength(32L * 1024 * 1024);
+                var block = new byte[64 * 1024];
+                for (var index = 0; index < 512; index++)
+                {
+                    await stream.WriteAsync(block, TestContext.Current.CancellationToken);
+                }
             }
 
             var hash = await SafeHostPublishStager.HashDirectoryAsync(source, TestContext.Current.CancellationToken);
+            var overlapDestination = Path.Combine(source, "host-publish-input");
             var overlapException = await Assert.ThrowsAsync<InvalidOperationException>(
                 () => SafeHostPublishStager.StageAsync(
                     source,
-                    Path.Combine(source, "escaped-copy"),
+                    overlapDestination,
                     hash,
                     TestContext.Current.CancellationToken));
             Assert.Contains("must not overlap", overlapException.Message, StringComparison.Ordinal);
-            Assert.False(Directory.Exists(Path.Combine(source, "escaped-copy")));
+            Assert.False(Directory.Exists(overlapDestination));
 
-            var badHashDestination = Path.Combine(tempRoot, "bad-hash-copy");
+            var ownedRoot = Path.Combine(tempRoot, "owned");
+            await CreateOwnedArtifactRootAsync(ownedRoot);
+            var badHashDestination = Path.Combine(ownedRoot, "host-publish-input");
             await Assert.ThrowsAsync<InvalidOperationException>(
                 () => SafeHostPublishStager.StageAsync(
                     source,
@@ -399,7 +409,7 @@ public sealed class TestInfrastructureTests
                     TestContext.Current.CancellationToken));
             Assert.False(Directory.Exists(badHashDestination));
 
-            var racedDestination = Path.Combine(tempRoot, "raced-copy");
+            var racedDestination = badHashDestination;
             await Assert.ThrowsAsync<InvalidOperationException>(
                 () => SafeHostPublishStager.StageAsync(
                     source,
@@ -408,6 +418,94 @@ public sealed class TestInfrastructureTests
                     TestContext.Current.CancellationToken,
                     () => File.WriteAllText(assembly, "evil")));
             Assert.False(Directory.Exists(racedDestination));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SafeHostPublishStager_ContainsConcurrentIntermediateSourceAndDestinationLinkSwaps()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var tempRoot = CreateTemporaryDirectory();
+        try
+        {
+            var source = Path.Combine(tempRoot, "source");
+            var nested = Path.Combine(source, "nested");
+            var outside = Path.Combine(tempRoot, "outside");
+            var ownedRoot = Path.Combine(tempRoot, "owned");
+            Directory.CreateDirectory(nested);
+            Directory.CreateDirectory(outside);
+            await CreateOwnedArtifactRootAsync(ownedRoot);
+            await File.WriteAllTextAsync(Path.Combine(source, "jellyfin.dll"), "host", TestContext.Current.CancellationToken);
+            await File.WriteAllTextAsync(Path.Combine(nested, "dependency.dll"), "dependency", TestContext.Current.CancellationToken);
+            await File.WriteAllTextAsync(Path.Combine(outside, "dependency.dll"), "outside", TestContext.Current.CancellationToken);
+            var hash = await SafeHostPublishStager.HashDirectoryAsync(source, TestContext.Current.CancellationToken);
+            var destination = Path.Combine(ownedRoot, "host-publish-input");
+
+            var sourceRace = await Assert.ThrowsAnyAsync<Exception>(
+                () => SafeHostPublishStager.StageAsync(
+                    source,
+                    destination,
+                    hash,
+                    TestContext.Current.CancellationToken,
+                    () =>
+                    {
+                        Directory.Move(nested, nested + "-original");
+                        Directory.CreateSymbolicLink(nested, outside);
+                    }));
+            Assert.Contains("open", sourceRace.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.False(Directory.Exists(destination));
+            Assert.Equal("outside", await File.ReadAllTextAsync(Path.Combine(outside, "dependency.dll"), TestContext.Current.CancellationToken));
+
+            Directory.Delete(nested);
+            Directory.Move(nested + "-original", nested);
+            var outsideEscapedFile = Path.Combine(outside, "jellyfin.dll");
+            var destinationRace = await Assert.ThrowsAnyAsync<Exception>(
+                () => SafeHostPublishStager.StageAsync(
+                    source,
+                    destination,
+                    hash,
+                    TestContext.Current.CancellationToken,
+                    () => Directory.CreateSymbolicLink(destination, outside)));
+            Assert.Contains("destination", destinationRace.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.False(File.Exists(outsideEscapedFile));
+            Assert.Equal("outside", await File.ReadAllTextAsync(Path.Combine(outside, "dependency.dll"), TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SafeHostPublishStager_RejectsSparseFilesBeforeDestinationCreation()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        var tempRoot = CreateTemporaryDirectory();
+        try
+        {
+            var source = Path.Combine(tempRoot, "source");
+            Directory.CreateDirectory(source);
+            await File.WriteAllTextAsync(Path.Combine(source, "jellyfin.dll"), "host", TestContext.Current.CancellationToken);
+            await using (var sparse = new FileStream(Path.Combine(source, "sparse.bin"), FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                sparse.SetLength(32L * 1024 * 1024);
+            }
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => SafeHostPublishStager.HashDirectoryAsync(source, TestContext.Current.CancellationToken));
+            Assert.Contains("sparse file", exception.Message, StringComparison.OrdinalIgnoreCase);
         }
         finally
         {
@@ -918,6 +1016,15 @@ public sealed class TestInfrastructureTests
         {
             Directory.Delete(tempRoot, recursive: true);
         }
+    }
+
+    private static async Task CreateOwnedArtifactRootAsync(string path)
+    {
+        Directory.CreateDirectory(path);
+        await File.WriteAllTextAsync(
+            Path.Combine(path, ".jellyfin-npgsql-owned-artifacts"),
+            "Owned by Jellyfin.Plugin.Database.Npgsql.TestHarness\n",
+            TestContext.Current.CancellationToken);
     }
 
     private static string CreateTemporaryDirectory()

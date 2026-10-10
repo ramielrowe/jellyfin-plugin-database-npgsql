@@ -143,9 +143,11 @@ Jellyfin 12.2 host and its precomputed digest. It starts the digest-pinned
 PostgreSQL image, installs the package, and verifies the pre-mutation provider
 guard. It does not infer, edit, or depend on the parent repository.
 
-The legacy source-build path runs only when `JELLYFIN_HOST_REPOSITORY` is set
-explicitly to a suitable checkout; it is not the supported reproducibility path
-and no parent checkout is inferred. `POSTGRES_IMAGE`, `POSTGRES_PORT`,
+The standalone smoke script's legacy source-build path runs only when
+`JELLYFIN_HOST_REPOSITORY` is set explicitly to a suitable checkout. The release
+verifier rejects that variable (and unsupported-host repository variants) and
+requires a prebuilt publish with its pinned SHA-256, so its black-box gate cannot
+fall back to a source checkout. `POSTGRES_IMAGE`, `POSTGRES_PORT`,
 `HTTP_PORT`, and `HTTPS_PORT` remain explicit overrides. A full migration,
 rollback, CRUD, and restart result must not be reported until bead
 `jellyfin-38k.8` and its dependent parity work are complete.

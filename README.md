@@ -240,6 +240,9 @@ JELLYFIN_HOST_SHA256=<documented-publish-hash> \
 ./tests/black-box-smoke.sh
 ```
 
-The script never infers a parent checkout. `JELLYFIN_HOST_REPOSITORY` remains an
-explicit legacy compatibility input while the plugin is developed inside the
-old monorepo, but it is not needed after relocation.
+The standalone smoke script retains an explicit legacy repository input for
+development compatibility. The release verifier does not: when
+`RUN_BLACK_BOX=true`, it rejects repository inputs and requires the exact
+`JELLYFIN_HOST_PUBLISH` plus its `JELLYFIN_HOST_SHA256` before doing any build
+work. It stages that publish through Linux descriptor-relative, no-follow
+filesystem operations before the relocated smoke test can consume it.

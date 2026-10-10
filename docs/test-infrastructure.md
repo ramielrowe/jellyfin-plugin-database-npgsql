@@ -165,3 +165,11 @@ absent. The reusable C# fixture
 above is the preferred path for new database tests and supports an external
 administrator connection. The package smoke removes its labeled container and
 retains only redacted logs and evidence with owner-only modes.
+
+`scripts/verify-release.sh` deliberately has a narrower input policy than the
+standalone smoke script. Its black-box mode rejects host-repository variables,
+requires `JELLYFIN_HOST_PUBLISH` and a 64-hex `JELLYFIN_HOST_SHA256`, and copies
+the publish into its marker-owned isolated root using `openat2` beneath
+directory descriptors. Intermediate symbolic-link swaps cannot escape the
+source root, the completed directory is published with a no-replace rename, and
+partial cleanup enumerates descriptors without following links.

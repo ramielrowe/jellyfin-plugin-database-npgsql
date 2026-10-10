@@ -62,6 +62,27 @@ assert_relocated_obj_metadata() {
     fi
 }
 
+validate_black_box_inputs() {
+    [ -z "${JELLYFIN_HOST_REPOSITORY:-}" ] \
+        || { echo "FAIL: release verification rejects JELLYFIN_HOST_REPOSITORY; supply an exact prebuilt JELLYFIN_HOST_PUBLISH" >&2; exit 1; }
+    [ -z "${JELLYFIN_UNSUPPORTED_HOST_REPOSITORY:-}" ] \
+        || { echo "FAIL: release verification rejects JELLYFIN_UNSUPPORTED_HOST_REPOSITORY" >&2; exit 1; }
+    [ -z "${UNSUPPORTED_JELLYFIN_HOST_REPOSITORY:-}" ] \
+        || { echo "FAIL: release verification rejects UNSUPPORTED_JELLYFIN_HOST_REPOSITORY" >&2; exit 1; }
+    [ -n "${JELLYFIN_HOST_PUBLISH:-}" ] \
+        || { echo "FAIL: RUN_BLACK_BOX=true requires an exact prebuilt JELLYFIN_HOST_PUBLISH" >&2; exit 1; }
+    [[ "${JELLYFIN_HOST_SHA256:-}" =~ ^[0-9a-fA-F]{64}$ ]] \
+        || { echo "FAIL: RUN_BLACK_BOX=true requires a 64-hex JELLYFIN_HOST_SHA256" >&2; exit 1; }
+    if [ -n "${UNSUPPORTED_JELLYFIN_HOST_PUBLISH:-}" ]; then
+        [[ "${UNSUPPORTED_JELLYFIN_HOST_SHA256:-}" =~ ^[0-9a-fA-F]{64}$ ]] \
+            || { echo "FAIL: UNSUPPORTED_JELLYFIN_HOST_PUBLISH requires a 64-hex UNSUPPORTED_JELLYFIN_HOST_SHA256" >&2; exit 1; }
+    fi
+}
+
+if [ "${RUN_BLACK_BOX:-false}" = true ]; then
+    validate_black_box_inputs
+fi
+
 restore_without_build_servers "$SOLUTION" --locked-mode
 build_without_build_servers "$SOLUTION" --configuration Release --no-restore
 build_without_build_servers "$HARNESS_PROJECT" --configuration Release --no-restore
@@ -146,14 +167,12 @@ relocated_symbol_hash=$(hash_file "$RELOCATED_HARNESS" "$RELOCATED/artifacts/sym
     || { echo "FAIL: relocated PDB $relocated_symbol_hash differs from source PDB $source_symbol_hash" >&2; exit 1; }
 
 if [ "${RUN_BLACK_BOX:-false}" = true ]; then
-    if [ -n "${JELLYFIN_HOST_PUBLISH:-}" ]; then
-        STAGED_HOST_PUBLISH=$(dotnet "$ISOLATED_CLEANER" stage-host-publish \
-            "$JELLYFIN_HOST_PUBLISH" \
-            "$OWNED_ROOT" \
-            host-publish-input \
-            "${JELLYFIN_HOST_SHA256:-}")
-        export JELLYFIN_HOST_PUBLISH="$STAGED_HOST_PUBLISH"
-    fi
+    STAGED_HOST_PUBLISH=$(dotnet "$ISOLATED_CLEANER" stage-host-publish \
+        "$JELLYFIN_HOST_PUBLISH" \
+        "$OWNED_ROOT" \
+        host-publish-input \
+        "$JELLYFIN_HOST_SHA256")
+    export JELLYFIN_HOST_PUBLISH="$STAGED_HOST_PUBLISH"
     if [ -n "${UNSUPPORTED_JELLYFIN_HOST_PUBLISH:-}" ]; then
         STAGED_UNSUPPORTED_HOST_PUBLISH=$(dotnet "$ISOLATED_CLEANER" stage-host-publish \
             "$UNSUPPORTED_JELLYFIN_HOST_PUBLISH" \
