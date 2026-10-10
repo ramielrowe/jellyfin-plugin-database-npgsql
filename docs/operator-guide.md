@@ -100,14 +100,20 @@ causes startup to fail so `database.xml` remains authoritative.
 ## 3. Install the ZIP before first start
 
 Stop Jellyfin. Replace the two `/absolute/path/...` placeholders, then run the
-whole block in Bash as the account that manages Jellyfin plugins. Every attempt
-uses a new staging directory inside the plugin root, so a staging directory left
-by an interrupted attempt cannot contribute files to a retry.
+whole block as the account that manages Jellyfin plugins. This exact block is
+qualified on Ubuntu 24.04 with Bash, Python 3, and GNU coreutils. In particular,
+it relies on GNU `sha256sum --check --strict`, `mktemp --tmpdir`, and
+`mv --no-clobber --no-target-directory` behavior. On another platform, use
+equivalent tools that preserve the checksum validation, unique same-filesystem
+staging directory, no-overwrite atomic rename, and final postconditions; do not
+assume these options are portable. Every attempt uses a new staging directory
+inside the plugin root, so a staging directory left by an interrupted attempt
+cannot contribute files to a retry.
 
 ```bash
 set -eu
-export RELEASE_DIR=/absolute/path/to/downloaded-release
-export JELLYFIN_PLUGIN_ROOT=/absolute/path/to/jellyfin/plugins
+export RELEASE_DIR='/absolute/path/to/downloaded-release'
+export JELLYFIN_PLUGIN_ROOT='/absolute/path/to/jellyfin/plugins'
 export PACKAGE_NAME=jellyfin-plugin-database-npgsql_0.1.0.0.zip
 export CHECKSUM_NAME=jellyfin-plugin-database-npgsql_0.1.0.0.zip.sha256
 export PLUGIN_NAME='Npgsql Database_0.1.0.0'
