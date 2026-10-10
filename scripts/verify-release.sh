@@ -23,6 +23,9 @@ export NUGET_PACKAGES="$PLUGIN_ROOT/.packages"
 export NUGET_HTTP_CACHE_PATH="$PLUGIN_ROOT/.nuget-http"
 export XDG_DATA_HOME="$PLUGIN_ROOT/.artifacts/xdg-data"
 
+command -v grep >/dev/null 2>&1 \
+    || { echo "FAIL: release verification requires grep" >&2; exit 1; }
+
 restore_without_build_servers() {
     dotnet restore "$@" --disable-build-servers
 }
@@ -49,10 +52,13 @@ assert_relocated_obj_metadata() {
     local forbidden_root=$1
     local relocated_root=$2
     local metadata_leaks
-    metadata_leaks=$(rg --hidden --no-ignore -a -l -F "$forbidden_root" \
-        --glob 'project.assets.json' \
-        --glob '*.nuget.dgspec.json' \
-        "$relocated_root" || true)
+    local grep_status=0
+    metadata_leaks=$(grep --recursive --binary-files=text --files-with-matches --fixed-strings \
+        --include='project.assets.json' \
+        --include='*.nuget.dgspec.json' \
+        -- "$forbidden_root" "$relocated_root") || grep_status=$?
+    [ "$grep_status" -le 1 ] \
+        || { echo "FAIL: could not inspect relocated obj metadata" >&2; exit 1; }
     if [ -n "$metadata_leaks" ]; then
         while IFS= read -r leaked_path; do
             echo "FAIL: relocated obj metadata contains source checkout path: ${leaked_path#"$relocated_root/"}" >&2
@@ -186,11 +192,14 @@ if [ "${RUN_BLACK_BOX:-false}" = true ]; then
 fi
 
 assert_relocated_obj_metadata "$ORIGINAL_CHECKOUT" "$RELOCATED"
-path_leaks=$(rg --hidden --no-ignore -a -l -F "$ORIGINAL_CHECKOUT" \
-    --glob '!.dotnet-cli/**' \
-    --glob '!.nuget-http/**' \
-    --glob '!.packages/**' \
-    "$RELOCATED" || true)
+grep_status=0
+path_leaks=$(grep --recursive --binary-files=text --files-with-matches --fixed-strings \
+    --exclude-dir='.dotnet-cli' \
+    --exclude-dir='.nuget-http' \
+    --exclude-dir='.packages' \
+    -- "$ORIGINAL_CHECKOUT" "$RELOCATED") || grep_status=$?
+[ "$grep_status" -le 1 ] \
+    || { echo "FAIL: could not inspect the relocated repository for path leaks" >&2; exit 1; }
 if [ -n "$path_leaks" ]; then
     while IFS= read -r leaked_path; do
         echo "FAIL: isolated path leak: ${leaked_path#"$RELOCATED/"}" >&2

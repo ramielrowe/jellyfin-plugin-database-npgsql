@@ -111,8 +111,11 @@ public sealed class ReleaseContractTests
 
         const string MetadataAssertion = "assert_relocated_obj_metadata \"$ORIGINAL_CHECKOUT\" \"$RELOCATED\"";
         Assert.Equal(2, script.Split(MetadataAssertion, StringSplitOptions.None).Length - 1);
-        Assert.Contains("--glob 'project.assets.json'", script, StringComparison.Ordinal);
-        Assert.Contains("--glob '*.nuget.dgspec.json'", script, StringComparison.Ordinal);
+        Assert.Contains("command -v grep", script, StringComparison.Ordinal);
+        Assert.Contains("--include='project.assets.json'", script, StringComparison.Ordinal);
+        Assert.Contains("--include='*.nuget.dgspec.json'", script, StringComparison.Ordinal);
+        Assert.Equal(2, script.Split("[ \"$grep_status\" -le 1 ]", StringSplitOptions.None).Length - 1);
+        Assert.DoesNotContain("rg --hidden", script, StringComparison.Ordinal);
 
         var sourcePhase = script.IndexOf("restore_without_build_servers \"$SOLUTION\"", StringComparison.Ordinal);
         var relocation = script.IndexOf("relocate-isolated", StringComparison.Ordinal);
@@ -128,7 +131,7 @@ public sealed class ReleaseContractTests
             StringComparison.Ordinal);
         var blackBox = script.IndexOf("\"$RELOCATED/tests/black-box-smoke.sh\"", StringComparison.Ordinal);
         var finalMetadataAssertion = script.LastIndexOf(MetadataAssertion, StringComparison.Ordinal);
-        var broadPathScan = script.IndexOf("path_leaks=$(rg", StringComparison.Ordinal);
+        var broadPathScan = script.IndexOf("path_leaks=$(grep", StringComparison.Ordinal);
         var success = script.IndexOf("echo \"Release verification passed:", StringComparison.Ordinal);
         var cleanupTrap = script.IndexOf("trap cleanup EXIT", StringComparison.Ordinal);
 
@@ -210,12 +213,38 @@ public sealed class ReleaseContractTests
         Assert.False(HasFinalScansAfterBlackBox(priorOrdering));
     }
 
+    [Theory]
+    [InlineData(".github/workflows/linuxserver-image.yml")]
+    [InlineData(".github/workflows/kubernetes-seed-image.yml")]
+    public void ContainerPublishWorkflowKeepsRegistryCredentialsAvailableForAttestation(string relativePath)
+    {
+        var root = FindRepositoryRoot();
+        var workflow = File.ReadAllText(Path.Combine(root, relativePath));
+        var publishStart = workflow.IndexOf("  publish:\n", StringComparison.Ordinal);
+
+        Assert.True(publishStart >= 0);
+        var publish = workflow[publishStart..];
+        var setupBuildx = publish.IndexOf("docker/setup-buildx-action@", StringComparison.Ordinal);
+        var login = publish.IndexOf("docker/login-action@", StringComparison.Ordinal);
+        var push = publish.IndexOf("docker/build-push-action@", StringComparison.Ordinal);
+        var attest = publish.IndexOf("actions/attest-build-provenance@", StringComparison.Ordinal);
+
+        Assert.True(setupBuildx >= 0 && setupBuildx < login);
+        Assert.True(login < push);
+        Assert.True(push < attest);
+        Assert.DoesNotContain("$GITHUB_ENV", publish, StringComparison.Ordinal);
+        Assert.Contains(
+            "DOCKER_CONFIG=\"$anonymous_config\" docker buildx imagetools inspect",
+            publish,
+            StringComparison.Ordinal);
+    }
+
     private static bool HasFinalScansAfterBlackBox(string script)
     {
         const string MetadataAssertion = "assert_relocated_obj_metadata \"$ORIGINAL_CHECKOUT\" \"$RELOCATED\"";
         var blackBox = script.IndexOf("\"$RELOCATED/tests/black-box-smoke.sh\"", StringComparison.Ordinal);
         var finalMetadataAssertion = script.LastIndexOf(MetadataAssertion, StringComparison.Ordinal);
-        var broadPathScan = script.IndexOf("path_leaks=$(rg", StringComparison.Ordinal);
+        var broadPathScan = script.IndexOf("path_leaks=$(grep", StringComparison.Ordinal);
         var success = script.IndexOf("echo \"Release verification passed:", StringComparison.Ordinal);
 
         return blackBox >= 0 &&
