@@ -33,24 +33,29 @@ internal static class NpgsqlBackupScope
     /// <returns>A handle that leaves the scope when disposed.</returns>
     internal static IDisposable Enter()
     {
-        var snapshotPath = Path.Combine(
-            Path.GetTempPath(),
-            $".jellyfin-npgsql-home-sections-{Guid.NewGuid():N}.json");
+        var parent = Path.Combine(NpgsqlScratchSpace.GetRoot(), "home-sections");
+        NpgsqlScratchSpace.Scavenge(parent, "home-sections", "home-sections-");
+        var ownedDirectory = NpgsqlScratchSpace.CreateOwnedDirectory(parent, "home-sections");
+        var snapshotPath = Path.Combine(ownedDirectory, "snapshot.json");
         var activity = new Activity("Jellyfin.Npgsql.StockBackup");
         activity.AddBaggage(BaggageKey, BaggageValue);
         activity.SetCustomProperty(HomeSectionsPropertyKey, snapshotPath);
         activity.Start();
-        return new Scope(activity, snapshotPath);
+        return new Scope(activity, ownedDirectory);
     }
 
-    private sealed class Scope(Activity activity, string snapshotPath) : IDisposable
+    private sealed class Scope(Activity activity, string ownedDirectory) : IDisposable
     {
         public void Dispose()
         {
             activity.Dispose();
-            if (File.Exists(snapshotPath))
+            try
             {
-                File.Delete(snapshotPath);
+                NpgsqlScratchSpace.ClaimAndDelete(ownedDirectory, "home-sections");
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
+            {
+                // The owner marker and atomic tombstone allow safe startup/next-run scavenging.
             }
         }
     }

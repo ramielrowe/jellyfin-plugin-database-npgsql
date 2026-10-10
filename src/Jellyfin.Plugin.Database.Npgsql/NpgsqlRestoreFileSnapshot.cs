@@ -37,6 +37,8 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
 
     private const int OpenWriteOnly = 1;
 
+    private const int OpenReadWrite = 2;
+
     private const int OpenCreate = 0x40;
 
     private const int OpenExclusive = 0x80;
@@ -51,9 +53,11 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
     private readonly string stockFilesystemArchivePath;
     private readonly List<CapturedFile> files;
     private readonly List<CapturedDirectory> directories;
+    private readonly List<AppliedDirectory> appliedDirectories;
     private readonly List<string> absentDirectories;
     private readonly Dictionary<string, RootHandle> roots;
     private readonly string journalPath;
+    private readonly SafeFileHandle scratchHandle;
     private bool committed;
     private bool cleanupDeferred;
     private bool rolledBack;
@@ -64,17 +68,34 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
         string stockFilesystemArchivePath,
         List<CapturedFile> files,
         List<CapturedDirectory> directories,
+        List<AppliedDirectory> appliedDirectories,
         List<string> absentDirectories,
         Dictionary<string, RootHandle> roots,
-        Guid? restoreId = null)
+        Guid? restoreId = null,
+        FileIdentity? expectedScratchIdentity = null)
     {
         this.scratchRoot = scratchRoot;
         this.stockFilesystemArchivePath = stockFilesystemArchivePath;
         this.files = files;
         this.directories = directories;
+        this.appliedDirectories = appliedDirectories;
         this.absentDirectories = absentDirectories;
         this.roots = roots;
         this.journalPath = Path.Combine(scratchRoot, "recovery-journal.json");
+        var scratchDescriptor = NativeOpen(scratchRoot, OpenDirectoryFlag | OpenNoFollow | OpenCloseOnExec);
+        if (scratchDescriptor < 0)
+        {
+            throw new InvalidDataException(
+                $"The restore scratch generation could not be opened safely (errno {Marshal.GetLastPInvokeError()}).");
+        }
+
+        this.scratchHandle = new SafeFileHandle((nint)scratchDescriptor, ownsHandle: true);
+        if (expectedScratchIdentity is not null && ReadIdentity(this.scratchHandle) != expectedScratchIdentity)
+        {
+            this.scratchHandle.Dispose();
+            throw new InvalidDataException("The restore scratch generation was replaced during recovery.");
+        }
+
         this.RestoreId = restoreId ?? Guid.NewGuid();
     }
 
@@ -94,6 +115,8 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
             {
                 root.Dispose();
             }
+
+            this.scratchHandle.Dispose();
 
             if (this.committed && !this.cleanupDeferred)
             {
@@ -143,21 +166,18 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
 
         var files = new List<CapturedFile>();
         var directories = new Dictionary<string, CapturedDirectory>(StringComparer.OrdinalIgnoreCase);
+        var appliedDirectories = new List<AppliedDirectory>();
         var absentDirectories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var roots = new Dictionary<string, RootHandle>(StringComparer.Ordinal);
         try
         {
+            using var scratchCaptureRoot = OpenRoot(scratchRoot);
             using var archive = await ZipFile.OpenReadAsync(archivePath, cancellationToken).ConfigureAwait(false);
             var targets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             long capturedBytes = 0;
             foreach (var entry in archive.Entries.OrderBy(candidate => candidate.FullName, StringComparer.Ordinal))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (entry.FullName.EndsWith('/'))
-                {
-                    continue;
-                }
-
                 var mapping = MapTarget(entry.FullName, paths);
                 if (mapping is null)
                 {
@@ -165,6 +185,12 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
                 }
 
                 var (root, relative) = mapping.Value;
+                var isDirectoryEntry = entry.FullName.EndsWith('/');
+                if (isDirectoryEntry)
+                {
+                    relative = relative.TrimEnd('/');
+                }
+
                 if (string.Equals(Path.GetFullPath(root), Path.GetFullPath(paths.DataPath), StringComparison.Ordinal)
                     && (string.Equals(relative, RecoveryDirectoryName, StringComparison.Ordinal)
                         || relative.StartsWith(RecoveryDirectoryName + '/', StringComparison.Ordinal)))
@@ -193,12 +219,29 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
                         $"Multiple archive entries resolve to stock restore target '{target}'.");
                 }
 
+                if (isDirectoryEntry)
+                {
+                    InspectDirectoryTarget(
+                        rootHandle,
+                        relative.Replace('/', Path.DirectorySeparatorChar),
+                        directories,
+                        absentDirectories);
+                    appliedDirectories.Add(new AppliedDirectory(
+                        root,
+                        target,
+                        GetArchiveDirectoryMode(entry),
+                        GetArchiveFileAttributes(entry),
+                        entry.LastWriteTime.UtcDateTime));
+                    continue;
+                }
+
                 var inspection = InspectTarget(
                     rootHandle,
                     relative.Replace('/', Path.DirectorySeparatorChar),
                     directories,
                     absentDirectories);
                 string? copyPath = null;
+                FileIdentity? snapshotIdentity = null;
                 UnixFileMode? mode = null;
                 FileAttributes attributes = default;
                 DateTime lastWriteTimeUtc = default;
@@ -229,6 +272,7 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
                             copyPath,
                             NpgsqlBackupArchive.MaximumEntryBytes,
                             cancellationToken).ConfigureAwait(false);
+                        snapshotIdentity = ReadChildIdentity(scratchCaptureRoot.Handle, Path.GetFileName(copyPath));
                         mode = inspection.Mode;
                         attributes = inspection.Attributes;
                         lastWriteTimeUtc = inspection.LastWriteTimeUtc;
@@ -238,6 +282,9 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
 
                 var stagedPath = Path.Combine(scratchRoot, "staged-" + files.Count.ToString("D8", System.Globalization.CultureInfo.InvariantCulture));
                 await CopyEntryBoundedAsync(entry, stagedPath, cancellationToken).ConfigureAwait(false);
+                var stagedIdentity = ReadChildIdentity(scratchCaptureRoot.Handle, Path.GetFileName(stagedPath));
+                var appliedMode = GetArchiveFileMode(entry);
+                var appliedAttributes = GetArchiveFileAttributes(entry);
                 files.Add(new CapturedFile(
                     root,
                     target,
@@ -246,7 +293,12 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
                     mode,
                     attributes,
                     lastWriteTimeUtc,
-                    lastAccessTimeUtc));
+                    lastAccessTimeUtc,
+                    appliedMode,
+                    appliedAttributes,
+                    entry.LastWriteTime.UtcDateTime,
+                    snapshotIdentity,
+                    stagedIdentity));
             }
 
             var stockFilesystemArchivePath = Path.Combine(scratchRoot, "stock-filesystem.zip");
@@ -256,6 +308,7 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
                 stockFilesystemArchivePath,
                 files,
                 directories.Values.OrderByDescending(item => item.Path.Length).ToList(),
+                appliedDirectories.OrderByDescending(item => item.Path.Length).ToList(),
                 absentDirectories.OrderByDescending(path => path.Length).ToList(),
                 roots);
             snapshot.WriteJournal(RestoreJournalPhase.Captured);
@@ -298,20 +351,46 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
             return;
         }
 
+        await using var recoveryLease = AcquireRecoveryLease(recoveryRoot);
+
+        // Only terminal directories already claimed to trash are scavenged here. Live
+        // restore-* names contain replayable journals and must never be age/PID deleted.
+        NpgsqlScratchSpace.Scavenge(recoveryRoot, "restore", ".no-live-restore-prefix-");
+
         foreach (var directory in Directory.EnumerateDirectories(recoveryRoot, "restore-*", SearchOption.TopDirectoryOnly))
         {
             cancellationToken.ThrowIfCancellationRequested();
             var journalPath = Path.Combine(directory, "recovery-journal.json");
             RestoreJournal journal;
+            using var recoveryDirectory = OpenRoot(directory);
             try
             {
+                NpgsqlScratchSpace.ValidateOwnedHandle(recoveryDirectory.Handle, "restore", Path.GetFileName(directory));
+            }
+            catch (InvalidDataException exception)
+            {
+                throw new InvalidDataException(
+                    $"PostgreSQL restore recovery is fail-closed because '{directory}' has no valid exclusive owner marker.",
+                    exception);
+            }
+
+            try
+            {
+                var journalDescriptor = NativeOpenAt(
+                    recoveryDirectory.Handle.DangerousGetHandle().ToInt32(),
+                    "recovery-journal.json",
+                    OpenReadOnly | OpenNoFollow | OpenCloseOnExec);
+                if (journalDescriptor < 0)
+                {
+                    throw new IOException(
+                        $"The restore recovery journal is missing or linked (errno {Marshal.GetLastPInvokeError()}).");
+                }
+
                 await using var stream = new FileStream(
-                    journalPath,
-                    FileMode.Open,
+                    new SafeFileHandle((nint)journalDescriptor, ownsHandle: true),
                     FileAccess.Read,
-                    FileShare.Read,
                     131072,
-                    FileOptions.Asynchronous | FileOptions.SequentialScan);
+                    isAsync: false);
                 journal = await JsonSerializer.DeserializeAsync<RestoreJournal>(
                     stream,
                     cancellationToken: cancellationToken).ConfigureAwait(false)
@@ -352,9 +431,11 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
                     journal.StockFilesystemArchivePath,
                     journal.Files,
                     journal.Directories,
+                    journal.AppliedDirectories ?? [],
                     journal.AbsentDirectories,
                     roots,
-                    journal.RestoreId);
+                    journal.RestoreId,
+                    recoveryDirectory.Identity);
                 roots = null!;
                 await using (snapshot.ConfigureAwait(false))
                 {
@@ -406,6 +487,55 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
         }
     }
 
+    private static FileStream AcquireRecoveryLease(string recoveryRoot)
+    {
+        using var root = OpenRoot(recoveryRoot);
+        var descriptor = NativeOpenAt(
+            root.Handle.DangerousGetHandle().ToInt32(),
+            ".jellyfin-npgsql-recovery.lock",
+            OpenReadWrite | OpenCreate | OpenNoFollow | OpenCloseOnExec,
+            384);
+        if (descriptor < 0)
+        {
+            throw new InvalidOperationException(
+                $"PostgreSQL restore recovery could not safely open its process lease (errno {Marshal.GetLastPInvokeError()}).");
+        }
+
+        var handle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        var stream = new FileStream(handle, FileAccess.ReadWrite);
+        try
+        {
+            stream.Lock(0, 1);
+            stream.SetLength(0);
+            stream.Position = 0;
+            using (var writer = new StreamWriter(stream, System.Text.Encoding.UTF8, 1024, leaveOpen: true))
+            {
+                writer.Write(Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                writer.Flush();
+            }
+
+            stream.Flush(flushToDisk: true);
+            return stream;
+        }
+        catch (IOException exception)
+        {
+            stream.Dispose();
+            throw new InvalidOperationException(
+                "Another Jellyfin process owns PostgreSQL restore recovery. Startup remains fail-closed until that process exits.",
+                exception);
+        }
+    }
+
+    /// <summary>Acquires the real process recovery lease for cross-process tests.</summary>
+    /// <param name="applicationDataPath">The isolated application data root.</param>
+    /// <returns>The held kernel lease.</returns>
+    internal static IDisposable AcquireRecoveryLeaseForTests(string applicationDataPath)
+    {
+        var recoveryRoot = Path.Combine(applicationDataPath, RecoveryDirectoryName);
+        Directory.CreateDirectory(recoveryRoot);
+        return AcquireRecoveryLease(recoveryRoot);
+    }
+
     private static void ValidateJournal(string directory, RestoreJournal journal)
     {
         if (!string.Equals(journal.Format, "jellyfin-npgsql-restore-recovery-v1", StringComparison.Ordinal)
@@ -432,6 +562,29 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
             if (!journal.Roots.Keys.Any(root => IsWithinRoot(root, Path.GetFullPath(file.TargetPath))))
             {
                 throw new InvalidDataException("The PostgreSQL restore recovery journal contains a target outside its captured roots.");
+            }
+
+            if (file.StagedIdentity is null || (file.SnapshotPath is not null && file.SnapshotIdentity is null))
+            {
+                throw new InvalidDataException("The PostgreSQL restore recovery journal contains an unpinned scratch file.");
+            }
+        }
+
+        foreach (var appliedDirectory in journal.AppliedDirectories ?? [])
+        {
+            if (!journal.Roots.ContainsKey(Path.GetFullPath(appliedDirectory.RootPath))
+                || !IsWithinRoot(appliedDirectory.RootPath, Path.GetFullPath(appliedDirectory.Path)))
+            {
+                throw new InvalidDataException("The PostgreSQL restore recovery journal contains a directory target outside its captured root.");
+            }
+        }
+
+        foreach (var capturedDirectory in journal.Directories)
+        {
+            if (capturedDirectory.Identity is null
+                || !journal.Roots.Keys.Any(root => IsWithinRoot(root, Path.GetFullPath(capturedDirectory.Path))))
+            {
+                throw new InvalidDataException("The PostgreSQL restore recovery journal contains an unpinned directory component.");
             }
         }
     }
@@ -483,22 +636,47 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
             root.VerifyNamespace();
         }
 
+        foreach (var directory in this.appliedDirectories.OrderBy(item => item.Path.Length))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var root = this.roots[Path.GetFullPath(directory.RootPath)];
+            using var handle = this.OpenDirectoryComponents(
+                root,
+                GetRelativePath(root.Path, directory.Path),
+                create: true);
+            FlushHandle(handle);
+        }
+
         foreach (var file in this.files)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var root = this.roots[Path.GetFullPath(file.RootPath)];
             root.VerifyNamespace();
-            using var parent = OpenParentDirectory(root, file.TargetPath, create: true);
+            using var parent = this.OpenParentDirectory(root, file.TargetPath, create: true);
             NpgsqlBackupFileSystem.Checkpoint("restore-apply-after-open-parent");
             var temporaryName = ".jellyfin-npgsql-apply-" + Guid.NewGuid().ToString("N");
             try
             {
                 using var temporary = await CopyToNewHandleAsync(
-                    file.StagedPath,
+                    this.scratchHandle,
+                    Path.GetFileName(file.StagedPath),
+                    file.StagedIdentity,
                     parent,
                     temporaryName,
                     NpgsqlBackupArchive.MaximumEntryBytes,
                     cancellationToken).ConfigureAwait(false);
+                if (file.AppliedMode is { } appliedMode)
+                {
+                    File.SetUnixFileMode(temporary, appliedMode);
+                }
+
+                File.SetAttributes(temporary, file.AppliedAttributes);
+                if (file.AppliedLastWriteTimeUtc != default)
+                {
+                    File.SetLastWriteTimeUtc(temporary, file.AppliedLastWriteTimeUtc);
+                    File.SetLastAccessTimeUtc(temporary, file.AppliedLastWriteTimeUtc);
+                }
+
                 FlushHandle(temporary);
                 NpgsqlBackupFileSystem.Checkpoint("restore-apply-before-rename");
                 root.VerifyNamespace();
@@ -511,6 +689,23 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
             {
                 UnlinkIfPresent(parent, temporaryName, removeDirectory: false);
             }
+        }
+
+        foreach (var directory in this.appliedDirectories)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var root = this.roots[Path.GetFullPath(directory.RootPath)];
+            root.VerifyNamespace();
+            using var handle = this.OpenDirectory(root, directory.Path);
+            File.SetUnixFileMode(handle, directory.Mode);
+            File.SetAttributes(handle, directory.Attributes);
+            if (directory.LastWriteTimeUtc != default)
+            {
+                File.SetLastWriteTimeUtc(handle, directory.LastWriteTimeUtc);
+                File.SetLastAccessTimeUtc(handle, directory.LastWriteTimeUtc);
+            }
+
+            FlushHandle(handle);
         }
 
         if (!databaseCommitted)
@@ -537,7 +732,7 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
             cancellationToken.ThrowIfCancellationRequested();
             var root = this.roots[Path.GetFullPath(file.RootPath)];
             namespaceChanged |= !root.IsVisibleNamespaceCurrent();
-            using var parent = OpenParentDirectory(root, file.TargetPath, create: true);
+            using var parent = this.OpenParentDirectory(root, file.TargetPath, create: true);
             NpgsqlBackupFileSystem.Checkpoint("restore-rollback-after-open-parent");
             var targetName = Path.GetFileName(file.TargetPath);
             if (file.SnapshotPath is null)
@@ -551,7 +746,9 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
             try
             {
                 using var replacement = await CopyToNewHandleAsync(
-                    file.SnapshotPath,
+                    this.scratchHandle,
+                    Path.GetFileName(file.SnapshotPath),
+                    file.SnapshotIdentity,
                     parent,
                     replacementName,
                     NpgsqlBackupArchive.MaximumEntryBytes,
@@ -583,7 +780,7 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
             var root = this.FindRoot(directory);
             try
             {
-                using var parent = OpenParentDirectory(root, directory, create: false);
+                using var parent = this.OpenParentDirectory(root, directory, create: false);
                 namespaceChanged |= !root.IsVisibleNamespaceCurrent();
                 UnlinkIfPresent(parent, Path.GetFileName(directory), removeDirectory: true);
                 FlushHandle(parent);
@@ -598,7 +795,7 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             var root = this.FindRoot(directory.Path);
-            using var handle = OpenDirectory(root, directory.Path);
+            using var handle = this.OpenDirectory(root, directory.Path);
             namespaceChanged |= !root.IsVisibleNamespaceCurrent();
             if (directory.Mode is { } mode)
             {
@@ -630,28 +827,49 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
             this.stockFilesystemArchivePath,
             this.files,
             this.directories,
+            this.appliedDirectories,
             this.absentDirectories,
             this.roots.ToDictionary(
                 item => item.Key,
                 item => item.Value.Identity,
                 StringComparer.Ordinal));
-        var temporary = this.journalPath + ".new";
-        var options = new FileStreamOptions
+        var temporaryName = ".recovery-journal-" + Guid.NewGuid().ToString("N") + ".new";
+        var descriptor = NativeOpenAt(
+            this.scratchHandle.DangerousGetHandle().ToInt32(),
+            temporaryName,
+            OpenWriteOnly | OpenCreate | OpenExclusive | OpenNoFollow | OpenCloseOnExec,
+            384);
+        if (descriptor < 0)
         {
-            Mode = FileMode.Create,
-            Access = FileAccess.Write,
-            Share = FileShare.None,
-            Options = FileOptions.WriteThrough,
-            UnixCreateMode = OwnerFileMode,
-        };
-        using (var stream = new FileStream(temporary, options))
-        {
-            JsonSerializer.Serialize(stream, journal);
-            stream.Flush(flushToDisk: true);
+            throw new IOException(
+                $"Could not safely create the restore recovery journal (errno {Marshal.GetLastPInvokeError()}).");
         }
 
-        File.Move(temporary, this.journalPath, overwrite: true);
-        NpgsqlBackupFileSystem.FlushDirectory(this.scratchRoot, "flush-restore-recovery-journal");
+        try
+        {
+            using (var stream = new FileStream(
+                new SafeFileHandle((nint)descriptor, ownsHandle: true),
+                FileAccess.Write))
+            {
+                descriptor = -1;
+                JsonSerializer.Serialize(stream, journal);
+                stream.Flush(flushToDisk: true);
+            }
+
+            RenameAt(this.scratchHandle, temporaryName, Path.GetFileName(this.journalPath));
+            NpgsqlBackupFileSystem.Checkpoint("flush-restore-recovery-journal");
+            FlushHandle(this.scratchHandle);
+        }
+        finally
+        {
+            if (descriptor >= 0)
+            {
+                using var failedHandle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+            }
+
+            UnlinkIfPresent(this.scratchHandle, temporaryName, removeDirectory: false);
+        }
+
         NpgsqlBackupFileSystem.Checkpoint("restore-journal-" + phase.ToString());
     }
 
@@ -811,6 +1029,61 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
         }
     }
 
+    private static void InspectDirectoryTarget(
+        RootHandle root,
+        string relative,
+        Dictionary<string, CapturedDirectory> directories,
+        HashSet<string> absentDirectories)
+    {
+        var components = relative.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
+        if (components.Length == 0 || components.Any(component => component is "." or ".."))
+        {
+            throw new InvalidDataException("A stock restore directory has an unsafe relative path.");
+        }
+
+        var current = Duplicate(root.Handle);
+        try
+        {
+            CaptureDirectoryMetadata(root.Path, string.Empty, current, directories);
+            var traversed = string.Empty;
+            for (var index = 0; index < components.Length; index++)
+            {
+                var component = components[index];
+                traversed = string.IsNullOrEmpty(traversed) ? component : Path.Combine(traversed, component);
+                var descriptor = NativeOpenAt(
+                    current.DangerousGetHandle().ToInt32(),
+                    component,
+                    OpenReadOnly | OpenDirectoryFlag | OpenNoFollow | OpenCloseOnExec);
+                if (descriptor < 0)
+                {
+                    var error = Marshal.GetLastPInvokeError();
+                    if (error == 2)
+                    {
+                        for (var missing = index; missing < components.Length; missing++)
+                        {
+                            var missingRelative = string.Join(Path.DirectorySeparatorChar, components.Take(missing + 1));
+                            absentDirectories.Add(Path.Combine(root.Path, missingRelative));
+                        }
+
+                        return;
+                    }
+
+                    throw new InvalidDataException(
+                        $"Stock restore directory '{Path.Combine(root.Path, relative)}' traverses a linked or non-directory component '{component}' (errno {error}).");
+                }
+
+                var previous = current;
+                current = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+                previous.Dispose();
+                CaptureDirectoryMetadata(root.Path, traversed, current, directories);
+            }
+        }
+        finally
+        {
+            current.Dispose();
+        }
+    }
+
     private static void CaptureDirectoryMetadata(
         string root,
         string relative,
@@ -836,7 +1109,8 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
                 File.GetUnixFileMode(handle),
                 File.GetAttributes(handle),
                 File.GetLastWriteTimeUtc(handle),
-                File.GetLastAccessTimeUtc(handle)));
+                File.GetLastAccessTimeUtc(handle),
+                ReadIdentity(handle)));
     }
 
     private static async Task CopyBoundedAsync(
@@ -940,7 +1214,9 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
     }
 
     private static async Task<SafeFileHandle> CopyToNewHandleAsync(
-        string source,
+        SafeFileHandle scratch,
+        string sourceName,
+        FileIdentity? expectedSourceIdentity,
         SafeFileHandle parent,
         string name,
         long maximumBytes,
@@ -959,13 +1235,34 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
         var handle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
         try
         {
+            var inputDescriptor = NativeOpenAt(
+                scratch.DangerousGetHandle().ToInt32(),
+                sourceName,
+                OpenReadOnly | OpenNoFollow | OpenCloseOnExec);
+            if (inputDescriptor < 0)
+            {
+                throw new InvalidDataException(
+                    $"Restore scratch source '{sourceName}' is missing, linked, or replaced (errno {Marshal.GetLastPInvokeError()}).");
+            }
+
+            using (var validationHandle = new SafeFileHandle((nint)inputDescriptor, ownsHandle: false))
+            {
+                var stat = ReadStat(validationHandle);
+                if (expectedSourceIdentity is null
+                    || ReadIdentity(validationHandle) != expectedSourceIdentity
+                    || stat.LinkCount != 1
+                    || (stat.Mode & 0xF000) != 0x8000)
+                {
+                    throw new InvalidDataException(
+                        $"Restore scratch source '{sourceName}' changed identity or is not an exclusive regular file.");
+                }
+            }
+
             await using var input = new FileStream(
-                source,
-                FileMode.Open,
+                new SafeFileHandle((nint)inputDescriptor, ownsHandle: true),
                 FileAccess.Read,
-                FileShare.Read,
                 131072,
-                FileOptions.Asynchronous | FileOptions.SequentialScan);
+                isAsync: false);
             await using (var output = new FileStream(handle, FileAccess.Write, 131072, isAsync: false))
             {
                 var buffer = new byte[131072];
@@ -1046,6 +1343,70 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
                 await output.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
         }
+    }
+
+    private static UnixFileMode GetArchiveFileMode(ZipArchiveEntry entry)
+    {
+        const int typeMask = 0xF000;
+        const int regularFile = 0x8000;
+        const int permissionsMask = 0x0FFF;
+        const int unsafeSpecialBits = 0x0E00;
+        const int otherWrite = 0x0002;
+        var raw = (entry.ExternalAttributes >> 16) & 0xFFFF;
+        var type = raw & typeMask;
+        if (type != 0 && type != regularFile)
+        {
+            throw new InvalidDataException($"Restore entry '{entry.FullName}' is not a regular ZIP file.");
+        }
+
+        var permissions = raw & permissionsMask;
+        if (permissions == 0)
+        {
+            permissions = 0x180; // 0600 when the archive has no Unix mode contract.
+        }
+
+        if ((permissions & (unsafeSpecialBits | otherWrite)) != 0)
+        {
+            throw new InvalidDataException(
+                $"Restore entry '{entry.FullName}' has unsafe special or world-writable mode bits.");
+        }
+
+        return (UnixFileMode)permissions;
+    }
+
+    private static UnixFileMode GetArchiveDirectoryMode(ZipArchiveEntry entry)
+    {
+        const int typeMask = 0xF000;
+        const int directory = 0x4000;
+        const int permissionsMask = 0x0FFF;
+        const int unsafeSpecialBits = 0x0E00;
+        const int otherWrite = 0x0002;
+        var raw = (entry.ExternalAttributes >> 16) & 0xFFFF;
+        var type = raw & typeMask;
+        if (type != 0 && type != directory)
+        {
+            throw new InvalidDataException($"Restore entry '{entry.FullName}' is not a ZIP directory.");
+        }
+
+        var permissions = raw & permissionsMask;
+        if (permissions == 0)
+        {
+            permissions = 0x1C0; // 0700 when the archive has no Unix mode contract.
+        }
+
+        if ((permissions & (unsafeSpecialBits | otherWrite)) != 0)
+        {
+            throw new InvalidDataException(
+                $"Restore entry '{entry.FullName}' has unsafe special or world-writable directory mode bits.");
+        }
+
+        return (UnixFileMode)permissions;
+    }
+
+    private static FileAttributes GetArchiveFileAttributes(ZipArchiveEntry entry)
+    {
+        const FileAttributes supported = FileAttributes.ReadOnly | FileAttributes.Hidden | FileAttributes.Archive | FileAttributes.Normal;
+        return (FileAttributes)(entry.ExternalAttributes & (int)supported);
     }
 
     private static async Task CreateStockFilesystemArchiveAsync(
@@ -1149,17 +1510,17 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
         return root ?? throw new InvalidOperationException($"No captured restore root owns '{path}'.");
     }
 
-    private static SafeFileHandle OpenParentDirectory(RootHandle root, string targetPath, bool create)
+    private SafeFileHandle OpenParentDirectory(RootHandle root, string targetPath, bool create)
     {
         var relative = GetRelativePath(root.Path, targetPath);
         var parent = Path.GetDirectoryName(relative);
-        return OpenDirectoryComponents(root, parent, create);
+        return this.OpenDirectoryComponents(root, parent, create);
     }
 
-    private static SafeFileHandle OpenDirectory(RootHandle root, string path)
-        => OpenDirectoryComponents(root, GetRelativePath(root.Path, path), create: false);
+    private SafeFileHandle OpenDirectory(RootHandle root, string path)
+        => this.OpenDirectoryComponents(root, GetRelativePath(root.Path, path), create: false);
 
-    private static SafeFileHandle OpenDirectoryComponents(RootHandle root, string? relative, bool create)
+    private SafeFileHandle OpenDirectoryComponents(RootHandle root, string? relative, bool create)
     {
         var duplicate = NativeDup(root.Handle.DangerousGetHandle().ToInt32());
         if (duplicate < 0)
@@ -1175,8 +1536,10 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
                 return current;
             }
 
+            var traversed = string.Empty;
             foreach (var component in relative.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
             {
+                traversed = string.IsNullOrEmpty(traversed) ? component : Path.Combine(traversed, component);
                 var next = NativeOpenAt(
                     current.DangerousGetHandle().ToInt32(),
                     component,
@@ -1212,6 +1575,14 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
                 var previous = current;
                 current = new SafeFileHandle((nint)next, ownsHandle: true);
                 previous.Dispose();
+                var componentPath = Path.Combine(root.Path, traversed);
+                var captured = this.directories.FirstOrDefault(
+                    candidate => string.Equals(candidate.Path, componentPath, StringComparison.Ordinal));
+                if (captured is not null && ReadIdentity(current) != captured.Identity)
+                {
+                    throw new InvalidDataException(
+                        $"Restore directory component '{componentPath}' was replaced after capture.");
+                }
             }
 
             return current;
@@ -1293,6 +1664,28 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
         }
     }
 
+    private static FileIdentity ReadChildIdentity(SafeFileHandle parent, string name)
+    {
+        var descriptor = NativeOpenAt(
+            parent.DangerousGetHandle().ToInt32(),
+            name,
+            OpenReadOnly | OpenNoFollow | OpenCloseOnExec);
+        if (descriptor < 0)
+        {
+            throw new IOException(
+                $"Could not identify restore scratch file '{name}' (errno {Marshal.GetLastPInvokeError()}).");
+        }
+
+        using var handle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        var stat = ReadStat(handle);
+        if (stat.LinkCount != 1 || (stat.Mode & 0xF000) != 0x8000)
+        {
+            throw new InvalidDataException($"Restore scratch file '{name}' is not an exclusive regular file.");
+        }
+
+        return ReadIdentity(handle);
+    }
+
     private static FileStat ReadStat(SafeFileHandle handle)
     {
         var buffer = Marshal.AllocHGlobal(256);
@@ -1334,10 +1727,7 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
 
     private static void DeleteScratch(string path)
     {
-        if (Directory.Exists(path))
-        {
-            Directory.Delete(path, true);
-        }
+        NpgsqlScratchSpace.ClaimAndDelete(path, "restore");
     }
 
 #pragma warning disable CA2101 // LPUTF8Str explicitly matches Linux filesystem path encoding.
@@ -1412,14 +1802,27 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
         UnixFileMode? Mode,
         FileAttributes Attributes,
         DateTime LastWriteTimeUtc,
-        DateTime LastAccessTimeUtc);
+        DateTime LastAccessTimeUtc,
+        UnixFileMode? AppliedMode = null,
+        FileAttributes AppliedAttributes = FileAttributes.Normal,
+        DateTime AppliedLastWriteTimeUtc = default,
+        FileIdentity? SnapshotIdentity = null,
+        FileIdentity? StagedIdentity = null);
 
     private sealed record CapturedDirectory(
         string Path,
         UnixFileMode? Mode,
         FileAttributes Attributes,
         DateTime LastWriteTimeUtc,
-        DateTime LastAccessTimeUtc);
+        DateTime LastAccessTimeUtc,
+        FileIdentity Identity);
+
+    private sealed record AppliedDirectory(
+        string RootPath,
+        string Path,
+        UnixFileMode Mode,
+        FileAttributes Attributes,
+        DateTime LastWriteTimeUtc);
 
     private sealed record FileStat(uint LinkCount, ushort Mode, long Length);
 
@@ -1430,6 +1833,7 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
         string StockFilesystemArchivePath,
         List<CapturedFile> Files,
         List<CapturedDirectory> Directories,
+        List<AppliedDirectory>? AppliedDirectories,
         List<string> AbsentDirectories,
         Dictionary<string, FileIdentity> Roots);
 

@@ -3,6 +3,32 @@ using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
 using MediaBrowser.Controller;
 using Npgsql;
 
+if (args.Length == 4 && args[0] == "restore-recovery-lease-hold")
+{
+    using var lease = NpgsqlRestoreFileSnapshot.AcquireRecoveryLeaseForTests(args[1]);
+    await File.WriteAllTextAsync(args[2], "ready", CancellationToken.None).ConfigureAwait(false);
+    await Task.Delay(
+        TimeSpan.FromSeconds(int.Parse(args[3], System.Globalization.CultureInfo.InvariantCulture)),
+        CancellationToken.None).ConfigureAwait(false);
+    return 0;
+}
+
+if (args.Length == 2 && args[0] == "restore-recovery-lease-expect-blocked")
+{
+    try
+    {
+        await NpgsqlRestoreFileSnapshot.RecoverPendingAsync(
+            args[1],
+            "Host=should-not-connect.invalid;Database=none;Username=none",
+            CancellationToken.None).ConfigureAwait(false);
+        return 1;
+    }
+    catch (InvalidOperationException exception) when (exception.Message.Contains("owns PostgreSQL restore recovery", StringComparison.Ordinal))
+    {
+        return 0;
+    }
+}
+
 if (args.Length == 2 && args[0] == "restore-recovery-crash")
 {
     var connectionString = Environment.GetEnvironmentVariable("JELLYFIN_NPGSQL_RESTORE_CRASH_CONNECTION")

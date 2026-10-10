@@ -15,19 +15,25 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
     internal const long DefaultMaximumPhysicalBytes = 8L * 1024 * 1024 * 1024;
     internal const int MaximumCanonicalKeyBytes = 1024 * 1024;
     private const int SortMemoryBytes = 16 * 1024 * 1024;
+    private const int MaximumMergeReaders = 32;
     private const UnixFileMode OwnerFileMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
     private static readonly AsyncLocal<Func<ReadOnlyMemory<byte>, byte[]>?> DigestOverride = new();
     private static readonly AsyncLocal<long?> QuotaOverride = new();
+    private static readonly AsyncLocal<int?> SortMemoryOverride = new();
     private readonly string root;
     private readonly long maximumPhysicalBytes;
+    private readonly CancellationToken cancellationToken;
+    private readonly int sortMemoryBytes;
     private readonly Dictionary<int, SetState> sets = new();
     private long physicalBytes;
     private long writes;
     private bool disposed;
 
-    internal NpgsqlExactDiskIndex(string root)
+    internal NpgsqlExactDiskIndex(string root, CancellationToken cancellationToken = default)
     {
         this.root = root;
+        this.cancellationToken = cancellationToken;
+        this.sortMemoryBytes = SortMemoryOverride.Value ?? SortMemoryBytes;
         this.maximumPhysicalBytes = QuotaOverride.Value ?? DefaultMaximumPhysicalBytes;
         Directory.CreateDirectory(root);
         if (!OperatingSystem.IsWindows())
@@ -53,6 +59,14 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
         return new CallbackScope(() => QuotaOverride.Value = previous);
     }
 
+    internal static IDisposable InjectSortMemoryForTests(int bytes)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(bytes);
+        var previous = SortMemoryOverride.Value;
+        SortMemoryOverride.Value = bytes;
+        return new CallbackScope(() => SortMemoryOverride.Value = previous);
+    }
+
     internal void Add(
         int setId,
         ReadOnlySpan<byte> canonicalValue,
@@ -60,6 +74,7 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
         string duplicateDescription)
     {
         ObjectDisposedException.ThrowIf(this.disposed, this);
+        this.cancellationToken.ThrowIfCancellationRequested();
         if (canonicalValue.Length > MaximumCanonicalKeyBytes)
         {
             throw new InvalidDataException(
@@ -111,6 +126,7 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
     {
         try
         {
+            this.cancellationToken.ThrowIfCancellationRequested();
             var set = this.RequireSet(setId);
             if (set.CompletedPath is not null)
             {
@@ -143,12 +159,13 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
     {
         this.CompleteSet(referenceSetId);
         this.CompleteSet(principalSetId);
-        using var references = new RecordReader(this.RequireSet(referenceSetId).CompletedPath!, sorted: true);
-        using var principals = new RecordReader(this.RequireSet(principalSetId).CompletedPath!, sorted: true);
+        using var references = new RecordReader(this.RequireSet(referenceSetId).CompletedPath!, sorted: true, this.cancellationToken);
+        using var principals = new RecordReader(this.RequireSet(principalSetId).CompletedPath!, sorted: true, this.cancellationToken);
         var reference = references.Read();
         var principal = principals.Read();
         while (reference is not null)
         {
+            this.cancellationToken.ThrowIfCancellationRequested();
             while (principal is not null && ByteArrayComparer.Instance.Compare(principal, reference) < 0)
             {
                 principal = principals.Read();
@@ -178,17 +195,8 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
             set.Writer.Dispose();
         }
 
-        if (Directory.Exists(this.root))
-        {
-            try
-            {
-                Directory.Delete(this.root, recursive: true);
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-            {
-                // The owner marker lets startup scavenging retry interrupted cleanup.
-            }
-        }
+        // ModelValidationState owns and atomically claims the marked root after this
+        // index has released every file handle.
     }
 
     private static FileStream OpenWrite(string path)
@@ -212,13 +220,15 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
     private List<string> CreateRuns(SetState set)
     {
         var runs = new List<string>();
-        using var reader = new RecordReader(set.UnsortedPath, sorted: false);
+        using var reader = new RecordReader(set.UnsortedPath, sorted: false, this.cancellationToken);
         while (true)
         {
+            this.cancellationToken.ThrowIfCancellationRequested();
             var records = new List<byte[]>();
             var bytes = 0;
-            while (bytes < SortMemoryBytes && reader.Read() is { } record)
+            while (bytes < this.sortMemoryBytes && reader.Read() is { } record)
             {
+                this.cancellationToken.ThrowIfCancellationRequested();
                 records.Add(record);
                 bytes = checked(bytes + record.Length + 8);
             }
@@ -228,13 +238,17 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
                 break;
             }
 
+            this.cancellationToken.ThrowIfCancellationRequested();
+            NpgsqlBackupFileSystem.Checkpoint("validation-index-before-sort");
             records.Sort(ByteArrayComparer.Instance);
+            this.cancellationToken.ThrowIfCancellationRequested();
             var run = Path.Combine(this.root, $"run-{Guid.NewGuid():N}");
             using (var writer = OpenWrite(run))
             {
                 byte[]? previous = null;
                 foreach (var record in records)
                 {
+                    this.cancellationToken.ThrowIfCancellationRequested();
                     if (previous is not null && previous.AsSpan().SequenceEqual(record))
                     {
                         if (!set.DuplicatesAllowed)
@@ -259,16 +273,61 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
         return runs;
     }
 
-    private string MergeRuns(SetState set, IReadOnlyList<string> runs)
+    private string MergeRuns(SetState set, List<string> runs)
     {
         var outputPath = Path.Combine(this.root, $"set-{set.Id:D5}.sorted");
+        if (runs.Count == 0)
+        {
+            using var empty = OpenWrite(outputPath);
+            empty.Flush(flushToDisk: true);
+            return outputPath;
+        }
+
+        var current = runs.ToList();
+        try
+        {
+            while (current.Count > MaximumMergeReaders)
+            {
+                this.cancellationToken.ThrowIfCancellationRequested();
+                var next = new List<string>();
+                foreach (var batch in current.Chunk(MaximumMergeReaders))
+                {
+                    this.cancellationToken.ThrowIfCancellationRequested();
+                    var intermediate = Path.Combine(this.root, $"merge-{Guid.NewGuid():N}");
+                    this.MergeBatch(set, batch, intermediate);
+                    next.Add(intermediate);
+                }
+
+                foreach (var path in current.Where(path => !runs.Contains(path, StringComparer.Ordinal)))
+                {
+                    TryDelete(path);
+                }
+
+                current = next;
+            }
+
+            this.MergeBatch(set, current, outputPath);
+            return outputPath;
+        }
+        finally
+        {
+            foreach (var path in current.Where(path => !runs.Contains(path, StringComparer.Ordinal)))
+            {
+                TryDelete(path);
+            }
+        }
+    }
+
+    private void MergeBatch(SetState set, IReadOnlyList<string> paths, string outputPath)
+    {
         using var output = OpenWrite(outputPath);
-        var readers = runs.Select(path => new RecordReader(path, sorted: true)).ToArray();
+        var readers = paths.Select(path => new RecordReader(path, sorted: true, this.cancellationToken)).ToArray();
         try
         {
             var queue = new PriorityQueue<(byte[] Value, int Reader), byte[]>(ByteArrayComparer.Instance);
             for (var index = 0; index < readers.Length; index++)
             {
+                this.cancellationToken.ThrowIfCancellationRequested();
                 if (readers[index].Read() is { } value)
                 {
                     queue.Enqueue((value, index), value);
@@ -278,6 +337,7 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
             byte[]? previous = null;
             while (queue.TryDequeue(out var item, out _))
             {
+                this.cancellationToken.ThrowIfCancellationRequested();
                 if (previous is not null && previous.AsSpan().SequenceEqual(item.Value))
                 {
                     if (!set.DuplicatesAllowed)
@@ -299,7 +359,6 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
 
             output.Flush(flushToDisk: true);
             this.CheckActualPhysicalBytes();
-            return outputPath;
         }
         finally
         {
@@ -312,6 +371,7 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
 
     private void WriteRecord(Stream writer, byte[] record)
     {
+        this.cancellationToken.ThrowIfCancellationRequested();
         this.Reserve(checked(4L + record.Length));
         NpgsqlBackupFileSystem.Checkpoint("validation-index-write");
         Span<byte> length = stackalloc byte[4];
@@ -345,6 +405,7 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
         {
             foreach (var path in Directory.EnumerateFiles(this.root, "*", SearchOption.TopDirectoryOnly))
             {
+                this.cancellationToken.ThrowIfCancellationRequested();
                 actual = checked(actual + new FileInfo(path).Length);
             }
         }
@@ -409,14 +470,18 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
         private readonly FileStream stream;
         private readonly bool sorted;
 
-        internal RecordReader(string path, bool sorted)
+        private readonly CancellationToken cancellationToken;
+
+        internal RecordReader(string path, bool sorted, CancellationToken cancellationToken)
         {
             this.stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 131072, FileOptions.SequentialScan);
             this.sorted = sorted;
+            this.cancellationToken = cancellationToken;
         }
 
         internal byte[]? Read()
         {
+            this.cancellationToken.ThrowIfCancellationRequested();
             Span<byte> header = stackalloc byte[8];
             var first = this.stream.Read(header[..1]);
             if (first == 0)

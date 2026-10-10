@@ -11,6 +11,7 @@ using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace Jellyfin.Plugin.Database.Npgsql;
 
@@ -22,11 +23,19 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
     private static readonly SemaphoreSlim ProviderOperationGate = new(1, 1);
 
     private static readonly TimeSpan OperationDeadline = TimeSpan.FromMinutes(10);
+    private static readonly Action<ILogger, string, Exception?> LogShutdownFault = LoggerMessage.Define<string>(
+        LogLevel.Critical,
+        new EventId(9101, "NpgsqlRestoreShutdownStalled"),
+        "{Message}");
+
+    private static string? terminalShutdownFault;
+    private static TaskCompletionSource shutdownFaultSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private readonly IBackupService inner;
     private readonly bool isActiveProvider;
     private readonly IServiceProvider? services;
     private readonly IHostApplicationLifetime? applicationLifetime;
+    private readonly ILogger<NpgsqlBackupServiceDecorator>? logger;
 
     /// <summary>Initializes a new instance of the <see cref="NpgsqlBackupServiceDecorator"/> class without a runtime model.</summary>
     /// <param name="inner">The exact stock Jellyfin service.</param>
@@ -46,6 +55,12 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
         this.isActiveProvider = isActiveProvider;
         this.services = services;
         this.applicationLifetime = services?.GetService<IHostApplicationLifetime>();
+        this.logger = services?.GetService<ILogger<NpgsqlBackupServiceDecorator>>();
+        var applicationPaths = services?.GetService<IServerApplicationPaths>();
+        if (applicationPaths is not null)
+        {
+            NpgsqlScratchSpace.ConfigureRoot(applicationPaths.DataPath);
+        }
     }
 
     /// <inheritdoc />
@@ -58,7 +73,7 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
         }
 
         using var deadline = new CancellationTokenSource(OperationDeadline);
-        await ProviderOperationGate.WaitAsync(deadline.Token).ConfigureAwait(false);
+        await WaitForProviderGateAsync(deadline.Token).ConfigureAwait(false);
         try
         {
             using var scope = NpgsqlBackupScope.Enter();
@@ -127,6 +142,7 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
             return;
         }
 
+        ThrowIfTerminalShutdownFault();
         ProviderOperationGate.Wait(deadline.Token);
         var handoffStarted = false;
         ShutdownGateRelease? release = null;
@@ -146,7 +162,13 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
                     "The PostgreSQL restore cannot schedule a restart because the host application lifetime is unavailable. The provider operation gate remains fail-closed.");
             }
 
-            release = new ShutdownGateRelease();
+            if (this.applicationLifetime.ApplicationStopped.IsCancellationRequested)
+            {
+                throw new InvalidOperationException(
+                    "The PostgreSQL restore cannot schedule a restart after the host lifetime has already stopped.");
+            }
+
+            release = new ShutdownGateRelease(this.logger, GetShutdownDeadline());
             stoppedRegistration = this.applicationLifetime.ApplicationStopped.Register(release.Release);
             this.inner.ScheduleRestoreAndRestartServer(archivePath);
             handoffStarted = true;
@@ -162,10 +184,24 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
         }
     }
 
+    /// <summary>Clears only the observable watchdog state after a test has acknowledged shutdown.</summary>
+    internal static void ResetShutdownFaultForTests()
+    {
+        Volatile.Write(ref terminalShutdownFault, null);
+        Volatile.Write(
+            ref shutdownFaultSignal,
+            new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+    }
+
 #pragma warning disable SA1201 // Gate callback is kept beside the scheduling operation it protects.
     private sealed class ShutdownGateRelease
     {
         private int released;
+
+        internal ShutdownGateRelease(ILogger? logger, TimeSpan deadline)
+        {
+            _ = this.WatchAsync(logger, deadline);
+        }
 
         internal void Release()
         {
@@ -176,6 +212,65 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
         }
 
         internal void Abandon() => _ = Interlocked.Exchange(ref this.released, 1);
+
+        private async Task WatchAsync(ILogger? logger, TimeSpan deadline)
+        {
+            await Task.Delay(deadline).ConfigureAwait(false);
+            if (Volatile.Read(ref this.released) != 0)
+            {
+                return;
+            }
+
+            var message = $"Jellyfin did not reach ApplicationStopped within {deadline}. PostgreSQL backup and restore remain disabled fail-closed; inspect host shutdown logs and restart the process.";
+            Interlocked.CompareExchange(ref terminalShutdownFault, message, null);
+            Volatile.Read(ref shutdownFaultSignal).TrySetResult();
+            if (logger is not null)
+            {
+                LogShutdownFault(logger, message, null);
+            }
+        }
+    }
+
+    private static void ThrowIfTerminalShutdownFault()
+    {
+        if (Volatile.Read(ref terminalShutdownFault) is { } fault)
+        {
+            throw new InvalidOperationException(fault);
+        }
+    }
+
+    private static async Task WaitForProviderGateAsync(CancellationToken cancellationToken)
+    {
+        ThrowIfTerminalShutdownFault();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var wait = ProviderOperationGate.WaitAsync(linked.Token);
+        var faultSignal = Volatile.Read(ref shutdownFaultSignal).Task;
+        if (await Task.WhenAny(wait, faultSignal).ConfigureAwait(false) == faultSignal)
+        {
+            await linked.CancelAsync().ConfigureAwait(false);
+            try
+            {
+                await wait.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (linked.IsCancellationRequested)
+            {
+                // Prevent the abandoned waiter from acquiring the gate later.
+            }
+
+            ThrowIfTerminalShutdownFault();
+        }
+
+        await wait.ConfigureAwait(false);
+    }
+
+    private static TimeSpan GetShutdownDeadline()
+    {
+        const int defaultSeconds = 30;
+        var configured = Environment.GetEnvironmentVariable("JELLYFIN_NPGSQL_SHUTDOWN_DEADLINE_SECONDS");
+        return int.TryParse(configured, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var seconds)
+            && seconds is >= 1 and <= 600
+            ? TimeSpan.FromSeconds(seconds)
+            : TimeSpan.FromSeconds(defaultSeconds);
     }
 
     private static async Task RestoreHistoryAsync(
@@ -297,7 +392,7 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
         Microsoft.EntityFrameworkCore.Metadata.IModel? model)
     {
         using var deadline = new CancellationTokenSource(OperationDeadline);
-        await ProviderOperationGate.WaitAsync(deadline.Token).ConfigureAwait(false);
+        await WaitForProviderGateAsync(deadline.Token).ConfigureAwait(false);
         var keepGateHeld = false;
         try
         {

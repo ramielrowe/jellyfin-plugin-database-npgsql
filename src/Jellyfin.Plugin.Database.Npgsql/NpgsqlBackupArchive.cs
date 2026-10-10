@@ -511,23 +511,19 @@ internal static class NpgsqlBackupArchive
             throw new InvalidDataException("The backup archive exceeds the supported compressed-size limit.");
         }
 
-        var directory = Path.GetDirectoryName(Path.GetFullPath(archivePath))
-            ?? throw new InvalidOperationException("The restore archive has no parent directory.");
-        var snapshotPath = Path.Combine(
-            directory,
-            $".jellyfin-npgsql-restore-{Guid.NewGuid():N}.zip");
+        var snapshotParent = Path.Combine(NpgsqlScratchSpace.GetRoot(), "snapshots");
+        NpgsqlScratchSpace.Scavenge(snapshotParent, "snapshot", "snapshot-");
+        var snapshotDirectory = NpgsqlScratchSpace.CreateOwnedDirectory(snapshotParent, "snapshot");
+        var snapshotPath = Path.Combine(snapshotDirectory, "archive.zip");
         try
         {
             await CopyFileAsync(archivePath, snapshotPath, operationToken).ConfigureAwait(false);
             await ValidateAsync(snapshotPath, model, operationToken).ConfigureAwait(false);
-            return new ValidatedArchiveSnapshot(snapshotPath);
+            return new ValidatedArchiveSnapshot(snapshotPath, snapshotDirectory);
         }
         catch
         {
-            if (File.Exists(snapshotPath))
-            {
-                File.Delete(snapshotPath);
-            }
+            NpgsqlScratchSpace.ClaimAndDelete(snapshotDirectory, "snapshot");
 
             throw;
         }
@@ -1113,10 +1109,17 @@ internal static class NpgsqlBackupArchive
         /// Initializes a new instance of the <see cref="ValidatedArchiveSnapshot"/> class.
         /// </summary>
         /// <param name="path">The exact marker-owned snapshot path.</param>
-        internal ValidatedArchiveSnapshot(string path) => this.Path = path;
+        /// <param name="ownedDirectory">The atomically claimable owner-marked generation.</param>
+        internal ValidatedArchiveSnapshot(string path, string ownedDirectory)
+        {
+            this.Path = path;
+            this.OwnedDirectory = ownedDirectory;
+        }
 
         /// <summary>Gets the marker-named snapshot path.</summary>
         internal string Path { get; }
+
+        private string OwnedDirectory { get; }
 
         /// <inheritdoc />
         public void Dispose()
@@ -1127,10 +1130,7 @@ internal static class NpgsqlBackupArchive
             }
 
             this.disposed = true;
-            if (File.Exists(this.Path))
-            {
-                File.Delete(this.Path);
-            }
+            NpgsqlScratchSpace.ClaimAndDelete(this.OwnedDirectory, "snapshot");
         }
     }
 
@@ -1173,7 +1173,7 @@ internal static class NpgsqlBackupArchive
             this.scratchRoot = NpgsqlScratchSpace.CreateOwnedDirectory(scratchParent, "validation");
             try
             {
-                this.index = new NpgsqlExactDiskIndex(this.scratchRoot);
+                this.index = new NpgsqlExactDiskIndex(this.scratchRoot, cancellationToken);
             }
             catch
             {
@@ -1215,6 +1215,14 @@ internal static class NpgsqlBackupArchive
 
             this.disposed = true;
             this.index.Dispose();
+            try
+            {
+                DeleteValidationScratch(this.scratchRoot);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
+            {
+                // The atomically claimed tombstone is safely scavenged on the next validation.
+            }
         }
 
         internal void AddHistory(string migrationId, string productVersion)
@@ -1369,10 +1377,7 @@ internal static class NpgsqlBackupArchive
 
         private static void DeleteValidationScratch(string path)
         {
-            if (Directory.Exists(path))
-            {
-                Directory.Delete(path, true);
-            }
+            NpgsqlScratchSpace.ClaimAndDelete(path, "validation");
         }
 
         private static byte[] EncodeValues(

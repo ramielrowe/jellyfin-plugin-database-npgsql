@@ -27,10 +27,12 @@ the stock service extracts configuration or touches PostgreSQL. ZIP names are
 canonicalized under the same extraction semantics as the stock service, with
 case, Unicode, separator, dot-segment, ADS, trailing-dot/space, absolute-path,
 and file/directory aliases rejected. Restore uses a deadline-bounded,
-owner-only, marker-named recovery directory below the Jellyfin data path and
-deletes only that owned directory afterward. Test-only scratch defaults below
-the repository's ignored `.artifacts/npgsql-scratch` tree; deployments may set
-`JELLYFIN_NPGSQL_SCRATCH_ROOT` to another private writable location.
+owner-only, marker-named recovery directory below the Jellyfin data path. All
+validation and `HomeSection` scratch also lives below the configured data path's
+`.jellyfin-npgsql-scratch` root. Test-only use before application paths exist
+defaults to the repository's ignored `.artifacts/npgsql-scratch` tree;
+deployments may set `JELLYFIN_NPGSQL_SCRATCH_ROOT` to another private writable
+location.
 
 The decorator first lets stock process a sanitized archive whose manifest has
 no database or production-file payloads. It then creates an unpooled restore
@@ -56,8 +58,10 @@ sort prefix: canonical composite-key bytes are retained and compared in full,
 so a digest collision cannot create equality. The index has a 1 MiB canonical
 key limit and an enforced 8 GiB physical-write quota (including unsorted data,
 runs, and merged output) while the archive remains capped at ten million rows.
-It uses bounded 16 MiB sort chunks, needs no SQLite library from the host, and
-fails deterministically if its real write accounting exceeds quota. Owner
+It uses bounded 16 MiB sort chunks and at most 32 merge readers, threads the
+operation cancellation token through ingestion, sorting, run creation, and
+multi-pass merge, needs no SQLite library from the host, and fails
+deterministically if its real write accounting exceeds quota. Owner
 markers include process identity; dead validation directories are scavenged on
 the next validation while live/concurrent or unmarked directories are never
 removed. ZIP central-directory size and count are checked before `ZipArchive`
@@ -68,6 +72,10 @@ through cleanup. After a scheduled restore it remains held until the host's
 actual `ApplicationStopped` acknowledgement. A delayed or failed shutdown does
 not reopen the gate in the same process; later operations fail closed instead
 of racing the scheduled restore.
+The shutdown acknowledgement watchdog defaults to 30 seconds and may be set to
+1–600 seconds with `JELLYFIN_NPGSQL_SHUTDOWN_DEADLINE_SECONDS`. Expiry emits an
+actionable critical log and makes later calls reject immediately while keeping
+the gate held; it never treats a timeout as permission to race the restore.
 Before restore, the decorator captures file contents plus file and directory
 metadata (including configured roots) and pre-extracts archive files into an
 owner-only directory. Stock receives a private payload-free archive, so it
@@ -81,6 +89,11 @@ required handle-relative proof fail closed before filesystem mutation. Any
 later failure restores overwritten files, modes, attributes, and timestamps,
 removes newly created targets/directories, and rolls back the still-open
 provider transaction.
+Successful application restores each ZIP file's supported Unix mode, safe file
+attributes, and ZIP timestamp. Special mode bits, non-regular types, and
+world-writable files are rejected; absent Unix metadata is normalized to
+owner-read/write. Scratch files and directories remain owner-only regardless of
+archive metadata.
 
 Before the first transactional or filesystem mutation, the plugin durably
 writes a versioned recovery journal, complete old-file snapshots, staged new
@@ -94,6 +107,13 @@ the journal and marker and idempotently completes either the exact new file
 state (committed marker) or the exact old file state (no marker). Once the
 committed journal is durable, marker and snapshot cleanup are best effort and
 retryable; cleanup failure cannot misreport a committed restore as failed.
+Terminal cleanup first validates the owner marker through an open no-follow
+directory handle, atomically renames that exact device/inode generation to a
+unique same-parent tombstone, fsyncs the parent, and only then performs
+handle-relative deletion. A replacement at the old name is therefore never
+deleted. Interrupted tombstones are idempotently scavenged. Recovery itself is
+serialized across processes by an OS file lease with durable PID evidence;
+kernel lease release after a crash permits the next startup to resume.
 Missing, corrupt, escaping, or root-identity-mismatched journals fail startup
 closed. A separate process is killed with `Environment.FailFast` immediately
 after each durable journal transition (including both visible and absent commit

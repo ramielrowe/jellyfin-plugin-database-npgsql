@@ -687,6 +687,50 @@ public sealed class TestInfrastructureTests
     }
 
     [Fact]
+    public async Task RestoreRecoveryLease_ExcludesSecondProcessAndReleasesAfterExit()
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux process lease contract.");
+        var root = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var helper = Path.Combine(root, "tests", "Jellyfin.Plugin.Database.Npgsql.TestHarness", "bin", "Release", "net10.0", "Jellyfin.Plugin.Database.Npgsql.TestHarness.dll");
+        var applicationData = Path.Combine(root, ".artifacts", "recovery-lease-" + Guid.NewGuid().ToString("N"));
+        var ready = Path.Combine(applicationData, "ready");
+        Directory.CreateDirectory(applicationData);
+        try
+        {
+            var holder = ExternalCommand.RunAsync(
+                "dotnet",
+                new[] { helper, "restore-recovery-lease-hold", applicationData, ready, "3" },
+                TimeSpan.FromSeconds(15),
+                TestContext.Current.CancellationToken);
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+            while (!File.Exists(ready) && DateTime.UtcNow < deadline && !holder.IsCompleted)
+            {
+                await Task.Delay(25, TestContext.Current.CancellationToken);
+            }
+
+            Assert.True(File.Exists(ready), "The first process did not publish its restore recovery lease.");
+            var blocked = await ExternalCommand.RunAsync(
+                "dotnet",
+                new[] { helper, "restore-recovery-lease-expect-blocked", applicationData },
+                TimeSpan.FromSeconds(10),
+                TestContext.Current.CancellationToken);
+            blocked.EnsureSuccess("Proving restore recovery process exclusion", new SensitiveDataRedactor());
+            (await holder).EnsureSuccess("Holding the restore recovery process lease", new SensitiveDataRedactor());
+
+            var afterExit = await ExternalCommand.RunAsync(
+                "dotnet",
+                new[] { helper, "restore-recovery-lease-hold", applicationData, ready, "0" },
+                TimeSpan.FromSeconds(10),
+                TestContext.Current.CancellationToken);
+            afterExit.EnsureSuccess("Reacquiring a stale process lease after owner exit", new SensitiveDataRedactor());
+        }
+        finally
+        {
+            Directory.Delete(applicationData, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ExternalCommand_TimeoutTerminatesProcessTree()
     {
         var stopwatch = Stopwatch.StartNew();
