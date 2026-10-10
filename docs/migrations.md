@@ -30,7 +30,8 @@ parent Jellyfin checkout is required.
 To add a reviewed successor after changing the model, run the same build and then:
 
 ```sh
-dotnet ef migrations add <Name> \
+MIGRATION_NAME=ReplaceWithMigrationName
+dotnet ef migrations add "$MIGRATION_NAME" \
   --context JellyfinDbContext \
   --project src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj \
   --startup-project tools/Jellyfin.Plugin.Database.Npgsql.Migrations/Jellyfin.Plugin.Database.Npgsql.Migrations.csproj \

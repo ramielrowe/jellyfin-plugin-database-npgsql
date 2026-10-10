@@ -8,12 +8,14 @@ by copying the tracked source into an isolated directory outside the checkout.
 
 The `0.1.0.0` release is pinned to the exact Jellyfin database ABI `12.2.0.0`,
 the audited vanilla Jellyfin `12.2.0.0` host and its 49 code migrations, EF Core
-10.0.11, Npgsql/EF provider 10.0.3, .NET 10, and PostgreSQL 16.6. A new Jellyfin
-release requires both ABI and persisted-model audits even when the public ABI
-number does not change. Review the final relational model, host code-migration
-set, query semantics, generated SQL, and real lifecycle before changing the
-supported matrix. Never widen `targetAbi` or bypass runtime guards merely
-because a newer host starts.
+10.0.11, Npgsql/EF provider 10.0.3, .NET 10, and PostgreSQL 16.6. PostgreSQL 16.6
+is the exact qualified server and the only version in the support matrix; the
+runtime startup guards verify the Jellyfin ABI, model, and package artifacts,
+not the PostgreSQL server version. A new Jellyfin release requires both ABI and
+persisted-model audits even when the public ABI number does not change. Review
+the final relational model, host code-migration set, query semantics, generated
+SQL, and real lifecycle before changing the supported matrix. Never widen
+`targetAbi` or bypass runtime guards merely because a newer host starts.
 
 The provider is loaded by Jellyfin before ordinary plugins. Its constructor and
 first configuration path therefore use only early host contracts and load the
@@ -25,7 +27,9 @@ the early provider proves that exact guard registration before database access.
 
 ## Fast local gates
 
-These commands are independent and may be run exactly as written:
+Run these commands in the listed order. The first command supplies the locked
+restore required by the following `--no-restore` commands, and the Release build
+supplies the outputs required by the `--no-build` test command.
 
 ```sh
 dotnet restore Jellyfin.Plugin.Database.Npgsql.slnx --locked-mode
@@ -66,7 +70,7 @@ suite and fixture add their own concurrent process/database cases.
 export JELLYFIN_NPGSQL_TEST_USE_CONTAINER=true
 export JELLYFIN_NPGSQL_TEST_REQUIRED=true
 export JELLYFIN_NPGSQL_TEST_HOST_PUBLISH=/path/to/vanilla-jellyfin-12.2-publish
-export JELLYFIN_NPGSQL_TEST_HOST_SHA256=<hash-from-helper>
+export JELLYFIN_NPGSQL_TEST_HOST_SHA256=REPLACE_WITH_HASH_FROM_HELPER
 dotnet test --project tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests.csproj \
   --configuration Release --no-build --max-parallel-test-modules 4
 ```
@@ -87,7 +91,7 @@ installs only the final ZIP into a staged copy of the exact pristine host:
 ```sh
 export RUN_BLACK_BOX=true
 export JELLYFIN_HOST_PUBLISH=/path/to/vanilla-jellyfin-12.2-publish
-export JELLYFIN_HOST_SHA256=<hash-from-helper>
+export JELLYFIN_HOST_SHA256=REPLACE_WITH_HASH_FROM_HELPER
 ./scripts/verify-release.sh
 ```
 

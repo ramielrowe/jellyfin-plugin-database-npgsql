@@ -15,8 +15,11 @@ Jellyfin database ABI `12.2.0.0` (the vanilla Jellyfin `12.2.0.0` host), and
 PostgreSQL `16.6`. The release project targets .NET 10, compiles against the
 published `Jellyfin.Database.Implementations` 12.2.0 contract, and pins EF Core
 10.0.11 and Npgsql 10.0.3. No other Jellyfin or PostgreSQL version is supported
-by this release, even if it appears to start. Do not bypass the version guards.
-The evidence behind this matrix is documented in
+by this release, even if it appears to start. The runtime startup guards enforce
+the exact Jellyfin ABI, model, and package artifacts; PostgreSQL 16.6 is the
+exact qualified server and support target, not a server version enforced at
+startup. Do not bypass the Jellyfin or artifact guards. The evidence behind this
+matrix is documented in
 [`docs/feasibility-report.md`](docs/feasibility-report.md). Jellyfin and EF Core
 assemblies are host-owned compile contracts; only the provider and Npgsql runtime
 assemblies belong in the plugin package.
@@ -49,15 +52,18 @@ Extract one complete release ZIP into the exact versioned directory
 because vanilla Jellyfin uses a prefix search; this prevents a leftover older or
 similarly named folder from silently selecting an unintended binary.
 
-For upgrades or rollback, extract the complete package to its new versioned
-directory first, then change `PluginName` in one configuration edit and restart.
-Keep the prior package and migration snapshot outside Jellyfin's plugin root
-until the new version starts successfully; ordinary plugin housekeeping may
-delete an older same-GUID directory. If startup reports a missing dependency or
-unsupported database ABI, move the newer package out of the plugin root,
-restore the complete prior package and matching `PluginName` (or the prior
-Jellyfin version), and restart. Do not partially overwrite a live version
-directory.
+For upgrades or rollback, verify the checksum and exact seven-file allowlist,
+extract into a fresh unique staging directory, and atomically rename the
+complete package to its new versioned directory before changing `PluginName`
+and restarting. Keep the prior package and configuration outside Jellyfin's
+plugin root until the new version starts successfully; ordinary plugin
+housekeeping may delete an older same-GUID directory. If startup reports a
+missing dependency or unsupported database ABI before a schema migration
+succeeds, move the newer package out of the plugin root, restore the complete
+prior package and matching `PluginName` (or the prior Jellyfin version), and
+restart. After a successful schema migration, package-only downgrade is
+unsupported without separately qualified database recovery. Do not partially
+overwrite a live version directory.
 
 The complete operational procedure—including interrupted staging, package-only
 downgrade limits, dashboard disable, uninstall, missing-file recovery, portable
@@ -156,7 +162,9 @@ own the Jellyfin objects and needs `CONNECT` on that database plus `USAGE` and
 Before vanilla Jellyfin runs a pending database migration, the provider creates
 a managed, streamed, rollback-capable snapshot below the Jellyfin data path. It
 does not invoke external PostgreSQL clients or require elevated database
-privileges. Unsupported populated layouts fail before mutation.
+privileges. Jellyfin uses that snapshot automatically only if the migration
+fails and deletes it after success; operators cannot retain or replay it.
+Unsupported populated layouts fail before mutation.
 
 ## Backup and restore policy
 
@@ -245,7 +253,7 @@ guards, restricted PostgreSQL role, and untouched vanilla startup path:
 
 ```sh
 JELLYFIN_HOST_PUBLISH=/path/to/vanilla-jellyfin-publish \
-JELLYFIN_HOST_SHA256=<documented-publish-hash> \
+JELLYFIN_HOST_SHA256=REPLACE_WITH_DOCUMENTED_PUBLISH_HASH \
 ./tests/black-box-smoke.sh
 ```
 

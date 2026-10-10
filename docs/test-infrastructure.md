@@ -115,7 +115,7 @@ and host-integrity verification:
 
 ```sh
 export JELLYFIN_NPGSQL_TEST_HOST_PUBLISH=/path/to/vanilla-jellyfin-publish
-export JELLYFIN_NPGSQL_TEST_HOST_SHA256=<hash printed above>
+export JELLYFIN_NPGSQL_TEST_HOST_SHA256=REPLACE_WITH_HASH_PRINTED_ABOVE
 dotnet test --project tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests.csproj \
   --filter 'FullyQualifiedName~PristineHostOptInTests'
 ```
@@ -163,7 +163,7 @@ change. Existing provider-core CI jobs may retain their compatibility flag:
 
 ```sh
 export JELLYFIN_HOST_PUBLISH=/path/to/vanilla-jellyfin-publish
-export JELLYFIN_HOST_SHA256=<publish hash>
+export JELLYFIN_HOST_SHA256=REPLACE_WITH_PUBLISH_HASH
 PROVIDER_CORE_ONLY=true ./tests/black-box-smoke.sh
 ```
 

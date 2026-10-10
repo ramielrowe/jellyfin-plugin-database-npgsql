@@ -9,18 +9,22 @@ existing installation.
 | Component | Supported by plugin 0.1.0.0 |
 | --- | --- |
 | Jellyfin host | Exact database ABI `12.2.0.0`, tested with vanilla Jellyfin `12.2.0.0` |
-| PostgreSQL server | Exact PostgreSQL `16.6` |
+| PostgreSQL server | Exact qualification target and supported matrix: PostgreSQL `16.6` |
 | Runtime | .NET 10 on Linux x64, as exercised by release qualification |
 | Plugin directory | Exact `Npgsql Database_0.1.0.0` |
 | Provider assembly | Exact `Jellyfin.Plugin.Database.Npgsql.dll` |
 
-Do not force an unsupported Jellyfin or PostgreSQL version by editing metadata,
-renaming directories, replacing dependencies, or bypassing the startup guards.
-Every Jellyfin ABI or persisted-model release needs a new compatibility audit
-and will normally require a new plugin release. PostgreSQL versions other than
-16.6 may work, but this release makes no such support claim.
+Do not force an unsupported Jellyfin version by editing metadata, renaming
+directories, replacing dependencies, or bypassing the startup guards. Every
+Jellyfin ABI or persisted-model release needs a new compatibility audit and will
+normally require a new plugin release. PostgreSQL 16.6 is the exact server used
+for qualification and the only server version in this release's support matrix;
+the runtime startup guards enforce the Jellyfin ABI, model, and package
+artifacts, not the PostgreSQL server version. Another PostgreSQL version may
+start, but that does not make it supported.
 
-This plugin creates a new PostgreSQL Jellyfin database. Changing
+This plugin creates the Jellyfin schema inside a fresh, operator-provisioned
+PostgreSQL database; it never creates the database itself. Changing
 `DatabaseType` does **not** migrate an existing SQLite database, and an SQLite
 file is **not** a PostgreSQL backup. There is no supported SQLite-to-PostgreSQL
 conversion workflow in this release.
@@ -95,26 +99,83 @@ causes startup to fail so `database.xml` remains authoritative.
 
 ## 3. Install the ZIP before first start
 
-Stop Jellyfin. Set these placeholders for your installation and run the
-checksum and extraction steps as the account that manages Jellyfin plugins:
+Stop Jellyfin. Replace the two `/absolute/path/...` placeholders, then run the
+whole block in Bash as the account that manages Jellyfin plugins. Every attempt
+uses a new staging directory inside the plugin root, so a staging directory left
+by an interrupted attempt cannot contribute files to a retry.
 
-```sh
-export RELEASE_DIR=/path/to/downloaded-release
-export JELLYFIN_PLUGIN_ROOT=/path/to/jellyfin/plugins
+```bash
+set -eu
+export RELEASE_DIR=/absolute/path/to/downloaded-release
+export JELLYFIN_PLUGIN_ROOT=/absolute/path/to/jellyfin/plugins
+export PACKAGE_NAME=jellyfin-plugin-database-npgsql_0.1.0.0.zip
+export CHECKSUM_NAME=jellyfin-plugin-database-npgsql_0.1.0.0.zip.sha256
+export PLUGIN_NAME='Npgsql Database_0.1.0.0'
+
 cd "$RELEASE_DIR"
-sha256sum --check jellyfin-plugin-database-npgsql_0.1.0.0.zip.sha256
+sha256sum --check --strict "$CHECKSUM_NAME"
 install -d -m 0750 "$JELLYFIN_PLUGIN_ROOT"
-install -d -m 0750 "$JELLYFIN_PLUGIN_ROOT/Npgsql Database_0.1.0.0.staging"
-python3 -m zipfile -e jellyfin-plugin-database-npgsql_0.1.0.0.zip \
-  "$JELLYFIN_PLUGIN_ROOT/Npgsql Database_0.1.0.0.staging"
-mv --no-target-directory \
-  "$JELLYFIN_PLUGIN_ROOT/Npgsql Database_0.1.0.0.staging" \
-  "$JELLYFIN_PLUGIN_ROOT/Npgsql Database_0.1.0.0"
+export PACKAGE_PATH="$RELEASE_DIR/$PACKAGE_NAME"
+export PLUGIN_DIR="$JELLYFIN_PLUGIN_ROOT/$PLUGIN_NAME"
+test ! -e "$PLUGIN_DIR"
+export STAGE_DIR
+STAGE_DIR=$(mktemp -d --tmpdir="$JELLYFIN_PLUGIN_ROOT" \
+  '.npgsql-install.XXXXXXXX')
+
+python3 - <<'PY'
+import os
+import shutil
+import stat
+import zipfile
+
+expected = {
+    "Jellyfin.Plugin.Database.Npgsql.deps.json",
+    "Jellyfin.Plugin.Database.Npgsql.dll",
+    "LICENSE",
+    "Npgsql.EntityFrameworkCore.PostgreSQL.dll",
+    "Npgsql.dll",
+    "THIRD-PARTY-NOTICES.md",
+    "meta.json",
+}
+package = os.environ["PACKAGE_PATH"]
+stage = os.environ["STAGE_DIR"]
+
+with zipfile.ZipFile(package, "r") as archive:
+    entries = archive.infolist()
+    names = [entry.filename for entry in entries]
+    if len(entries) != len(expected) or set(names) != expected:
+        raise SystemExit("package does not contain the exact seven-file allowlist")
+
+    for entry in entries:
+        file_type = stat.S_IFMT(entry.external_attr >> 16)
+        if entry.is_dir() or file_type not in (0, stat.S_IFREG):
+            raise SystemExit(f"package entry is not a regular file: {entry.filename}")
+        target = os.path.join(stage, entry.filename)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(target, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as destination:
+            with archive.open(entry, "r") as source:
+                shutil.copyfileobj(source, destination)
+        os.chmod(target, 0o640)
+
+os.chmod(stage, 0o750)
+PY
+
+mv --no-clobber --no-target-directory "$STAGE_DIR" "$PLUGIN_DIR"
+test ! -e "$STAGE_DIR"
+test -d "$PLUGIN_DIR"
 ```
 
-The example uses Python's standard ZIP extractor; a trusted equivalent is fine.
-The target directory must not already exist. The ZIP contains exactly these
-seven files:
+The checksum is verified before the archive is opened. The extractor accepts
+only the seven expected root-level regular files, creates each file exclusively
+instead of overwriting anything, and assigns directory mode `0750` and file mode
+`0640`. Because staging is a unique directory on the same filesystem as the
+canonical destination, the final move is atomic; `--no-clobber` plus the two
+final tests makes an existing destination a failure instead of an overwrite.
+An interrupted attempt can leave an `.npgsql-install.*` sibling for an operator
+to inspect and remove while Jellyfin is stopped, but a later attempt always uses
+a different directory. The ZIP allowlist is:
 
 ```text
 Jellyfin.Plugin.Database.Npgsql.deps.json
@@ -194,19 +255,22 @@ independent PostgreSQL disaster-recovery procedure before production use.
 
 ## Update, rollback, disable, uninstall, and recovery
 
-For an update, stop Jellyfin, verify and extract the complete new ZIP into its
-new exact versioned directory, then atomically change `PluginName` once. Never
-partially overwrite the selected directory. Keep the old ZIP, its configuration,
-and any migration snapshot outside the plugin root until startup is verified;
-ordinary plugin housekeeping can remove an older same-GUID folder.
+For an update, stop Jellyfin and repeat the checksum, allowlist, unique-staging,
+and atomic-rename procedure for the new exact versioned directory, then
+atomically change `PluginName` once. Never partially overwrite the selected
+directory. Keep the old ZIP and its configuration outside the plugin root until
+startup is verified; ordinary plugin housekeeping can remove an older same-GUID
+folder.
 
 Provider migration rollback is automatic when Jellyfin reports a migration
-failure; there is no supported operator command for replaying one of these
-snapshots later. If an update fails, leave the snapshot untouched, stop the
-server, and preserve the complete logs, host, plugin, configuration, and
-database state for review. Restore an older host/plugin/database combination
-only through a separately qualified recovery procedure. Merely selecting an
-older DLL does not roll back schema history.
+failure during that migration. Jellyfin deletes the internal snapshot after a
+successful migration. Operators cannot retain, select, or replay these
+snapshots later. If an update fails, stop the server and preserve the complete
+logs, host, plugin, configuration, and database state for review. After a
+successful schema migration, a package-only downgrade is unsupported; restore
+an older host/plugin/database combination only through a separately qualified
+database-recovery procedure. Merely selecting an older DLL does not roll back
+schema history.
 
 Do not disable or uninstall the ordinary plugin while PostgreSQL is selected.
 The late plugin supplies the mandatory full-system restore guard; disabling,

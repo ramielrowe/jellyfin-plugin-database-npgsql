@@ -15,6 +15,13 @@ owner-only (`0700`) on Unix and every file is owner-only (`0600`). Keys are
 opaque `npgsql-v1-<32 lowercase hex>` identifiers; paths, links, incomplete
 directories, and names outside that grammar are rejected.
 
+These snapshots exist only for Jellyfin's migration transaction flow. Jellyfin
+automatically requests restore when that migration fails and deletes the
+snapshot after a successful migration. The provider exposes no operator command
+to retain, select, or replay a snapshot later. Consequently, a package-only
+downgrade after a successful schema migration is unsupported without a
+separately qualified database-recovery procedure.
+
 ## Format and publication
 
 Creation holds a provider process gate and a PostgreSQL transaction advisory

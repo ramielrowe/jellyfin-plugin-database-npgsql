@@ -55,9 +55,11 @@ recovery option.
 
 The provider migration protocol is separate. Before a pending Jellyfin
 migration, `MigrationBackupFast` creates a bounded, provider-owned PostgreSQL
-snapshot; Jellyfin can call `RestoreBackupFast` to roll that one migration back.
-Its format, validation, transaction boundary, and cleanup contract are described
-in [migration-backups.md](migration-backups.md). It does not restore Jellyfin's
+snapshot. Jellyfin calls `RestoreBackupFast` only as part of automatically
+rolling back that failing migration, and deletes the snapshot after a successful
+migration. Operators cannot retain, select, or replay it. Its format,
+validation, transaction boundary, and cleanup contract are described in
+[migration-backups.md](migration-backups.md). It does not restore Jellyfin's
 Config, Data, or Root trees and must not be presented to the dashboard restore
 endpoint.
 

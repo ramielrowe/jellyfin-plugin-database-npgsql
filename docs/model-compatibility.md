@@ -146,16 +146,15 @@ once. Both saves complete through the provider's automatic execution strategy;
 returned shadow IDs, tracker states, canonical node counts, and exact persisted
 rows prove retries have no duplicate side effects.
 
-The full-host model test uses a separate test-only provider assembly and a wholly
-disposable database to bridge the unfinished backup bead. It first lets an
-untouched vanilla SQLite startup record Jellyfin's current code-migration history,
-copies that history into the precreated PostgreSQL model, and then starts the same
-untouched publish with the plugin. The release ZIP never contains the bridge;
-the production provider continues to reject migration backup until the dedicated
-backup implementation lands.
+The full-host model test now uses the production provider package against a
+wholly disposable database. The provider's migration backup implementation lets
+the untouched vanilla host apply the real baseline, and the test verifies the
+resulting model and lifecycle without a bridge assembly.
 
-Bead `.7` owns migration generation. Its migration must reproduce this finalized
-model exactly, install both LIKE forms and the bounded-prefix function, install
-the non-locking interning functions and unconditional triggers, create the People
-`text_pattern_ops` and ItemValue accelerators, omit the three unsafe physical
-primary keys, and verify the runtime fingerprint before applying any mutation.
+The checked-in migration reproduces this finalized model exactly. It installs
+both LIKE forms and the bounded-prefix function, the non-locking interning
+functions and unconditional triggers, the People `text_pattern_ops` and
+ItemValue accelerators, omits the three unsafe physical primary keys, and
+verifies the runtime fingerprint before mutation. Migration snapshots are used
+only by Jellyfin's automatic failing-migration rollback and are deleted after a
+successful migration; they are not operator restore media.

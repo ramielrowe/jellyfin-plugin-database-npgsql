@@ -33,9 +33,12 @@ Jellyfin's discovery root. It then verifies
 that dashboard-style metadata disable, uninstall while configured, and a
 missing provider DLL each stop startup without changing PostgreSQL or creating
 SQLite. Restoring the exact metadata, directory, or DLL recovers on a fresh
-process. Database migrations still require the separate provider migration
-snapshot for a true schema rollback; merely selecting an older DLL is not a
-database rollback procedure.
+process. If a migration fails, Jellyfin uses the separate provider migration
+snapshot automatically during that failure. It deletes the snapshot after a
+successful migration, and operators cannot retain or replay it. The package
+rollback exercise therefore does not claim a schema downgrade; after a
+successful schema migration, selecting an older DLL without separately
+qualified database recovery is unsupported.
 
 The predecessor fixture is source, metadata, and migrations rather than a
 checked-in binary. Its package reuses only the release ZIP's version-locked
