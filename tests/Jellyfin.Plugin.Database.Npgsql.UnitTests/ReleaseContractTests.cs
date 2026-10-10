@@ -258,6 +258,16 @@ public sealed class ReleaseContractTests
         Assert.Contains("branches: [main, master]", workflow, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void ContinuousIntegrationUsesWorkspaceAbsoluteVanillaHostPath()
+    {
+        var root = FindRepositoryRoot();
+        var workflow = File.ReadAllText(Path.Combine(root, ".github", "workflows", "ci.yml"));
+
+        Assert.Contains("JELLYFIN_HOST_PUBLISH: ${{ github.workspace }}/host", workflow, StringComparison.Ordinal);
+        Assert.DoesNotContain("JELLYFIN_HOST_PUBLISH: ../host", workflow, StringComparison.Ordinal);
+    }
+
     private static bool HasFinalScansAfterBlackBox(string script)
     {
         const string MetadataAssertion = "assert_relocated_obj_metadata \"$ORIGINAL_CHECKOUT\" \"$RELOCATED\"";

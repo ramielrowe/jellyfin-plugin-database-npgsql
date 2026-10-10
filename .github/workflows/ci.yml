@@ -60,7 +60,9 @@ jobs:
         working-directory: plugin
         env:
           RUN_BLACK_BOX: 'true'
-          JELLYFIN_HOST_PUBLISH: ../host
+          # verify-release.sh relocates the repository and changes directories before
+          # staging this input, so the host path must not depend on the working directory.
+          JELLYFIN_HOST_PUBLISH: ${{ github.workspace }}/host
         run: |
           export JELLYFIN_HOST_SHA256="$(cat .host-sha256)"
           ./scripts/verify-release.sh
