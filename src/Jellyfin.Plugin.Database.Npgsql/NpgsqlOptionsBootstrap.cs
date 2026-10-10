@@ -68,10 +68,7 @@ internal static class NpgsqlOptionsBootstrap
         options
             .ReplaceService<IModelCustomizer, NpgsqlModelCustomizer>()
             .ReplaceService<IRelationalDatabaseCreator, NpgsqlExistingDatabaseOnlyCreator>()
-            .AddInterceptors(
-                NpgsqlQueryExpressionInterceptor.Instance,
-                NpgsqlBackupTransactionInterceptor.Instance,
-                NpgsqlRestoreSaveChangesInterceptor.Instance);
+            .AddInterceptors(NpgsqlQueryExpressionInterceptor.Instance);
         return configured;
     }
 

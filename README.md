@@ -1,10 +1,5 @@
 # Jellyfin Npgsql database provider
 
-> **Restore platform requirement:** database-inclusive full-system restore is
-> supported only on Linux. The provider fails closed on other operating systems
-> because exact compensation requires Linux handle-relative, no-follow filesystem
-> primitives. Backup creation and ordinary PostgreSQL operation remain portable.
-
 This repository is the standalone development workspace for an Npgsql-backed
 `IJellyfinDatabaseProvider` that loads into an unmodified Jellyfin server. The
 release ZIP is intentionally self-contained except for Jellyfin's host-owned
@@ -23,10 +18,8 @@ assemblies are host-owned compile contracts; only the provider and Npgsql runtim
 assemblies belong in the plugin package.
 
 The provider is loaded before Jellyfin's ordinary plugin initialization. Its
-constructor consequently depends only on services available in the early
-container. The same assembly is also loaded by the ordinary plugin manager so
-its `IPluginServiceRegistrator` can install the pre-mutation full-system backup
-guard.
+constructor consequently depends only on the early `ILogger<T>` service and it
+does not use `IPluginServiceRegistrator`.
 
 ## Installation and version selection
 
@@ -44,13 +37,10 @@ If startup reports a missing dependency or unsupported database ABI, restore the
 prior `PluginName` (or the prior Jellyfin version) and restart. Do not partially
 overwrite a live version directory.
 
-The packaged `meta.json` must remain `Active`. `database.xml` selects the early
-database provider, while ordinary plugin registration installs the only
-supported `IBackupService` decoration. The early provider validates the exact
-manifest and the final service registration before it permits PostgreSQL startup.
-Deleting or disabling `meta.json`, removing the registrator, or replacing the
-decorator therefore fails closed before a database connection or restore can
-mutate application files or migration history.
+The packaged `meta.json` is disabled deliberately. `database.xml`, not normal
+plugin enablement, activates an early database provider. Keeping the ordinary
+plugin entry disabled avoids loading a redundant collectible copy later in the
+same process. No ordinary `IPlugin` descriptor or service registrator is needed.
 
 ## Database configuration
 
@@ -178,8 +168,6 @@ API/media-scan proof, and intentional provider differences are documented in
 [`docs/persistence-parity.md`](docs/persistence-parity.md).
 The atomic backup format, validation boundaries, and transactional restore are
 documented in [`docs/migration-backups.md`](docs/migration-backups.md).
-Stock database-inclusive backup and restore behavior is documented in
-[`docs/full-system-backup.md`](docs/full-system-backup.md).
 The checked-in predecessor package and exact fresh-start, upgrade, restart, and
 failure matrix are documented in
 [`docs/stock-lifecycle.md`](docs/stock-lifecycle.md).

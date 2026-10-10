@@ -2,13 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Runtime.Loader;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Plugin.Database.Npgsql.ValueConverters;
-using Jellyfin.Server.Implementations.SystemBackupService;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -29,7 +27,6 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     ];
 
     private readonly ILogger<NpgsqlDatabaseProvider> logger;
-    private readonly IServiceProvider? services;
     private readonly string? applicationDataPath;
     private string? backupRoot;
     private string? connectionString;
@@ -50,7 +47,6 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
         : this(logger)
     {
         ArgumentNullException.ThrowIfNull(services);
-        this.services = services;
         const string ApplicationPathsTypeName = "MediaBrowser.Common.Configuration.IApplicationPaths, MediaBrowser.Common";
         var applicationPathsType = Type.GetType(ApplicationPathsTypeName, throwOnError: false);
         var applicationPaths = applicationPathsType is null ? null : services.GetService(applicationPathsType);
@@ -76,13 +72,6 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     {
         ArgumentNullException.ThrowIfNull(options);
         ArgumentNullException.ThrowIfNull(databaseConfiguration);
-
-        ValidateNormalPluginMetadata();
-
-        if (this.services is not null)
-        {
-            ValidateBackupSafetyDecorator(this.services);
-        }
 
         var hostDatabaseAssembly = typeof(JellyfinDbContext).Assembly;
         var hostDatabaseVersion = hostDatabaseAssembly.GetName().Version
@@ -115,14 +104,6 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
             customOptions.Options);
         this.connectionString = configured.ConnectionString;
         this.restoreDataSource = NpgsqlRestoreDataSource.Create(configured);
-        if (this.applicationDataPath is not null)
-        {
-            NpgsqlScratchSpace.ConfigureRoot(this.applicationDataPath);
-            NpgsqlRestoreFileSnapshot.RecoverPendingAsync(
-                this.applicationDataPath,
-                this.connectionString,
-                CancellationToken.None).GetAwaiter().GetResult();
-        }
 
         LogProviderLoaded(
             this.logger,
@@ -253,99 +234,6 @@ public partial class NpgsqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <returns><see langword="true" /> when the ABI is supported.</returns>
     internal static bool SupportsHostDatabaseAbi(Version version)
         => version == new Version(12, 2, 0, 0);
-
-    /// <summary>Validates the normal plugin manifest before any startup migration can access PostgreSQL.</summary>
-    internal static void ValidateNormalPluginMetadata()
-    {
-        var pluginDirectory = Path.GetDirectoryName(typeof(NpgsqlDatabaseProvider).Assembly.Location)
-            ?? throw new InvalidOperationException("The Npgsql provider assembly has no installation directory.");
-        var metadataPath = Path.Combine(pluginDirectory, "meta.json");
-        try
-        {
-            if (!File.Exists(metadataPath) || new FileInfo(metadataPath).Length > 64 * 1024)
-            {
-                throw MissingNormalPluginMetadata();
-            }
-
-            using var stream = new FileStream(
-                metadataPath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.Read,
-                4096,
-                FileOptions.SequentialScan);
-            using var document = JsonDocument.Parse(stream, new JsonDocumentOptions { MaxDepth = 16 });
-            var root = document.RootElement;
-            var assemblies = root.TryGetProperty("assemblies", out var assemblyElement)
-                && assemblyElement.ValueKind is JsonValueKind.Array
-                ? assemblyElement.EnumerateArray().Select(item => item.GetString()).ToArray()
-                : [];
-            if (!root.TryGetProperty("status", out var status)
-                || !string.Equals(status.GetString(), "Active", StringComparison.Ordinal)
-                || !root.TryGetProperty("guid", out var guid)
-                || !string.Equals(guid.GetString(), PluginMetadata.Id.ToString(), StringComparison.OrdinalIgnoreCase)
-                || !root.TryGetProperty("version", out var version)
-                || !string.Equals(version.GetString(), PluginMetadata.Version.ToString(), StringComparison.Ordinal)
-                || !root.TryGetProperty("targetAbi", out var targetAbi)
-                || !string.Equals(targetAbi.GetString(), PluginMetadata.SupportedDatabaseAbi, StringComparison.Ordinal)
-                || assemblies.Length != 1
-                || !string.Equals(assemblies[0], PluginMetadata.AssemblyFileName, StringComparison.Ordinal))
-            {
-                throw MissingNormalPluginMetadata();
-            }
-        }
-        catch (Exception exception) when (exception is JsonException or IOException or UnauthorizedAccessException or InvalidOperationException)
-        {
-            throw MissingNormalPluginMetadata(exception);
-        }
-    }
-
-    private static InvalidOperationException MissingNormalPluginMetadata(Exception? innerException = null)
-        => new(
-            "The Npgsql normal plugin metadata is missing, disabled, malformed, or does not match this provider build. "
-            + "Jellyfin is refusing to initialize PostgreSQL before startup migrations or any restore path can mutate files, "
-            + "migration history, or application data. Restore the complete plugin package with status Active and restart. "
-            + "No database connection was attempted.",
-            innerException);
-
-    /// <summary>Proves that normal plugin loading installed the exact pre-mutation restore guard.</summary>
-    /// <param name="services">The completed host service provider.</param>
-    internal static void ValidateBackupSafetyDecorator(IServiceProvider services)
-    {
-        ArgumentNullException.ThrowIfNull(services);
-        var serviceProbe = services.GetService<IServiceProviderIsService>();
-        if (serviceProbe is not null && !serviceProbe.IsService(typeof(IBackupService)))
-        {
-            // Jellyfin's isolated pre-initialisation migration container does
-            // not register any backup service or expose restore entry points.
-            // The full host container is validated separately when it builds
-            // its own context factory before serving dashboard/API requests.
-            return;
-        }
-
-        const string RegistrationTypeName = "Jellyfin.Plugin.Database.Npgsql.NpgsqlBackupSafetyRegistration";
-        var moduleVersionId = typeof(NpgsqlDatabaseProvider).Assembly.ManifestModule.ModuleVersionId;
-        var registrationIsExact = AppDomain.CurrentDomain.GetAssemblies()
-            .Where(assembly => !assembly.IsDynamic)
-            .Where(assembly => assembly.ManifestModule.ModuleVersionId == moduleVersionId)
-            .Select(assembly => assembly.GetType(RegistrationTypeName, throwOnError: false))
-            .Where(type => type is not null)
-            .Select(type => services.GetService(type!))
-            .Where(instance => instance is not null)
-            .Any(instance => string.Equals(instance!.GetType().FullName, RegistrationTypeName, StringComparison.Ordinal)
-                && instance.GetType().GetMethod(
-                    "IsExactFinalRegistration",
-                    BindingFlags.Instance | BindingFlags.NonPublic)?.Invoke(instance, null) is true);
-        if (!registrationIsExact)
-        {
-            throw new InvalidOperationException(
-                "The Npgsql full-system backup safety guard is unavailable. The normal plugin may be disabled, deleted, "
-                + "malfunctioning, missing its service registrator, or its IBackupService decoration may have been overridden. "
-                + "Jellyfin is refusing to start with DatabaseType PLUGIN_PROVIDER before any dashboard, API, scheduled, or startup "
-                + "restore can overwrite Config, Data, Root, migration history, or PostgreSQL. Restore the complete matching plugin "
-                + "package and enable it, or select a different database provider. No restore or database connection was attempted.");
-        }
-    }
 
     /// <summary>
     /// Validates the unmodified Jellyfin database configuration contract.

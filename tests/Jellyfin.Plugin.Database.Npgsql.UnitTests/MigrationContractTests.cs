@@ -54,19 +54,6 @@ public sealed class MigrationContractTests
     }
 
     [Fact]
-    public void RestoreReseed_CoversEveryAndOnlyPostgreSqlIdentityColumn()
-    {
-        using var context = CreateRuntimeContext();
-
-        var identities = NpgsqlDatabaseOperations.GetIdentityColumns(context.Model);
-
-        Assert.Equal(13, identities.Count);
-        Assert.Contains(identities, identity => identity is { Schema: "public", Table: "ActivityLogs", Column: "Id" });
-        Assert.Contains(identities, identity => identity is { Schema: "public", Table: "Permissions", Column: "Id" });
-        Assert.Contains(identities, identity => identity is { Schema: "public", Table: "__JellyfinTextNodes", Column: "Id" });
-    }
-
-    [Fact]
     public void HostMigrationAudit_AcceptsOnlyTheExactPinnedSet()
     {
         Assert.Equal(

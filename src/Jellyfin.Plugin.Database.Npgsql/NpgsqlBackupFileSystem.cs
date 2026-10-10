@@ -113,31 +113,6 @@ internal static class NpgsqlBackupFileSystem
         }
     }
 
-    /// <summary>Forces already-open file or directory metadata to stable storage.</summary>
-    /// <param name="handle">The exact handle whose inode must be flushed.</param>
-    /// <param name="point">The diagnostic fault point.</param>
-    internal static void FlushHandle(SafeFileHandle handle, string point)
-    {
-        ArgumentNullException.ThrowIfNull(handle);
-        FaultCallback.Value?.Invoke(point);
-        if (OperatingSystem.IsWindows())
-        {
-            if (!FlushFileBuffers(handle))
-            {
-                throw new IOException("The PostgreSQL backup handle could not be flushed for durable publication.", new Win32Exception());
-            }
-
-            return;
-        }
-
-        if (Fsync(handle.DangerousGetHandle().ToInt32()) != 0)
-        {
-            throw new IOException(
-                "The PostgreSQL backup handle could not be flushed for durable publication.",
-                new Win32Exception(Marshal.GetLastPInvokeError()));
-        }
-    }
-
     /// <summary>Atomically publishes and durably records a completed snapshot directory.</summary>
     /// <param name="partialDirectory">The private partial directory.</param>
     /// <param name="finalDirectory">The completed directory name.</param>

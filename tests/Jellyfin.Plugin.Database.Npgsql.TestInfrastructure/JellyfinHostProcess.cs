@@ -29,7 +29,6 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
     private bool _disposed;
     private bool _logCompleted;
     private bool _expectedStartupFailure;
-    private bool _expectedScheduledRestart;
 
     private JellyfinHostProcess(
         JellyfinHostLayout layout,
@@ -172,7 +171,8 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             if (HasExited)
             {
                 _supervisor.Terminate(TimeSpan.FromSeconds(15));
-                await CompleteAndCollectLogAsync().ConfigureAwait(false);
+                await CompleteLogAsync().ConfigureAwait(false);
+                _layout.CollectSanitizedLogs(_redactor);
                 throw new InvalidOperationException(
                     $"Jellyfin exited before becoming ready. See sanitized logs in '{_layout.CollectedLogDirectory}'.");
             }
@@ -228,13 +228,6 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         }
         catch (Exception exception) when (exception is InvalidOperationException or TimeoutException)
         {
-            // WaitUntilReady may observe the target exit just before the
-            // supervisor's diagnostic pipe and Jellyfin file logs finish
-            // flushing. TerminateAsync is idempotent and provides one
-            // synchronized drain/collection barrier before callers inspect
-            // evidence or reuse the layout.
-            await TerminateAsync().ConfigureAwait(false);
-            await _layout.Publish.VerifyUnchangedAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -306,7 +299,8 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         using var response = await SendAsync(request, cancellationToken).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
         await WaitForExitAsync(timeout, cancellationToken).ConfigureAwait(false);
-        await CompleteAndCollectLogAsync().ConfigureAwait(false);
+        await CompleteLogAsync().ConfigureAwait(false);
+        _layout.CollectSanitizedLogs(_redactor);
         await _layout.Publish.VerifyUnchangedAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -335,24 +329,6 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         }
     }
 
-    internal async Task WaitForExpectedScheduledRestartAsync(
-        TimeSpan timeout,
-        CancellationToken cancellationToken)
-    {
-        _expectedScheduledRestart = true;
-        await WaitForExitAsync(timeout, cancellationToken).ConfigureAwait(false);
-        if (_supervisor.Process.ExitCode is not 0 and not 143)
-        {
-            throw new InvalidOperationException(
-                $"Jellyfin's scheduled restart exited with unexpected status {_supervisor.Process.ExitCode}.");
-        }
-
-        await CompleteAndCollectLogAsync().ConfigureAwait(false);
-        await _layout.Publish.VerifyUnchangedAsync(cancellationToken).ConfigureAwait(false);
-    }
-
-    internal void ExpectScheduledRestart() => _expectedScheduledRestart = true;
-
     public async Task TerminateAsync()
     {
         if (!_supervisor.Process.HasExited)
@@ -360,7 +336,8 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             _supervisor.Terminate(TimeSpan.FromSeconds(15));
         }
 
-        await CompleteAndCollectLogAsync().ConfigureAwait(false);
+        await CompleteLogAsync().ConfigureAwait(false);
+        _layout.CollectSanitizedLogs(_redactor);
     }
 
     public async ValueTask DisposeAsync()
@@ -769,10 +746,7 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
             throw new InvalidOperationException("The Linux process supervisor failed: " + _redactor.Redact(diagnostic));
         }
 
-        if (_supervisor.Process.ExitCode != 0
-            && !_supervisor.WasTerminationRequested
-            && !_expectedStartupFailure
-            && !_expectedScheduledRestart)
+        if (_supervisor.Process.ExitCode != 0 && !_supervisor.WasTerminationRequested && !_expectedStartupFailure)
         {
             throw new InvalidOperationException(
                 $"The supervised Jellyfin host exited unexpectedly with status {_supervisor.Process.ExitCode}: "
@@ -780,20 +754,5 @@ public sealed class JellyfinHostProcess : IAsyncDisposable
         }
 
         _logCompleted = true;
-    }
-
-    private async Task CompleteAndCollectLogAsync()
-    {
-        try
-        {
-            await CompleteLogAsync().ConfigureAwait(false);
-        }
-        finally
-        {
-            // The process-supervisor file and Jellyfin logs are already
-            // streaming-redacted. Always collect them after the pipe drain,
-            // including when exit-status validation itself fails.
-            _layout.CollectSanitizedLogs(_redactor);
-        }
     }
 }

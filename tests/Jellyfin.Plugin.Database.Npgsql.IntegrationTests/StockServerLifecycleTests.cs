@@ -251,35 +251,27 @@ public sealed class StockServerLifecycleTests
             secret,
             cancellationToken);
 
+        var wrongPassword = "metadata-proof-" + Guid.NewGuid().ToString("N");
+        var wrongCredentials = new NpgsqlConnectionStringBuilder(database.RuntimeConnectionString)
+        {
+            Password = wrongPassword,
+            Timeout = 2,
+            CommandTimeout = 2,
+        };
         await AssertProviderSelectionFailureAsync(
             publish,
             package,
             artifacts.CaseDirectory,
             repositoryRoot,
-            database.RuntimeConnectionString,
-            "deleted-metadata-fails-before-database",
+            wrongCredentials.ConnectionString,
+            "deleted-metadata-still-early-loads",
             installPackage: true,
             deleteAssembly: false,
             deleteMetadata: true,
             pluginName: PluginMetadata.InstallationDirectory,
-            expectedDiagnostic: "normal plugin metadata is missing",
-            secret,
+            expectedDiagnostic: "28P01",
+            wrongPassword,
             cancellationToken);
-        await AssertProviderSelectionFailureAsync(
-            publish,
-            package,
-            artifacts.CaseDirectory,
-            repositoryRoot,
-            database.RuntimeConnectionString,
-            "disabled-metadata-fails-before-database",
-            installPackage: true,
-            deleteAssembly: false,
-            deleteMetadata: false,
-            pluginName: PluginMetadata.InstallationDirectory,
-            expectedDiagnostic: "normal plugin metadata is missing",
-            secret,
-            cancellationToken,
-            disableMetadata: true);
 
         Assert.Equal(originalSchema, await ReadPublicSchemaAsync(database.RuntimeConnectionString, cancellationToken));
         await publish.VerifyUnchangedAsync(cancellationToken);
@@ -598,8 +590,7 @@ public sealed class StockServerLifecycleTests
         string pluginName,
         string expectedDiagnostic,
         string secret,
-        CancellationToken cancellationToken,
-        bool disableMetadata = false)
+        CancellationToken cancellationToken)
     {
         var layout = JellyfinHostLayout.Create(caseRoot, publish, caseName);
         if (installPackage)
@@ -613,15 +604,6 @@ public sealed class StockServerLifecycleTests
             if (deleteMetadata)
             {
                 File.Delete(Path.Combine(pluginDirectory, "meta.json"));
-            }
-
-            if (disableMetadata)
-            {
-                var metadataPath = Path.Combine(pluginDirectory, "meta.json");
-                var metadata = File.ReadAllText(metadataPath);
-                File.WriteAllText(
-                    metadataPath,
-                    metadata.Replace("\"status\": \"Active\"", "\"status\": \"Disabled\"", StringComparison.Ordinal));
             }
         }
 

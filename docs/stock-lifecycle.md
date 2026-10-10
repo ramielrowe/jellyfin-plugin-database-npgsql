@@ -58,7 +58,7 @@ state before the compatibility contract can be widened.
 | Migration lock contention and timeout | `Snapshot_MigrationLockContentionTimesOutWithoutMutationOrArtifact` | The bounded command timeout leaves migration zero and publishes no backup. |
 | Deliberate transactional/non-transactional migration failure | `black-box-smoke.sh` and `MigrationBackupIntegrationTests` | The vanilla migration service calls provider restore; exact rows, schema, history, FKs, and sequence states return. |
 | Corrupt, stale, wrong-target, symlinked, partially written, or actively leased backup | `MigrationBackupIntegrationTests` restore cases | Validation/staging finishes before the target transaction; the target and published backup remain unchanged on failure. |
-| Missing folder/deleted assembly/ambiguous selection/deleted or disabled metadata | `StockServerLifecycleTests` and early-loader package smoke controls | Selection failures remain distinct; disabled or absent ordinary-plugin metadata fails before PostgreSQL, restore, or SQLite fallback can mutate state. |
+| Missing folder/deleted assembly/ambiguous selection/deleted or disabled metadata | `StockServerLifecycleTests` and early-loader package smoke controls | Selection failures remain distinct, while disabled or absent ordinary-plugin metadata does not disable the early selected provider; no SQLite fallback database is created. |
 
 `StockServerLifecycleTests` launches the untouched host from clean state for
 connection refusal, authentication failure, a missing database, and PostgreSQL
