@@ -5,6 +5,11 @@ This directory builds an **unofficial derivative** of
 this repository's Npgsql database-provider plugin pre-installed. It is not an
 image published or supported by LinuxServer.io or Jellyfin.
 
+For Kubernetes, prefer the dedicated
+[non-root init-container seed image](../kubernetes/README.md). It keeps the
+stock LinuxServer image and plugin lifecycles separate while sharing this
+image's exact installer, checksums, and fail-closed package policy.
+
 The image is deliberately narrow: plugin `0.1.0.0`, Jellyfin database ABI
 `12.2.0.0`, LinuxServer.io base `12.2ubu2604-ls53`, and PostgreSQL `16.6` are
 the only supported combination. The Dockerfile pins both build and runtime
@@ -76,11 +81,13 @@ exact seven-file allowlist and checksums, then atomically creates:
 /config/data/plugins/Npgsql Database_0.1.0.0
 ```
 
-Restarting with identical content is idempotent and normalizes the directory to
-mode `0750` and files to `0640`, owned by `abc`. An existing same-name directory
-with missing, extra, non-regular, or different content is a hard startup error;
-the image never overwrites a conflict. This also means an upgrade must use the
-matching image, plugin directory, and `database.xml` together. Read the
+Restarting with identical content and exact metadata is idempotent. The
+directory must be mode `0750`, its files mode `0640`, and all must be owned by
+`abc`. An existing same-name directory with mismatched ownership or mode, or
+with missing, extra, non-regular, or different content, is a hard startup
+error; the image never mutates or overwrites a conflict. This also means an
+upgrade must use the matching image, plugin directory, and `database.xml`
+together. Read the
 [installation lifecycle](../../docs/installation-lifecycle.md) before upgrading
 or rolling back: package-only downgrade after a successful schema migration is
 unsupported without separately qualified database recovery.

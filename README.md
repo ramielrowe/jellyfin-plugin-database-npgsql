@@ -72,6 +72,13 @@ symbols, and checksum verification—is in
 The end-to-end database provisioning and operator runbook is in
 [`docs/operator-guide.md`](docs/operator-guide.md).
 
+Container deployment options are documented separately: the
+[LinuxServer derivative image](docker/linuxserver/README.md) bundles the plugin
+for Docker/Compose, while the
+[Kubernetes seed image](docker/kubernetes/README.md) installs the exact package
+into a shared config PVC from a locked-down init container before an unmodified
+LinuxServer Jellyfin container starts.
+
 The packaged `meta.json` must remain `Active`. `database.xml` selects the early
 database provider, while active ordinary discovery installs the independent
 restore guard. Do not disable the plugin entry: the early provider treats a

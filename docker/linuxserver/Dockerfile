@@ -13,12 +13,13 @@ COPY LICENSE THIRD-PARTY-NOTICES.md meta.json ./
 COPY build/Package.proj build/release-policy.json build/
 COPY src/Jellyfin.Plugin.Database.Npgsql/ src/Jellyfin.Plugin.Database.Npgsql/
 COPY tools/Jellyfin.Plugin.Database.Npgsql.Packaging/ tools/Jellyfin.Plugin.Database.Npgsql.Packaging/
-COPY docker/linuxserver/build-seed.sh docker/linuxserver/package-files.txt docker/linuxserver/
+COPY --chmod=0755 docker/common/build-seed.sh docker/common/
+COPY docker/common/package-files.txt docker/common/
 
 RUN dotnet restore src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj --locked-mode \
     && dotnet restore tools/Jellyfin.Plugin.Database.Npgsql.Packaging/Jellyfin.Plugin.Database.Npgsql.Packaging.csproj --locked-mode \
     && dotnet msbuild build/Package.proj -target:Package -property:Configuration=Release \
-    && docker/linuxserver/build-seed.sh "${PLUGIN_VERSION}" "${INSTALLATION_DIRECTORY}"
+    && docker/common/build-seed.sh "${PLUGIN_VERSION}" "${INSTALLATION_DIRECTORY}"
 
 FROM ${JELLYFIN_BASE_IMAGE}
 
@@ -27,5 +28,6 @@ LABEL org.opencontainers.image.source="https://github.com/ramielrowe/jellyfin-pl
       org.opencontainers.image.licenses="GPL-3.0-only"
 
 COPY --from=build /out/seed/ /usr/local/share/jellyfin-npgsql/
+COPY --chmod=0555 docker/common/install-plugin.sh /usr/local/libexec/install-jellyfin-npgsql
 COPY docker/linuxserver/root/ /
 COPY --chmod=0755 docker/linuxserver/root/etc/s6-overlay/s6-rc.d/init-npgsql-plugin/run /etc/s6-overlay/s6-rc.d/init-npgsql-plugin/run

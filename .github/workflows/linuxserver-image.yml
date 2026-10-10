@@ -54,13 +54,17 @@ jobs:
             Npgsql.EntityFrameworkCore.PostgreSQL.dll \
             Npgsql.dll \
             THIRD-PARTY-NOTICES.md \
-            meta.json)" = "$(cat docker/linuxserver/package-files.txt)"
+            meta.json)" = "$(cat docker/common/package-files.txt)"
           test "$(cat docker/linuxserver/root/etc/s6-overlay/s6-rc.d/init-npgsql-plugin/up)" = "/etc/s6-overlay/s6-rc.d/init-npgsql-plugin/run"
           test -f docker/linuxserver/root/etc/s6-overlay/s6-rc.d/init-npgsql-plugin/dependencies.d/init-jellyfin-config
           test -f docker/linuxserver/root/etc/s6-overlay/s6-rc.d/init-config-end/dependencies.d/init-npgsql-plugin
           bash -n docker/linuxserver/root/etc/s6-overlay/s6-rc.d/init-npgsql-plugin/run
-          bash -n docker/linuxserver/build-seed.sh
+          bash -n docker/common/build-seed.sh
+          bash -n docker/common/install-plugin.sh
           bash -n docker/linuxserver/smoke-test.sh
+          grep -Fxq '!docker/common/build-seed.sh' docker/linuxserver/Dockerfile.dockerignore
+          grep -Fxq '!docker/common/install-plugin.sh' docker/linuxserver/Dockerfile.dockerignore
+          grep -Fxq '!docker/common/package-files.txt' docker/linuxserver/Dockerfile.dockerignore
           if [[ "${{ github.event_name }}" == release ]]; then
             test "${{ github.event.release.tag_name }}" = "v$version"
           fi

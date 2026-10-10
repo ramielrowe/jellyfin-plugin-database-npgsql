@@ -2,6 +2,7 @@
 set -euo pipefail
 
 export LC_ALL=C
+umask 0077
 
 [[ $# -eq 2 ]] || {
     printf 'usage: build-seed.sh PLUGIN_VERSION INSTALLATION_DIRECTORY\n' >&2
@@ -10,7 +11,7 @@ export LC_ALL=C
 
 version=$1
 installation_directory=$2
-allowlist=docker/linuxserver/package-files.txt
+allowlist=docker/common/package-files.txt
 package=artifacts/package
 seed=/out/seed
 expected=$(mktemp)
@@ -21,10 +22,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[[ -n "$version" && "$version" != */* ]]
-! printf '%s' "$version" | grep -q '[[:cntrl:]]'
+safe_name() {
+    [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ && $1 != . && $1 != .. ]]
+}
+
+safe_name "$version"
 [[ -n "$installation_directory" && "$installation_directory" != . && "$installation_directory" != .. ]]
-[[ "$installation_directory" != */* ]]
+[[ "$installation_directory" != */* && "$installation_directory" != *\\* ]]
 ! printf '%s' "$installation_directory" | grep -q '[[:cntrl:]]'
 
 policy_version=$(sed -n 's/^  "version":[[:space:]]*"\([^"[:cntrl:]]*\)",[[:space:]]*$/\1/p' build/release-policy.json)
@@ -32,29 +36,28 @@ policy_installation_directory=$(sed -n 's/^  "installationDirectory":[[:space:]]
 checksum_file=$(sed -n 's/^  "checksumFile":[[:space:]]*"\([^"[:cntrl:]]*\)",[[:space:]]*$/\1/p' build/release-policy.json)
 [[ "$version" == "$policy_version" ]]
 [[ "$installation_directory" == "$policy_installation_directory" ]]
-[[ -n "$checksum_file" && "$checksum_file" != */* ]]
+safe_name "$checksum_file"
 
+[[ -f "$allowlist" && ! -L "$allowlist" ]]
 sort "$allowlist" > "$expected"
 cmp -s "$allowlist" "$expected"
 [[ -s "$expected" ]]
 while IFS= read -r name; do
-    [[ -n "$name" && "$name" != . && "$name" != .. ]]
-    [[ "$name" != */* ]]
-    ! printf '%s' "$name" | grep -q '[[:cntrl:]]'
+    safe_name "$name"
 done < "$expected"
 
+[[ -d "$package" && ! -L "$package" ]]
 find "$package" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort > "$actual"
 cmp -s "$expected" "$actual"
 [[ -z $(find "$package" -mindepth 1 -maxdepth 1 ! -type f -print -quit) ]]
 (cd artifacts && sha256sum -c -- "$checksum_file")
 
-mkdir -p "$seed/package"
+install -d -m 0755 -- "$seed/package"
 while IFS= read -r name; do
-    cp -- "$package/$name" "$seed/package/$name"
+    install -m 0444 -- "$package/$name" "$seed/package/$name"
 done < "$expected"
-cp -- "$allowlist" "$seed/package-files.txt"
+install -m 0444 -- "$allowlist" "$seed/package-files.txt"
 (cd "$seed/package" && sha256sum -- *) > "$seed/SHA256SUMS"
 printf '%s\n' "$version" > "$seed/plugin-version"
 printf '%s\n' "$installation_directory" > "$seed/installation-directory"
-chmod 0444 "$seed"/package/* "$seed/package-files.txt" "$seed/SHA256SUMS" \
-    "$seed/plugin-version" "$seed/installation-directory"
+chmod 0444 "$seed/SHA256SUMS" "$seed/plugin-version" "$seed/installation-directory"

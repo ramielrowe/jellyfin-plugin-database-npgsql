@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jellyfin
+spec:
+  # This plugin and its PostgreSQL schema permit only one writer. Recreate also
+  # prevents old/new plugin versions from sharing /config during a rollout.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jellyfin
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jellyfin
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: install-npgsql-plugin
+          image: ghcr.io/ramielrowe/jellyfin-plugin-database-npgsql-seed@sha256:REPLACE_WITH_PUBLISHED_SEED_DIGEST
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: init-tmp
+              mountPath: /tmp
+      containers:
+        - name: jellyfin
+          # Exact stock LinuxServer image qualified with this plugin release.
+          image: lscr.io/linuxserver/jellyfin:12.2ubu2604-ls53@sha256:1bb4f88d822a0510bb3604b68aacb80d77c1d2a30181e500090c65111b98723b
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PUID
+              value: "1000"
+            - name: PGID
+              value: "1000"
+            - name: TZ
+              value: Etc/UTC
+          # LinuxServer's s6 init intentionally starts as root, then runs
+          # Jellyfin as PUID/PGID. Do not set runAsNonRoot for this container.
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+          ports:
+            - name: http
+              containerPort: 8096
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 12
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: media
+              mountPath: /media
+              readOnly: true
+      volumes:
+        # This claim must already exist, be pre-owned by 1000:1000, and contain
+        # database.xml before the first Pod starts. See README.md; neither
+        # kubelet nor the init image is asked to change its ownership.
+        - name: config
+          persistentVolumeClaim:
+            claimName: REPLACE_WITH_EXISTING_CONFIG_PVC
+        - name: media
+          persistentVolumeClaim:
+            claimName: REPLACE_WITH_EXISTING_MEDIA_PVC
+        - name: init-tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Mi

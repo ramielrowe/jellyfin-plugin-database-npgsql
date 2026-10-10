@@ -11,8 +11,9 @@
 !build/release-policy.json
 !src/Jellyfin.Plugin.Database.Npgsql/**
 !tools/Jellyfin.Plugin.Database.Npgsql.Packaging/**
-!docker/linuxserver/build-seed.sh
-!docker/linuxserver/package-files.txt
+!docker/common/build-seed.sh
+!docker/common/install-plugin.sh
+!docker/common/package-files.txt
 !docker/linuxserver/root/**
 **/bin
 **/bin/**
