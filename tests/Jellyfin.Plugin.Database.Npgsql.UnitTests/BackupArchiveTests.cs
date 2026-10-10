@@ -1296,7 +1296,44 @@ public sealed class BackupArchiveTests : IDisposable
         NpgsqlScratchSpace.ScavengeValidationDirectories(root);
 
         Assert.False(Directory.Exists(partial));
-        Assert.Single(Directory.GetDirectories(root, ".trash-uninitialized-*", SearchOption.TopDirectoryOnly));
+        var tombstone = Assert.Single(Directory.GetDirectories(root, ".trash-uninitialized-*", SearchOption.TopDirectoryOnly));
+        var claimPath = Assert.Single(Directory.GetFiles(root, ".trash-uninitialized-*.uninitialized-claim", SearchOption.TopDirectoryOnly));
+        var claim = JsonNode.Parse(File.ReadAllText(claimPath))!.AsObject();
+        Assert.Equal(Path.GetFileName(tombstone), claim["TrashName"]!.GetValue<string>());
+        Assert.NotEqual(Guid.Empty, claim["KeyId"]!.GetValue<Guid>());
+        Assert.Equal(64, claim["Proof"]!.GetValue<string>().Length);
+        Assert.True(File.Exists(Path.Combine(tombstone, ".jellyfin-npgsql-init-receipt.json")));
+    }
+
+    [Fact]
+    [SupportedOSPlatform("linux")]
+    public void ValidationScratch_WrongReceiptSecretCannotAuthorizeUninitializedCleanup()
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux authenticated initialization-receipt contract.");
+        var root = Path.Combine(this.testRoot, "validation-wrong-receipt-secret");
+        using (NpgsqlBackupFileSystem.InjectFaults(point =>
+        {
+            if (point == "scratch-init-after-receipt")
+            {
+                throw new IOException("simulated crash before owner marker");
+            }
+        }))
+        {
+            Assert.Throws<IOException>(() => NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation"));
+        }
+
+        var partial = Assert.Single(Directory.GetDirectories(root, ".init-validation-*", SearchOption.TopDirectoryOnly));
+        var receiptPath = Assert.Single(Directory.GetFiles(root, ".jellyfin-npgsql-init-receipt-*.json", SearchOption.TopDirectoryOnly));
+        var receipt = JsonNode.Parse(File.ReadAllText(receiptPath))!.AsObject();
+        receipt["Proof"] = new string('A', 64);
+        File.WriteAllText(receiptPath, receipt.ToJsonString());
+        File.SetUnixFileMode(receiptPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        Directory.SetLastWriteTimeUtc(partial, DateTime.UtcNow - TimeSpan.FromHours(2));
+
+        NpgsqlScratchSpace.ScavengeValidationDirectories(root);
+
+        Assert.True(Directory.Exists(partial));
+        Assert.True(File.Exists(receiptPath));
     }
 
     [Fact]
@@ -1543,6 +1580,9 @@ public sealed class BackupArchiveTests : IDisposable
         File.WriteAllText(
             Path.Combine(root, ".jellyfin-npgsql-root-key-" + Guid.NewGuid().ToString("N") + ".json"),
             "{torn");
+        File.SetUnixFileMode(
+            Directory.GetFiles(root, ".jellyfin-npgsql-root-key-*.json", SearchOption.TopDirectoryOnly).Single(),
+            UnixFileMode.UserRead | UnixFileMode.UserWrite);
         var beforeRotation = NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation");
         Assert.All(
             Directory.GetFiles(root, ".jellyfin-npgsql-root-key-*.json", SearchOption.TopDirectoryOnly)
@@ -1567,6 +1607,79 @@ public sealed class BackupArchiveTests : IDisposable
         NpgsqlScratchSpace.ClaimAndDelete(afterInterruptedRotation, "validation");
         Assert.False(Directory.Exists(beforeRotation));
         Assert.False(Directory.Exists(afterInterruptedRotation));
+    }
+
+    [Theory]
+    [InlineData("Secret")]
+    [InlineData("Integrity")]
+    [SupportedOSPlatform("linux")]
+    public void ScratchCleanup_DirectRootKeyMutationCannotAuthorizeCleanup(string property)
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux HMAC scratch-owner contract.");
+        var root = Path.Combine(this.testRoot, "scratch-key-mutation-" + property);
+        var owned = NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation");
+        var payload = Path.Combine(owned, "payload");
+        File.WriteAllText(payload, "keep");
+        var keyPath = Directory.GetFiles(root, ".jellyfin-npgsql-root-key-*.json", SearchOption.TopDirectoryOnly).Single();
+        var key = JsonNode.Parse(File.ReadAllText(keyPath))!.AsObject();
+        key[property] = new string(property == "Secret" ? 'A' : 'B', 64);
+        File.WriteAllText(keyPath, key.ToJsonString());
+        File.SetUnixFileMode(keyPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+
+        Assert.Throws<InvalidDataException>(() => NpgsqlScratchSpace.ClaimAndDelete(owned, "validation"));
+        Assert.Equal("keep", File.ReadAllText(payload));
+    }
+
+    [Theory]
+    [InlineData("scratch-root-key-after-temp-create")]
+    [InlineData("scratch-root-key-after-temp-flush")]
+    [InlineData("scratch-root-key-after-publish")]
+    [InlineData("flush-scratch-root-key-parent")]
+    public void ScratchCleanup_InterruptedKeyPublicationNeverInvalidatesExistingKeys(string point)
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux durable root-key publication contract.");
+        var root = Path.Combine(this.testRoot, "scratch-key-publication-" + point);
+        var beforeRotation = NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation");
+        using (NpgsqlBackupFileSystem.InjectFaults(checkpoint =>
+        {
+            if (string.Equals(checkpoint, point, StringComparison.Ordinal))
+            {
+                throw new IOException("simulated key publication crash");
+            }
+        }))
+        {
+            Assert.Throws<IOException>(() => NpgsqlScratchSpace.RotateRootKeyForTests(root));
+        }
+
+        var afterCrash = NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation");
+        NpgsqlScratchSpace.ClaimAndDelete(beforeRotation, "validation");
+        NpgsqlScratchSpace.ClaimAndDelete(afterCrash, "validation");
+        Assert.False(Directory.Exists(beforeRotation));
+        Assert.False(Directory.Exists(afterCrash));
+    }
+
+    [Fact]
+    public void ScratchCleanup_ThousandsOfCompletedGenerationsKeepLiveRetentionBounded()
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux bounded scratch-retention contract.");
+        var root = Path.Combine(this.testRoot, "scratch-retention-thousands");
+        for (var index = 0; index < 2000; index++)
+        {
+            var owned = NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation");
+            NpgsqlScratchSpace.ClaimAndDelete(owned, "validation");
+        }
+
+        var retained = Directory.EnumerateFileSystemEntries(root, "*", SearchOption.AllDirectories)
+            .Where(path => Path.GetFileName(path).StartsWith(".trash-", StringComparison.Ordinal)
+                || Path.GetFileName(path).StartsWith(".retained-", StringComparison.Ordinal)
+                || Path.GetFileName(path).StartsWith(".entry-claim-", StringComparison.Ordinal)
+                || Path.GetFileName(path).StartsWith(".jellyfin-npgsql-init-receipt-", StringComparison.Ordinal))
+            .ToArray();
+        Assert.InRange(retained.Length, 0, 1024);
+        Assert.DoesNotContain(
+            Directory.EnumerateFiles(root, ".jellyfin-npgsql-init-receipt-*", SearchOption.TopDirectoryOnly),
+            _ => true);
+        Assert.True(Directory.Exists(root + ".quarantine"));
     }
 
     [Fact]

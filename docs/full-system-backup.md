@@ -69,8 +69,10 @@ bind purpose, canonical basename, key generation, directory identity, and
 marker identity and, on Linux, device, inode, mount ID, and birth time when the
 filesystem reports it. Linux `statx` does not expose an inode-generation field
 on every supported kernel/filesystem, so mount ID and birth time supplement but
-do not overstate the kernel identity available. Key rotation appends a durable
-new key and retains old keys; a torn new record does not invalidate old proofs.
+do not overstate the kernel identity available. Key rotation writes an
+owner-only temporary record, flushes it, publishes it with an atomic no-replace
+rename, and fsyncs the parent. It retains old keys; a torn new record is
+isolated per candidate and does not invalidate old proofs.
 If every key record is torn or lost, startup appends a fresh key for new work
 while retaining all older generations as unprovable data; the fresh key cannot
 authorize them because every marker binds its original random key ID.
@@ -80,10 +82,18 @@ and is outside this trust boundary. Dead validation directories are scavenged
 on the next validation while live/concurrent, forged, or unmarked published
 directories are never mutated. Empty pre-marker staging generations use a
 reserved name and are reclaimed only after a one-hour inactivity bound and a
-separately authenticated creation receipt. Unknown empty, unknown nonempty,
-and malformed staging generations are preserved fail closed and isolated per
-candidate. Retention is capped at 1,024 namespace entries or 64 MiB; exceeding either
-bound disables new scratch work without deleting unknown data. ZIP central-directory size and count are checked before `ZipArchive`
+separately authenticated creation receipt. A completed receipt is atomically
+moved into the exact initialized or claimed generation, and an uninitialized
+tombstone receives a new authenticated claim binding its canonical tombstone
+name, generation identity, and root-key generation. Unknown empty, unknown
+nonempty, and malformed staging generations are preserved fail closed and
+isolated per candidate. Active retention is measured recursively, including
+receipts, sidecars, claims, retained children, and tombstones, and is capped
+before and after work at 1,024 namespace entries or 64 MiB. Authenticated
+terminal generations are compacted into an owner-private sibling quarantine
+when the active root reaches 75% of either limit; unknown or replacement
+objects remain in place. Exceeding either hard bound disables new scratch work
+without deleting unknown data. ZIP central-directory size and count are checked before `ZipArchive`
 materializes entries.
 
 A process-wide provider gate serializes backup and restore from preflight
@@ -136,9 +146,12 @@ unlink the exact object represented by an open descriptor; checking identity
 and then unlinking a mutable name would retain a final TOCTOU. The plugin
 therefore never unlinks scratch names on Linux. It deliberately retains small
 authenticated tombstones, entry claims, directory metadata, and symlinks under
-the bounded retention policy. Windows similarly retains a same-parent claimed
-generation because the managed recursive-delete API cannot provide the same
-exact-object guarantee. A replacement at an old, retained, root, or sidecar
+the bounded active-retention and quarantine policy. On Windows, the root, key,
+generation, marker, and inherited payload ACLs are restricted to the Jellyfin
+account. Cleanup pins each exact file or directory, verifies its stable file ID
+after the claim rename, truncates regular payloads through that handle, and uses
+`FILE_DISPOSITION_INFO_EX` delete-on-close semantics rather than managed
+recursive name deletion. A replacement at an old, retained, root, or sidecar
 name is never truncated or deleted. Interrupted tombstones are idempotently
 replayed from their durable claims with parent-fsync ordering. Recovery itself is serialized across processes by
 an OS lock held on the stable application-data directory inode; the separately

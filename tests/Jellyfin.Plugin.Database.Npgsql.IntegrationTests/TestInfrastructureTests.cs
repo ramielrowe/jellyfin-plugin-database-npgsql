@@ -774,12 +774,30 @@ public sealed class TestInfrastructureTests
                 Path.Combine(owned, "nested", "payload"),
                 "owned",
                 TestContext.Current.CancellationToken);
+            var unrelatedFile = Path.Combine(root, "unrelated-file");
+            var unrelatedDirectory = Path.Combine(root, "unrelated-directory");
+            var unrelatedSymlinkTarget = Path.Combine(root, "unrelated-symlink-target");
+            var unrelatedSymlink = Path.Combine(root, "unrelated-symlink");
+            var unrelatedRootReplacement = Path.Combine(root, ".trash-unrelated-root");
+            var unrelatedSidecarReplacement = Path.Combine(root, ".trash-unrelated-root.claim");
+            await File.WriteAllTextAsync(unrelatedFile, "file replacement", TestContext.Current.CancellationToken);
+            Directory.CreateDirectory(unrelatedDirectory);
+            await File.WriteAllTextAsync(Path.Combine(unrelatedDirectory, "payload"), "directory replacement", TestContext.Current.CancellationToken);
+            await File.WriteAllTextAsync(unrelatedSymlinkTarget, "symlink target", TestContext.Current.CancellationToken);
+            File.CreateSymbolicLink(unrelatedSymlink, unrelatedSymlinkTarget);
+            Directory.CreateDirectory(unrelatedRootReplacement);
+            await File.WriteAllTextAsync(Path.Combine(unrelatedRootReplacement, "payload"), "root replacement", TestContext.Current.CancellationToken);
+            await File.WriteAllTextAsync(unrelatedSidecarReplacement, "sidecar replacement", TestContext.Current.CancellationToken);
+            var evidencePath = Path.Combine(root, ".checkpoint-" + Guid.NewGuid().ToString("N"));
+            var expectedEvidence = "checkpoint-reached:" + point;
             var crashed = await ExternalCommand.RunAsync(
                 "dotnet",
-                new[] { helper, "scratch-cleanup-crash", owned, point },
+                new[] { helper, "scratch-cleanup-crash", owned, point, evidencePath },
                 TimeSpan.FromSeconds(15),
                 TestContext.Current.CancellationToken);
             Assert.NotEqual(0, crashed.ExitCode);
+            Assert.Contains(expectedEvidence, crashed.StandardError, StringComparison.Ordinal);
+            Assert.Equal(expectedEvidence, await File.ReadAllTextAsync(evidencePath, TestContext.Current.CancellationToken));
 
             using (NpgsqlScratchSpace.InjectOwnerLivenessForTests((_, _) => false))
             {
@@ -794,6 +812,49 @@ public sealed class TestInfrastructureTests
                     .Where(path => Path.GetFileName(path).StartsWith(".retained-", StringComparison.Ordinal)
                         && !Path.GetFileName(path).EndsWith(".json", StringComparison.Ordinal)),
                 path => Assert.Equal(0, new FileInfo(path).Length));
+            Assert.Equal("file replacement", await File.ReadAllTextAsync(unrelatedFile, TestContext.Current.CancellationToken));
+            Assert.Equal("directory replacement", await File.ReadAllTextAsync(Path.Combine(unrelatedDirectory, "payload"), TestContext.Current.CancellationToken));
+            Assert.Equal(unrelatedSymlinkTarget, new FileInfo(unrelatedSymlink).LinkTarget);
+            Assert.Equal("root replacement", await File.ReadAllTextAsync(Path.Combine(unrelatedRootReplacement, "payload"), TestContext.Current.CancellationToken));
+            Assert.Equal("sidecar replacement", await File.ReadAllTextAsync(unrelatedSidecarReplacement, TestContext.Current.CancellationToken));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData("scratch-root-key-after-temp-create")]
+    [InlineData("scratch-root-key-after-temp-flush")]
+    [InlineData("scratch-root-key-after-publish")]
+    [InlineData("flush-scratch-root-key-parent")]
+    public async Task ScratchRootKey_ProcessKillAtEveryPublicationBoundaryRecovers(string point)
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux durable root-key publication contract.");
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var helper = Path.Combine(repositoryRoot, "tests", "Jellyfin.Plugin.Database.Npgsql.TestHarness", "bin", "Release", "net10.0", "Jellyfin.Plugin.Database.Npgsql.TestHarness.dll");
+        var root = Path.Combine(repositoryRoot, ".artifacts", "root-key-crash-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var beforeCrash = NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation");
+            var evidencePath = Path.Combine(root, ".checkpoint-" + Guid.NewGuid().ToString("N"));
+            var expectedEvidence = "checkpoint-reached:" + point;
+            var crashed = await ExternalCommand.RunAsync(
+                "dotnet",
+                new[] { helper, "root-key-crash", root, point, evidencePath },
+                TimeSpan.FromSeconds(15),
+                TestContext.Current.CancellationToken);
+            Assert.NotEqual(0, crashed.ExitCode);
+            Assert.Contains(expectedEvidence, crashed.StandardError, StringComparison.Ordinal);
+            Assert.Equal(expectedEvidence, await File.ReadAllTextAsync(evidencePath, TestContext.Current.CancellationToken));
+
+            var afterCrash = NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation");
+            NpgsqlScratchSpace.ClaimAndDelete(beforeCrash, "validation");
+            NpgsqlScratchSpace.ClaimAndDelete(afterCrash, "validation");
+            Assert.False(Directory.Exists(beforeCrash));
+            Assert.False(Directory.Exists(afterCrash));
         }
         finally
         {

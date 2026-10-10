@@ -3,17 +3,52 @@ using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
 using MediaBrowser.Controller;
 using Npgsql;
 
-if (args.Length == 3 && args[0] == "scratch-cleanup-crash")
+if (args.Length == 4 && args[0] == "scratch-cleanup-crash")
 {
+    var evidence = "checkpoint-reached:" + args[2];
     using var crash = NpgsqlBackupFileSystem.InjectFaults(point =>
     {
         if (string.Equals(point, args[2], StringComparison.Ordinal))
         {
+            using (var marker = new FileStream(args[3], FileMode.CreateNew, FileAccess.Write, FileShare.Read, 4096, FileOptions.WriteThrough))
+            using (var writer = new StreamWriter(marker, System.Text.Encoding.UTF8, leaveOpen: true))
+            {
+                writer.Write(evidence);
+                writer.Flush();
+                marker.Flush(flushToDisk: true);
+            }
+
+            NpgsqlBackupFileSystem.FlushDirectory(Path.GetDirectoryName(args[3])!, "scratch-crash-evidence-parent");
+            Console.Error.WriteLine(evidence);
             Environment.FailFast("Intentional scratch cleanup crash at " + point);
         }
     });
     NpgsqlScratchSpace.ClaimAndDelete(args[1], "validation");
     throw new InvalidOperationException("The requested scratch cleanup crash checkpoint was not reached.");
+}
+
+if (args.Length == 4 && args[0] == "root-key-crash")
+{
+    var evidence = "checkpoint-reached:" + args[2];
+    using var crash = NpgsqlBackupFileSystem.InjectFaults(point =>
+    {
+        if (string.Equals(point, args[2], StringComparison.Ordinal))
+        {
+            using (var marker = new FileStream(args[3], FileMode.CreateNew, FileAccess.Write, FileShare.Read, 4096, FileOptions.WriteThrough))
+            using (var writer = new StreamWriter(marker, System.Text.Encoding.UTF8, leaveOpen: true))
+            {
+                writer.Write(evidence);
+                writer.Flush();
+                marker.Flush(flushToDisk: true);
+            }
+
+            NpgsqlBackupFileSystem.FlushDirectory(Path.GetDirectoryName(args[3])!, "root-key-crash-evidence-parent");
+            Console.Error.WriteLine(evidence);
+            Environment.FailFast("Intentional root-key publication crash at " + point);
+        }
+    });
+    _ = NpgsqlScratchSpace.RotateRootKeyForTests(args[1]);
+    throw new InvalidOperationException("The requested root-key crash checkpoint was not reached.");
 }
 
 if (args.Length == 4 && args[0] == "restore-recovery-lease-hold")

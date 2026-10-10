@@ -1,7 +1,10 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text.Json;
 using Microsoft.Win32.SafeHandles;
 
@@ -16,6 +19,8 @@ internal static class NpgsqlScratchSpace
     private const string RootKeyPrefix = ".jellyfin-npgsql-root-key-";
     private const string RootKeySuffix = ".json";
     private const string InitializationReceiptPrefix = ".jellyfin-npgsql-init-receipt-";
+    private const string InitializationReceiptName = ".jellyfin-npgsql-init-receipt.json";
+    private const string QuarantineSuffix = ".quarantine";
     private const int MaximumRetainedEntries = 1024;
     private const long MaximumRetainedBytes = 64L * 1024 * 1024;
     private const int OpenReadOnly = 0;
@@ -28,6 +33,16 @@ internal static class NpgsqlScratchSpace
     private const int OpenPath = 0x200000;
     private const int AtEmptyPath = 0x1000;
     private const int AtSymlinkNoFollow = 0x100;
+    private const uint WindowsDelete = 0x00010000;
+    private const uint WindowsGenericRead = 0x80000000;
+    private const uint WindowsGenericWrite = 0x40000000;
+    private const uint WindowsShareAll = 0x00000007;
+    private const uint WindowsOpenExisting = 3;
+    private const uint WindowsBackupSemantics = 0x02000000;
+    private const uint WindowsOpenReparsePoint = 0x00200000;
+    private const uint WindowsDispositionDelete = 0x00000001;
+    private const uint WindowsDispositionPosixSemantics = 0x00000002;
+    private const uint WindowsDispositionIgnoreReadonly = 0x00000010;
     private const UnixFileMode OwnerDirectoryMode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
     private const UnixFileMode OwnerFileMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
     private static readonly object ConfigurationLock = new();
@@ -71,12 +86,16 @@ internal static class NpgsqlScratchSpace
         ArgumentException.ThrowIfNullOrWhiteSpace(parent);
         ArgumentException.ThrowIfNullOrWhiteSpace(purpose);
         Directory.CreateDirectory(parent);
-        if (!OperatingSystem.IsWindows())
+        if (OperatingSystem.IsWindows())
+        {
+            EnsureWindowsOwnerOnlyDirectory(parent);
+        }
+        else
         {
             File.SetUnixFileMode(parent, OwnerDirectoryMode);
         }
 
-        EnsureRetentionCapacity(parent);
+        MaintainRetention(parent);
         var rootKey = LoadOrCreateRootKey(parent);
 
         var ownerId = Guid.NewGuid();
@@ -85,7 +104,11 @@ internal static class NpgsqlScratchSpace
         var directory = Path.Combine(parent, generationName);
         var stagingDirectory = Path.Combine(parent, stagingName);
         Directory.CreateDirectory(stagingDirectory);
-        if (!OperatingSystem.IsWindows())
+        if (OperatingSystem.IsWindows())
+        {
+            EnsureWindowsOwnerOnlyDirectory(stagingDirectory);
+        }
+        else
         {
             File.SetUnixFileMode(stagingDirectory, OwnerDirectoryMode);
         }
@@ -116,6 +139,11 @@ internal static class NpgsqlScratchSpace
         var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
         using (var stream = new FileStream(Path.Combine(stagingDirectory, OwnerMarker), options))
         {
+            if (OperatingSystem.IsWindows())
+            {
+                EnsureWindowsOwnerOnlyFile(Path.Combine(stagingDirectory, OwnerMarker));
+            }
+
             var markerIdentity = OperatingSystem.IsLinux() ? ReadIdentity(stream.SafeFileHandle) : null;
             var owner = new ScratchOwner(
                 PluginMetadata.Id.ToString("D"),
@@ -158,6 +186,13 @@ internal static class NpgsqlScratchSpace
             NpgsqlBackupFileSystem.FlushDirectory(parent, "flush-scratch-parent");
         }
 
+        if (directoryHandle is not null)
+        {
+            CompactInitializationReceipt(parent, directory, ownerId);
+        }
+
+        EnsureRetentionCapacity(parent);
+
         return directory;
     }
 
@@ -185,6 +220,7 @@ internal static class NpgsqlScratchSpace
         if (name.StartsWith(".trash-", StringComparison.Ordinal))
         {
             DeleteClaimedTrash(parent, name, purpose);
+            EnsureRetentionCapacity(parentPath);
             return;
         }
 
@@ -212,6 +248,7 @@ internal static class NpgsqlScratchSpace
             trashName,
             new ScratchClaim(owner, identity, trashName, owner.KeyId, null, string.Empty));
         DeleteClaimedTrash(parent, trashName, purpose, claimed);
+        EnsureRetentionCapacity(parentPath);
     }
 
     internal static void ScavengeValidationDirectories(string parent) => Scavenge(parent, "validation", "validation-");
@@ -256,6 +293,11 @@ internal static class NpgsqlScratchSpace
             return;
         }
 
+        if (OperatingSystem.IsLinux())
+        {
+            CompactPublishedInitializationReceipts(parent, purpose);
+        }
+
         ScavengeUninitialized(parent, purpose);
         foreach (var candidate in Directory.EnumerateDirectories(parent, "*", SearchOption.TopDirectoryOnly))
         {
@@ -288,6 +330,117 @@ internal static class NpgsqlScratchSpace
         }
 
         ScavengeOrphanedClaimSidecars(parent, purpose);
+        MaintainRetention(parent);
+    }
+
+    private static void CompactInitializationReceipt(string rootPath, string generationPath, Guid ownerId)
+    {
+        using var root = OpenDirectoryHandle(rootPath);
+        using var generation = OpenDirectoryHandle(generationPath);
+        var proof = ReadOwnerProof(generation);
+        if (proof.Owner.OwnerId != ownerId
+            || proof.Owner.DirectoryIdentity != ReadIdentity(generation))
+        {
+            throw new InvalidDataException("The published scratch generation does not match its initialization receipt.");
+        }
+
+        var receiptName = InitializationReceiptPrefix + ownerId.ToString("N") + RootKeySuffix;
+        var receipt = ReadInitializationReceipt(
+            root,
+            ".init-" + proof.Owner.GenerationName,
+            proof.Owner.Purpose,
+            ownerId,
+            ReadIdentity(generation));
+        if (receipt is null)
+        {
+            throw new InvalidDataException("The published scratch generation has no authentic initialization receipt.");
+        }
+
+        RenamePinnedBetweenNoReplace(
+            root,
+            receiptName,
+            generation,
+            InitializationReceiptName,
+            receipt.MarkerIdentity,
+            "Could not bind scratch initialization evidence to its generation.");
+        NpgsqlBackupFileSystem.FlushHandle(generation, "flush-scratch-init-receipt-generation");
+        NpgsqlBackupFileSystem.FlushHandle(root, "flush-scratch-init-receipt-root");
+        NpgsqlBackupFileSystem.Checkpoint("scratch-after-init-receipt-compaction");
+    }
+
+    private static void CompactPublishedInitializationReceipts(string rootPath, string purpose)
+    {
+        using var root = OpenDirectoryHandle(rootPath);
+        var claimedByOwner = new Dictionary<Guid, List<string>>();
+        foreach (var claimedPath in Directory.EnumerateDirectories(HandlePath(root), ".trash-*", SearchOption.TopDirectoryOnly))
+        {
+            var claimedName = Path.GetFileName(claimedPath);
+            const int prefixLength = 7;
+            if (claimedName.Length < prefixLength + 32
+                || !Guid.TryParseExact(claimedName.Substring(prefixLength, 32), "N", out var ownerId))
+            {
+                continue;
+            }
+
+            if (!claimedByOwner.TryGetValue(ownerId, out var names))
+            {
+                names = [];
+                claimedByOwner.Add(ownerId, names);
+            }
+
+            names.Add(claimedName);
+        }
+
+        foreach (var path in Directory.EnumerateFiles(HandlePath(root), InitializationReceiptPrefix + "*" + RootKeySuffix, SearchOption.TopDirectoryOnly))
+        {
+            try
+            {
+                var receiptName = Path.GetFileName(path);
+                var receipt = ReadInitializationReceipt(root, receiptName);
+                if (receipt is null || !string.Equals(receipt.Purpose, purpose, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var generationName = receipt.StagingName[".init-".Length..];
+                var candidates = new[] { generationName }
+                    .Concat(claimedByOwner.GetValueOrDefault(receipt.OwnerId) ?? []);
+                foreach (var candidate in candidates)
+                {
+                    try
+                    {
+                        using var generation = OpenDirectoryAt(root, candidate!);
+                        var proof = ReadOwnerProof(generation);
+                        if (proof.Owner.OwnerId != receipt.OwnerId
+                            || proof.Owner.DirectoryIdentity != receipt.DirectoryIdentity
+                            || ReadIdentity(generation) != receipt.DirectoryIdentity
+                            || !IsExpectedOwner(proof, purpose, rootPath))
+                        {
+                            continue;
+                        }
+
+                        RenamePinnedBetweenNoReplace(
+                            root,
+                            receiptName,
+                            generation,
+                            InitializationReceiptName,
+                            receipt.MarkerIdentity,
+                            "Could not compact scratch initialization evidence.");
+                        NpgsqlBackupFileSystem.FlushHandle(generation, "flush-scratch-init-receipt-generation");
+                        NpgsqlBackupFileSystem.FlushHandle(root, "flush-scratch-init-receipt-root");
+                        break;
+                    }
+                    catch (FileNotFoundException)
+                    {
+                        // Try the next live or claimed basename for this receipt.
+                    }
+                }
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException)
+            {
+                // A malformed, raced, or still-unpublished receipt is retained fail closed.
+            }
+        }
     }
 
     private static void ScavengeUninitialized(string parentPath, string purpose)
@@ -333,12 +486,13 @@ internal static class NpgsqlScratchSpace
 
                 if (entries.Length != 0
                     || DateTime.UtcNow - File.GetLastWriteTimeUtc(handle) < TimeSpan.FromHours(1)
-                    || ReadInitializationReceipt(parent, name, purpose, ownerId, identity) is null)
+                    || ReadInitializationReceipt(parent, name, purpose, ownerId, identity) is not { } receipt)
                 {
                     continue;
                 }
 
                 var claimedName = ".trash-uninitialized-" + ownerId.ToString("N") + "-" + Guid.NewGuid().ToString("N");
+                WriteUninitializedClaim(parent, receipt, identity, claimedName);
                 RenameNoReplace(parent, name, claimedName, "Could not claim uninitialized scratch generation.");
                 using var claimed = OpenDirectoryAt(parent, claimedName);
                 if (ReadIdentity(claimed) != identity || Directory.EnumerateFileSystemEntries(HandlePath(claimed)).Any())
@@ -347,7 +501,14 @@ internal static class NpgsqlScratchSpace
                     continue;
                 }
 
-                ReclaimPinned(claimed);
+                RenamePinnedBetweenNoReplace(
+                    parent,
+                    InitializationReceiptPrefix + ownerId.ToString("N") + RootKeySuffix,
+                    claimed,
+                    InitializationReceiptName,
+                    receipt.MarkerIdentity,
+                    "Could not bind initialization evidence to its claimed tombstone.");
+                NpgsqlBackupFileSystem.FlushHandle(claimed, "flush-scratch-uninitialized-generation");
                 NpgsqlBackupFileSystem.FlushHandle(parent, "flush-scratch-uninitialized-parent");
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException)
@@ -436,6 +597,39 @@ internal static class NpgsqlScratchSpace
         NpgsqlBackupFileSystem.Checkpoint("scratch-after-entry-claim");
     }
 
+    private static void WriteUninitializedClaim(
+        SafeFileHandle root,
+        InitializationReceipt receipt,
+        ScratchIdentity directoryIdentity,
+        string trashName)
+    {
+        var name = trashName + ".uninitialized-claim";
+        var descriptor = OpenAt(
+            root.DangerousGetHandle().ToInt32(),
+            name,
+            OpenWriteOnly | OpenCreate | OpenExclusive | OpenNoFollow | OpenCloseOnExec,
+            384);
+        if (descriptor < 0)
+        {
+            throw NativeFailure("Could not create an authenticated uninitialized-generation claim.");
+        }
+
+        using var handle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        using var stream = new FileStream(handle, FileAccess.Write);
+        var key = LoadRootKey(ResolveHandlePath(root), receipt.KeyId);
+        var claim = new ScratchUninitializedClaim(
+            receipt,
+            directoryIdentity,
+            trashName,
+            receipt.KeyId,
+            ReadIdentity(stream.SafeFileHandle),
+            string.Empty);
+        claim = claim with { Proof = ComputeUninitializedClaimProof(claim, key.Secret) };
+        JsonSerializer.Serialize(stream, claim);
+        stream.Flush(flushToDisk: true);
+        NpgsqlBackupFileSystem.FlushHandle(root, "flush-scratch-uninitialized-claim-parent");
+    }
+
     private static void ReplayRetainedClaims(SafeFileHandle directory, RootKey rootKey)
     {
         foreach (var claimPath in Directory.EnumerateFiles(HandlePath(directory), ".entry-claim-*.json", SearchOption.TopDirectoryOnly))
@@ -503,6 +697,7 @@ internal static class NpgsqlScratchSpace
                 .Select(Path.GetFileName)
                 .Where(name => !string.IsNullOrEmpty(name))
                 .Where(name => !string.Equals(name, OwnerMarker, StringComparison.Ordinal)
+                    && !string.Equals(name, InitializationReceiptName, StringComparison.Ordinal)
                     && !name!.StartsWith(".retained-", StringComparison.Ordinal)
                     && !name.StartsWith(".entry-claim-", StringComparison.Ordinal))
                 .ToArray();
@@ -880,12 +1075,165 @@ internal static class NpgsqlScratchSpace
 
         var parent = Path.GetDirectoryName(directory)!;
         var trash = Path.Combine(parent, ".trash-" + owner.OwnerId.ToString("N") + "-" + Guid.NewGuid().ToString("N"));
+        using var original = OpenWindowsObject(directory);
+        var originalIdentity = ReadWindowsIdentity(original);
         Directory.Move(directory, trash);
+        using var claimed = OpenWindowsObject(trash);
+        if (ReadWindowsIdentity(claimed) != originalIdentity)
+        {
+            throw new InvalidDataException("The claimed Windows scratch generation changed identity; it was retained.");
+        }
 
-        // The managed Windows directory APIs do not expose an exact opened-object
-        // recursive delete. Retain the claimed generation instead of risking a
-        // name race. The root retention budget bounds this fail-safe behavior.
+        DeleteWindowsContents(trash);
+        SetWindowsDeleteDisposition(claimed);
+        NpgsqlBackupFileSystem.Checkpoint("scratch-after-delete-root");
+        EnsureRetentionCapacity(parent);
     }
+
+    [SupportedOSPlatform("windows")]
+    private static void DeleteWindowsContents(string directory)
+    {
+        foreach (var source in Directory.EnumerateFileSystemEntries(directory, "*", SearchOption.TopDirectoryOnly))
+        {
+            using var original = OpenWindowsObject(source);
+            var originalIdentity = ReadWindowsIdentity(original);
+            var retained = Path.Combine(directory, ".retained-" + Guid.NewGuid().ToString("N"));
+            if ((File.GetAttributes(source) & FileAttributes.Directory) != 0)
+            {
+                Directory.Move(source, retained);
+            }
+            else
+            {
+                File.Move(source, retained);
+            }
+
+            using var claimed = OpenWindowsObject(retained);
+            if (ReadWindowsIdentity(claimed) != originalIdentity)
+            {
+                throw new InvalidDataException("A claimed Windows scratch entry changed identity; it was retained.");
+            }
+
+            var attributes = File.GetAttributes(retained);
+            if ((attributes & FileAttributes.Directory) != 0
+                && (attributes & FileAttributes.ReparsePoint) == 0)
+            {
+                DeleteWindowsContents(retained);
+            }
+            else if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0)
+            {
+                RandomAccess.SetLength(claimed, 0);
+                NpgsqlBackupFileSystem.FlushHandle(claimed, "flush-scratch-reclaimed-payload");
+            }
+
+            NpgsqlBackupFileSystem.Checkpoint("scratch-before-child-unlink");
+            SetWindowsDeleteDisposition(claimed);
+            NpgsqlBackupFileSystem.Checkpoint("scratch-after-child-delete");
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static SafeFileHandle OpenWindowsObject(string path)
+    {
+        var handle = CreateFileWindows(
+            path,
+            WindowsDelete | WindowsGenericRead | WindowsGenericWrite,
+            WindowsShareAll,
+            0,
+            WindowsOpenExisting,
+            WindowsBackupSemantics | WindowsOpenReparsePoint,
+            0);
+        return !handle.IsInvalid
+            ? handle
+            : throw new IOException("A Windows scratch object could not be pinned for safe reclamation.", new Win32Exception());
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static WindowsFileIdentity ReadWindowsIdentity(SafeFileHandle handle)
+    {
+        var info = new WindowsFileIdInfo { FileId = new byte[16] };
+        if (!GetFileInformationByHandleEx(handle, 18, ref info, Marshal.SizeOf<WindowsFileIdInfo>()))
+        {
+            throw new IOException("A Windows scratch object could not be identified.", new Win32Exception());
+        }
+
+        return new WindowsFileIdentity(info.VolumeSerialNumber, Convert.ToHexString(info.FileId));
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void SetWindowsDeleteDisposition(SafeFileHandle handle)
+    {
+        var disposition = new WindowsFileDispositionInfoEx
+        {
+            Flags = WindowsDispositionDelete | WindowsDispositionPosixSemantics | WindowsDispositionIgnoreReadonly,
+        };
+        if (!SetFileInformationByHandle(handle, 21, ref disposition, Marshal.SizeOf<WindowsFileDispositionInfoEx>()))
+        {
+            throw new IOException("A pinned Windows scratch object could not be reclaimed safely.", new Win32Exception());
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void EnsureWindowsOwnerOnlyDirectory(string path)
+    {
+        var owner = WindowsIdentity.GetCurrent().User
+            ?? throw new InvalidOperationException("The current Windows account has no security identifier.");
+        var security = new DirectorySecurity();
+        security.SetOwner(owner);
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.AddAccessRule(new FileSystemAccessRule(
+            owner,
+            FileSystemRights.FullControl,
+            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+            PropagationFlags.None,
+            AccessControlType.Allow));
+        new DirectoryInfo(path).SetAccessControl(security);
+
+        var verified = new DirectoryInfo(path).GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+        if (!verified.AreAccessRulesProtected || !HasWindowsOwner(verified, owner))
+        {
+            throw new UnauthorizedAccessException("The PostgreSQL scratch directory could not be restricted to its owner.");
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void EnsureWindowsOwnerOnlyFile(string path)
+    {
+        var owner = WindowsIdentity.GetCurrent().User
+            ?? throw new InvalidOperationException("The current Windows account has no security identifier.");
+        var security = new FileSecurity();
+        security.SetOwner(owner);
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.AddAccessRule(new FileSystemAccessRule(owner, FileSystemRights.FullControl, AccessControlType.Allow));
+        new FileInfo(path).SetAccessControl(security);
+
+        var verified = new FileInfo(path).GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+        if (!verified.AreAccessRulesProtected || !HasWindowsOwner(verified, owner))
+        {
+            throw new UnauthorizedAccessException("A PostgreSQL scratch file could not be restricted to its owner.");
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void VerifyWindowsOwnerOnlyFile(string path)
+    {
+        var owner = WindowsIdentity.GetCurrent().User
+            ?? throw new InvalidOperationException("The current Windows account has no security identifier.");
+        var security = new FileInfo(path).GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+        var rules = security.GetAccessRules(includeExplicit: true, includeInherited: true, typeof(SecurityIdentifier))
+            .Cast<FileSystemAccessRule>()
+            .ToArray();
+        if (!security.AreAccessRulesProtected
+            || !HasWindowsOwner(security, owner)
+            || rules.Any(rule => !rule.IdentityReference.Equals(owner) || rule.AccessControlType != AccessControlType.Allow))
+        {
+            throw new UnauthorizedAccessException("A PostgreSQL scratch key is not restricted to its owner.");
+        }
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static bool HasWindowsOwner(ObjectSecurity security, SecurityIdentifier owner)
+        => security.GetOwner(typeof(SecurityIdentifier)) is SecurityIdentifier actual
+            && actual.Equals(owner);
 
     private static SafeFileHandle OpenDirectoryHandle(string path)
     {
@@ -1001,6 +1349,63 @@ internal static class NpgsqlScratchSpace
         throw NativeFailure(message);
     }
 
+    private static void RenameBetweenNoReplace(
+        SafeFileHandle sourceParent,
+        string source,
+        SafeFileHandle destinationParent,
+        string destination,
+        string message)
+    {
+        const uint renameNoReplace = 1;
+        if (RenameAt2Native(
+                sourceParent.DangerousGetHandle().ToInt32(),
+                source,
+                destinationParent.DangerousGetHandle().ToInt32(),
+                destination,
+                renameNoReplace) == 0)
+        {
+            return;
+        }
+
+        var error = Marshal.GetLastPInvokeError();
+        if (error == 2)
+        {
+            throw new FileNotFoundException(message, source);
+        }
+
+        if (error is 38 or 22)
+        {
+            throw new PlatformNotSupportedException("Atomic no-replace scratch claims require renameat2(RENAME_NOREPLACE).");
+        }
+
+        throw NativeFailure(message);
+    }
+
+    private static void RenamePinnedBetweenNoReplace(
+        SafeFileHandle sourceParent,
+        string source,
+        SafeFileHandle destinationParent,
+        string destination,
+        ScratchIdentity expectedIdentity,
+        string message)
+    {
+        RenameBetweenNoReplace(sourceParent, source, destinationParent, destination, message);
+        using var moved = OpenAnyAt(destinationParent, destination);
+        if (ReadIdentity(moved) == expectedIdentity)
+        {
+            return;
+        }
+
+        const uint renameNoReplace = 1;
+        _ = RenameAt2Native(
+            destinationParent.DangerousGetHandle().ToInt32(),
+            destination,
+            sourceParent.DangerousGetHandle().ToInt32(),
+            source,
+            renameNoReplace);
+        throw new InvalidDataException("Scratch initialization evidence changed identity while it was being compacted; no object was deleted.");
+    }
+
     private static void EnsureRenameNoReplaceSupported(SafeFileHandle parent)
     {
         const uint renameNoReplace = 1;
@@ -1073,21 +1478,30 @@ internal static class NpgsqlScratchSpace
 
     private static void WriteRootKey(string rootPath, RootKey key)
     {
+        var name = RootKeyPrefix + key.KeyId.ToString("N") + RootKeySuffix;
+        var temporaryName = ".key-new-" + key.KeyId.ToString("N") + RootKeySuffix;
         if (OperatingSystem.IsWindows())
         {
-            var path = Path.Combine(rootPath, RootKeyPrefix + key.KeyId.ToString("N") + RootKeySuffix);
-            using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 4096, FileOptions.WriteThrough);
-            JsonSerializer.Serialize(stream, key);
-            stream.Flush(flushToDisk: true);
+            var temporaryPath = Path.Combine(rootPath, temporaryName);
+            using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 4096, FileOptions.WriteThrough))
+            {
+                EnsureWindowsOwnerOnlyFile(temporaryPath);
+                NpgsqlBackupFileSystem.Checkpoint("scratch-root-key-after-temp-create");
+                JsonSerializer.Serialize(stream, key);
+                stream.Flush(flushToDisk: true);
+            }
+
+            NpgsqlBackupFileSystem.Checkpoint("scratch-root-key-after-temp-flush");
+            File.Move(temporaryPath, Path.Combine(rootPath, name), overwrite: false);
+            NpgsqlBackupFileSystem.Checkpoint("scratch-root-key-after-publish");
             NpgsqlBackupFileSystem.FlushDirectory(rootPath, "flush-scratch-root-key-parent");
             return;
         }
 
         using var root = OpenDirectoryHandle(rootPath);
-        var name = RootKeyPrefix + key.KeyId.ToString("N") + RootKeySuffix;
         var descriptor = OpenAt(
             root.DangerousGetHandle().ToInt32(),
-            name,
+            temporaryName,
             OpenWriteOnly | OpenCreate | OpenExclusive | OpenNoFollow | OpenCloseOnExec,
             384);
         if (descriptor < 0)
@@ -1098,10 +1512,14 @@ internal static class NpgsqlScratchSpace
         using (var handle = new SafeFileHandle((nint)descriptor, ownsHandle: true))
         using (var stream = new FileStream(handle, FileAccess.Write))
         {
+            NpgsqlBackupFileSystem.Checkpoint("scratch-root-key-after-temp-create");
             JsonSerializer.Serialize(stream, key);
             stream.Flush(flushToDisk: true);
         }
 
+        NpgsqlBackupFileSystem.Checkpoint("scratch-root-key-after-temp-flush");
+        RenameNoReplace(root, temporaryName, name, "Could not publish the scratch root proof key.");
+        NpgsqlBackupFileSystem.Checkpoint("scratch-root-key-after-publish");
         NpgsqlBackupFileSystem.FlushHandle(root, "flush-scratch-root-key-parent");
     }
 
@@ -1118,6 +1536,7 @@ internal static class NpgsqlScratchSpace
                 RootKey? key = null;
                 try
                 {
+                    VerifyWindowsOwnerOnlyFile(path);
                     using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
                     key = JsonSerializer.Deserialize<RootKey>(stream);
                 }
@@ -1142,43 +1561,52 @@ internal static class NpgsqlScratchSpace
         using var root = OpenDirectoryHandle(rootPath);
         foreach (var path in Directory.EnumerateFiles(HandlePath(root), RootKeyPrefix + "*" + RootKeySuffix, SearchOption.TopDirectoryOnly))
         {
-            SafeFileHandle? handle = null;
-            try
+            var key = TryLoadRootKey(root, Path.GetFileName(path));
+            if (key is not null)
             {
-                var name = Path.GetFileName(path);
-                handle = OpenAnyAt(root, name);
-                var node = ReadNodeInfo(handle);
-                if (!node.IsRegularFile
-                    || node.LinkCount != 1
-                    || File.GetUnixFileMode(HandlePath(handle)) != OwnerFileMode)
-                {
-                    continue;
-                }
-
-                var descriptor = Open(HandlePath(handle), OpenReadOnly | OpenCloseOnExec);
-                if (descriptor < 0)
-                {
-                    continue;
-                }
-
-                using var readable = new SafeFileHandle((nint)descriptor, ownsHandle: true);
-                using var stream = new FileStream(readable, FileAccess.Read);
-                var key = JsonSerializer.Deserialize<RootKey>(stream);
-                if (key is null
-                    || key.Secret is not { Length: 64 }
-                    || key.RootIdentity != ReadIdentity(root)
-                    || !string.Equals(name, RootKeyPrefix + key.KeyId.ToString("N") + RootKeySuffix, StringComparison.Ordinal)
-                    || !FixedTimeEqualsHex(key.Integrity, ComputeRootKeyIntegrity(key with { Integrity = string.Empty })))
-                {
-                    continue;
-                }
-
                 yield return key;
             }
-            finally
+        }
+    }
+
+    private static RootKey? TryLoadRootKey(SafeFileHandle root, string name)
+    {
+        try
+        {
+            using var handle = OpenAnyAt(root, name);
+            var node = ReadNodeInfo(handle);
+            if (!node.IsRegularFile
+                || node.LinkCount != 1
+                || File.GetUnixFileMode(HandlePath(handle)) != OwnerFileMode)
             {
-                handle?.Dispose();
+                return null;
             }
+
+            var descriptor = Open(HandlePath(handle), OpenReadOnly | OpenCloseOnExec);
+            if (descriptor < 0)
+            {
+                return null;
+            }
+
+            using var readable = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+            using var stream = new FileStream(readable, FileAccess.Read);
+            var key = JsonSerializer.Deserialize<RootKey>(stream);
+            if (key is null
+                || key.Secret is not { Length: 64 }
+                || key.RootIdentity != ReadIdentity(root)
+                || !string.Equals(name, RootKeyPrefix + key.KeyId.ToString("N") + RootKeySuffix, StringComparison.Ordinal)
+                || !FixedTimeEqualsHex(key.Integrity, ComputeRootKeyIntegrity(key with { Integrity = string.Empty })))
+            {
+                return null;
+            }
+
+            return key;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException)
+        {
+            // A single torn or malformed append-only key record never prevents
+            // another valid record from authorizing recovery.
+            return null;
         }
     }
 
@@ -1265,51 +1693,218 @@ internal static class NpgsqlScratchSpace
         }
     }
 
+    private static InitializationReceipt? ReadInitializationReceipt(SafeFileHandle root, string receiptName)
+    {
+        try
+        {
+            using var marker = OpenAnyAt(root, receiptName);
+            var node = ReadNodeInfo(marker);
+            if (!node.IsRegularFile || node.LinkCount != 1)
+            {
+                return null;
+            }
+
+            var descriptor = Open(HandlePath(marker), OpenReadOnly | OpenCloseOnExec);
+            if (descriptor < 0)
+            {
+                return null;
+            }
+
+            using var readable = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+            using var stream = new FileStream(readable, FileAccess.Read);
+            var receipt = JsonSerializer.Deserialize<InitializationReceipt>(stream);
+            if (receipt is null
+                || receipt.OwnerId == Guid.Empty
+                || !string.Equals(receiptName, InitializationReceiptPrefix + receipt.OwnerId.ToString("N") + RootKeySuffix, StringComparison.Ordinal)
+                || !string.Equals(receipt.StagingName, ".init-" + receipt.Purpose + "-" + receipt.OwnerId.ToString("N"), StringComparison.Ordinal)
+                || receipt.MarkerIdentity != ReadIdentity(marker))
+            {
+                return null;
+            }
+
+            var key = LoadRootKey(ResolveHandlePath(root), receipt.KeyId);
+            return FixedTimeEqualsHex(receipt.Proof, ComputeInitializationReceiptProof(receipt with { Proof = string.Empty }, key.Secret))
+                ? receipt
+                : null;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException)
+        {
+            return null;
+        }
+    }
+
     private static void EnsureRetentionCapacity(string rootPath)
     {
-        var retained = Directory.EnumerateFileSystemEntries(rootPath, "*", SearchOption.TopDirectoryOnly)
-            .Where(path =>
-            {
-                var name = Path.GetFileName(path);
-                return name.StartsWith(".trash-", StringComparison.Ordinal)
-                    || name.StartsWith(".init-", StringComparison.Ordinal)
-                    || name.StartsWith(".delete-claim-", StringComparison.Ordinal)
-                    || name.StartsWith(".claim-new-", StringComparison.Ordinal);
-            })
-            .Take(MaximumRetainedEntries + 1)
-            .ToArray();
-        long bytes = 0;
-        foreach (var path in retained)
-        {
-            try
-            {
-                if (!Directory.Exists(path))
-                {
-                    bytes = checked(bytes + new FileInfo(path).Length);
-                    continue;
-                }
-
-                foreach (var file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
-                {
-                    bytes = checked(bytes + new FileInfo(file).Length);
-                    if (bytes > MaximumRetainedBytes)
-                    {
-                        break;
-                    }
-                }
-            }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-            {
-                throw new IOException("Scratch retention could not be measured safely; new scratch work is disabled until an operator inspects the root.", exception);
-            }
-        }
-
-        if (retained.Length > MaximumRetainedEntries || bytes > MaximumRetainedBytes)
+        var (entries, bytes) = MeasureRetention(rootPath);
+        if (entries > MaximumRetainedEntries || bytes > MaximumRetainedBytes)
         {
             throw new IOException(
                 $"Scratch retention exceeded its fail-closed limit ({MaximumRetainedEntries} entries or {MaximumRetainedBytes} bytes). "
                 + "No retained or unknown entry was deleted; an operator must inspect the owner-private scratch root.");
         }
+    }
+
+    private static (int Entries, long Bytes) MeasureRetention(string rootPath)
+    {
+        long bytes = 0;
+        var entries = 0;
+        var pending = new Stack<string>(Directory.EnumerateFileSystemEntries(rootPath, "*", SearchOption.TopDirectoryOnly)
+            .Where(IsRetainedRootEntry));
+        while (pending.Count != 0)
+        {
+            var path = pending.Pop();
+            try
+            {
+                entries = checked(entries + 1);
+                var attributes = File.GetAttributes(path);
+                if ((attributes & FileAttributes.Directory) == 0)
+                {
+                    bytes = checked(bytes + new FileInfo(path).Length);
+                }
+                else if ((attributes & FileAttributes.ReparsePoint) == 0)
+                {
+                    foreach (var child in Directory.EnumerateFileSystemEntries(path, "*", SearchOption.TopDirectoryOnly))
+                    {
+                        pending.Push(child);
+                    }
+                }
+
+                if (entries > MaximumRetainedEntries || bytes > MaximumRetainedBytes)
+                {
+                    break;
+                }
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or OverflowException)
+            {
+                throw new IOException("Scratch retention could not be measured safely; new scratch work is disabled until an operator inspects the root.", exception);
+            }
+        }
+
+        return (entries, bytes);
+    }
+
+    private static void MaintainRetention(string rootPath)
+    {
+        var usage = MeasureRetention(rootPath);
+        if (OperatingSystem.IsLinux()
+            && (usage.Entries > MaximumRetainedEntries * 3 / 4
+                || usage.Bytes > MaximumRetainedBytes * 3 / 4))
+        {
+            QuarantineTerminalGenerations(rootPath);
+        }
+
+        EnsureRetentionCapacity(rootPath);
+    }
+
+    private static void QuarantineTerminalGenerations(string rootPath)
+    {
+        var quarantinePath = rootPath + QuarantineSuffix;
+        Directory.CreateDirectory(quarantinePath);
+        using var root = OpenDirectoryHandle(rootPath);
+        using var quarantine = OpenDirectoryHandle(quarantinePath);
+        File.SetUnixFileMode(HandlePath(quarantine), OwnerDirectoryMode);
+        EnsureRenameNoReplaceSupported(root);
+        foreach (var candidate in Directory.EnumerateDirectories(HandlePath(root), ".trash-*", SearchOption.TopDirectoryOnly))
+        {
+            try
+            {
+                var name = Path.GetFileName(candidate);
+                using var generation = OpenDirectoryAt(root, name);
+                var identity = ReadIdentity(generation);
+                ScratchClaim claim;
+                try
+                {
+                    var owner = ReadOwnerProof(generation);
+                    ValidateOwner(owner, identity, owner.Owner.Purpose, name, rootPath);
+                    claim = ReadClaimSidecar(root, name);
+                    ValidateClaim(claim, identity, owner.Owner.Purpose, name, allowMissingDirectory: false, rootPath);
+                }
+                catch (InvalidDataException)
+                {
+                    continue;
+                }
+
+                if (!IsTerminalGeneration(generation)
+                    || ReadIdentityForNameIfPresent(root, name) != identity)
+                {
+                    continue;
+                }
+
+                var quarantineName = name + "-" + Guid.NewGuid().ToString("N");
+                RenamePinnedBetweenNoReplace(
+                    root,
+                    name,
+                    quarantine,
+                    quarantineName,
+                    identity,
+                    "Could not quarantine a terminal scratch generation.");
+
+                var sidecarName = ClaimSidecarName(name);
+                try
+                {
+                    RenamePinnedBetweenNoReplace(
+                        root,
+                        sidecarName,
+                        quarantine,
+                        quarantineName + ".claim",
+                        claim.ClaimMarkerIdentity!,
+                        "Could not quarantine a terminal scratch claim.");
+                }
+                catch (FileNotFoundException)
+                {
+                    // A crash after the generation move leaves no authority to
+                    // mutate it; the authenticated generation remains quarantined.
+                }
+
+                NpgsqlBackupFileSystem.FlushHandle(quarantine, "flush-scratch-quarantine");
+                NpgsqlBackupFileSystem.FlushHandle(root, "flush-scratch-quarantine-root");
+                _ = claim;
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or InvalidDataException)
+            {
+                // Quarantine only authenticated terminal generations. Unknown or
+                // concurrently replaced names remain exactly where they were.
+            }
+        }
+    }
+
+    private static bool IsTerminalGeneration(SafeFileHandle generation)
+    {
+        foreach (var path in Directory.EnumerateFiles(HandlePath(generation), "*", SearchOption.AllDirectories))
+        {
+            var name = Path.GetFileName(path);
+            if (name.StartsWith(".retained-", StringComparison.Ordinal))
+            {
+                if (new FileInfo(path).Length != 0)
+                {
+                    return false;
+                }
+
+                continue;
+            }
+
+            if (!string.Equals(name, OwnerMarker, StringComparison.Ordinal)
+                && !string.Equals(name, InitializationReceiptName, StringComparison.Ordinal)
+                && !name.StartsWith(".entry-claim-", StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsRetainedRootEntry(string path)
+    {
+        var name = Path.GetFileName(path);
+        return name.StartsWith(".trash-", StringComparison.Ordinal)
+            || name.StartsWith(".init-", StringComparison.Ordinal)
+            || name.StartsWith(".delete-claim-", StringComparison.Ordinal)
+            || name.StartsWith(".claim-new-", StringComparison.Ordinal)
+            || name.StartsWith(".key-new-", StringComparison.Ordinal)
+            || name.StartsWith(".retained-", StringComparison.Ordinal)
+            || name.StartsWith(".entry-claim-", StringComparison.Ordinal)
+            || name.StartsWith(InitializationReceiptPrefix, StringComparison.Ordinal);
     }
 
     private static string ComputeOwnerProof(ScratchOwner owner, string secret)
@@ -1366,6 +1961,20 @@ internal static class NpgsqlScratchSpace
                 FormatIdentity(receipt.DirectoryIdentity),
                 receipt.KeyId.ToString("D"),
                 FormatIdentity(receipt.MarkerIdentity)),
+            secret);
+
+    private static string ComputeUninitializedClaimProof(ScratchUninitializedClaim claim, string secret)
+        => ComputeHmac(
+            string.Join(
+                "\n",
+                "uninitialized-generation-claim-v1",
+                claim.Receipt.OwnerId.ToString("D"),
+                claim.Receipt.StagingName,
+                claim.TrashName,
+                FormatIdentity(claim.DirectoryIdentity),
+                claim.KeyId.ToString("D"),
+                FormatIdentity(claim.ClaimMarkerIdentity),
+                claim.Receipt.Proof),
             secret);
 
     private static string ComputeRootKeyIntegrity(RootKey key)
@@ -1518,7 +2127,51 @@ internal static class NpgsqlScratchSpace
     [DllImport("libc", EntryPoint = "statx", CharSet = CharSet.Ansi, SetLastError = true)]
     [DefaultDllImportSearchPaths(DllImportSearchPath.SafeDirectories)]
     private static extern int Statx(int directoryFileDescriptor, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags, uint mask, nint buffer);
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    private static extern SafeFileHandle CreateFileWindows(
+        [MarshalAs(UnmanagedType.LPWStr)] string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        nint securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        nint templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(
+        SafeFileHandle file,
+        int fileInformationClass,
+        ref WindowsFileIdInfo fileInformation,
+        int bufferSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFileInformationByHandle(
+        SafeFileHandle file,
+        int fileInformationClass,
+        ref WindowsFileDispositionInfoEx fileInformation,
+        int bufferSize);
 #pragma warning restore CA2101, SYSLIB1054
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WindowsFileIdInfo
+    {
+        public ulong VolumeSerialNumber;
+
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 16)]
+        public byte[] FileId;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WindowsFileDispositionInfoEx
+    {
+        public uint Flags;
+    }
 
     private sealed record ScratchOwner(
         string Provider,
@@ -1561,6 +2214,14 @@ internal static class NpgsqlScratchSpace
         ScratchIdentity MarkerIdentity,
         string Proof);
 
+    private sealed record ScratchUninitializedClaim(
+        InitializationReceipt Receipt,
+        ScratchIdentity DirectoryIdentity,
+        string TrashName,
+        Guid KeyId,
+        ScratchIdentity? ClaimMarkerIdentity,
+        string Proof);
+
     private sealed record RootKey(
         Guid KeyId,
         DateTime CreatedUtc,
@@ -1577,6 +2238,8 @@ internal static class NpgsqlScratchSpace
         ulong MountId,
         long? BirthSeconds,
         uint? BirthNanoseconds);
+
+    private sealed record WindowsFileIdentity(ulong VolumeSerialNumber, string FileId);
 
     private sealed class CallbackScope(Action callback) : IDisposable
     {
