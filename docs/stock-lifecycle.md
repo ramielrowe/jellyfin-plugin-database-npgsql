@@ -25,6 +25,18 @@ migration is the only new database migration. A third fresh process proves the
 52-row code/database history is idempotent and the users and media remain
 available through the public API. No SQLite database file may appear.
 
+The same real-host case also proves an interrupted side-by-side staging leaves
+the exact predecessor selected, a duplicate older directory cannot intercept
+the version-qualified current selection, and an explicit package rollback can
+select a restored predecessor after moving the newer same-GUID package outside
+Jellyfin's discovery root. It then verifies
+that dashboard-style metadata disable, uninstall while configured, and a
+missing provider DLL each stop startup without changing PostgreSQL or creating
+SQLite. Restoring the exact metadata, directory, or DLL recovers on a fresh
+process. Database migrations still require the separate provider migration
+snapshot for a true schema rollback; merely selecting an older DLL is not a
+database rollback procedure.
+
 The predecessor fixture is source, metadata, and migrations rather than a
 checked-in binary. Its package reuses only the release ZIP's version-locked
 Npgsql runtime binaries; the fixture supplies its own provider assembly,
@@ -58,7 +70,7 @@ state before the compatibility contract can be widened.
 | Migration lock contention and timeout | `Snapshot_MigrationLockContentionTimesOutWithoutMutationOrArtifact` | The bounded command timeout leaves migration zero and publishes no backup. |
 | Deliberate transactional/non-transactional migration failure | `black-box-smoke.sh` and `MigrationBackupIntegrationTests` | The vanilla migration service calls provider restore; exact rows, schema, history, FKs, and sequence states return. |
 | Corrupt, stale, wrong-target, symlinked, partially written, or actively leased backup | `MigrationBackupIntegrationTests` restore cases | Validation/staging finishes before the target transaction; the target and published backup remain unchanged on failure. |
-| Missing folder/deleted assembly/ambiguous selection/deleted or disabled metadata | `StockServerLifecycleTests` and early-loader package smoke controls | Selection failures remain distinct, while disabled or absent ordinary-plugin metadata does not disable the early selected provider; no SQLite fallback database is created. |
+| Interrupted update, duplicate old folder, package rollback, dashboard disable, uninstall, missing folder/DLL/metadata, and recovery | `StockServerLifecycleTests` and early-loader package smoke controls | Exact version selection remains deterministic; incomplete or inactive selected packages fail before database mutation and never create a SQLite fallback. |
 
 `StockServerLifecycleTests` launches the untouched host from clean state for
 connection refusal, authentication failure, a missing database, and PostgreSQL

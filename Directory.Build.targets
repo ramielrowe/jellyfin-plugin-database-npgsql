@@ -14,8 +14,9 @@
   -->
   <Target Name="AuditProjectReferenceBoundaries">
     <PropertyGroup>
-      <_AuditRepositoryRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)'))</_AuditRepositoryRoot>
-      <_AuditRepositoryPrefix>$(_AuditRepositoryRoot)</_AuditRepositoryPrefix>
+      <_AuditRepositoryRoot Condition="'$(StandaloneAuditRepositoryRoot)' != ''">$([System.IO.Path]::TrimEndingDirectorySeparator('$([System.IO.Path]::GetFullPath('$(StandaloneAuditRepositoryRoot)'))'))</_AuditRepositoryRoot>
+      <_AuditRepositoryRoot Condition="'$(_AuditRepositoryRoot)' == ''">$([System.IO.Path]::TrimEndingDirectorySeparator('$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)'))'))</_AuditRepositoryRoot>
+      <_AuditRepositoryPrefix>$(_AuditRepositoryRoot)$([System.IO.Path]::DirectorySeparatorChar)</_AuditRepositoryPrefix>
     </PropertyGroup>
 
     <ItemGroup>
@@ -24,6 +25,7 @@
 
     <Error
       Condition="'@(_AuditProjectReference)' != ''
+        and '%(_AuditProjectReference.FullPath)' != '$(_AuditRepositoryRoot)'
         and !$([System.String]::Copy('%(_AuditProjectReference.FullPath)').StartsWith('$(_AuditRepositoryPrefix)'))"
       Text="ProjectReference escapes the standalone repository: %(_AuditProjectReference.FullPath)" />
   </Target>
@@ -63,6 +65,7 @@
 
     <Error
       Condition="'@(_AuditResolvedProjectReference)' != ''
+        and '%(_AuditResolvedProjectReference.FullPath)' != '$(_AuditRepositoryRoot)'
         and !$([System.String]::Copy('%(_AuditResolvedProjectReference.FullPath)').StartsWith('$(_AuditRepositoryPrefix)'))"
       Text="Resolved ProjectReference escapes the standalone repository: %(_AuditResolvedProjectReference.FullPath)" />
     <Error

@@ -565,6 +565,43 @@ public sealed class StockServerLifecycleTests
             Assert.Equal(ExpectedHistory(includeUuidAggregates: false), predecessorHistory);
             Assert.Equal(2, await CountUsersAsync(database.RuntimeConnectionString, cancellationToken));
 
+            // A staged update that is interrupted before the atomic database.xml
+            // switch must leave the exact predecessor selection usable. The
+            // partial directory is deliberately disabled so ordinary discovery
+            // cannot mistake it for an installable release.
+            var interruptedDirectory = Path.Combine(
+                layout.DataDirectory,
+                "plugins",
+                PluginMetadata.InstallationDirectory + ".partial");
+            Directory.CreateDirectory(interruptedDirectory);
+            await File.WriteAllTextAsync(
+                Path.Combine(interruptedDirectory, "meta.json"),
+                (await File.ReadAllTextAsync(Path.Combine(repositoryRoot, "meta.json"), cancellationToken))
+                    .Replace("\"status\": \"Active\"", "\"status\": \"Disabled\"", StringComparison.Ordinal),
+                cancellationToken);
+            using (var interruptedHttpPort = LoopbackPortReservation.Acquire(leaseRoot))
+            using (var interruptedHttpsPort = LoopbackPortReservation.Acquire(leaseRoot))
+            {
+                layout.WriteNetworkConfiguration(interruptedHttpPort.Port, interruptedHttpsPort.Port);
+                await using var interrupted = JellyfinHostProcess.StartForRestartableLifecycle(
+                    layout,
+                    interruptedHttpPort,
+                    redactor,
+                    ffmpeg);
+                await interrupted.WaitUntilReadyAsync(TimeSpan.FromMinutes(2), cancellationToken);
+                adminToken = await AuthenticateAsync(
+                    interrupted,
+                    "lifecycle-admin",
+                    adminPassword,
+                    "interrupted-update",
+                    cancellationToken);
+                redactor.Add(adminToken);
+                evidenceRedactor.Add(adminToken);
+                await interrupted.StopGracefullyAsync(adminToken, TimeSpan.FromSeconds(30), cancellationToken);
+            }
+
+            Directory.Delete(interruptedDirectory, recursive: true);
+
             var currentPluginDirectory = layout.InstallPluginZip(currentPackage, PluginMetadata.InstallationDirectory);
             layout.WriteDatabaseConfiguration(
                 database.RuntimeConnectionString,
@@ -605,6 +642,64 @@ public sealed class StockServerLifecycleTests
             var upgradedHistory = await ReadHistoryAsync(database.RuntimeConnectionString, cancellationToken);
             Assert.Equal(ExpectedHistory(includeUuidAggregates: true), upgradedHistory);
             Assert.Equal(2, await CountUsersAsync(database.RuntimeConnectionString, cancellationToken));
+            var predecessorDirectory = Path.Combine(layout.DataDirectory, "plugins", PredecessorDirectory);
+            if (!Directory.Exists(predecessorDirectory))
+            {
+                // Stock ordinary-plugin housekeeping may remove the disabled
+                // predecessor after the successful update. Reinstalling the
+                // checksummed prior artifact is the documented rollback step.
+                layout.InstallPluginZip(predecessorPackage, PredecessorDirectory);
+            }
+
+            Assert.True(Directory.Exists(predecessorDirectory));
+            Assert.True(Directory.Exists(currentPluginDirectory));
+
+            // A deliberate package rollback removes the newer duplicate-GUID
+            // ordinary plugin from discovery and selects the restored exact
+            // predecessor directory. The database retains the newer lineage;
+            // operators must use the migration snapshot when an actual schema
+            // rollback is required.
+            var heldCurrentForRollback = Path.Combine(artifacts.CaseDirectory, "held-current-for-rollback");
+            Directory.Move(currentPluginDirectory, heldCurrentForRollback);
+            layout.WriteDatabaseConfiguration(
+                database.RuntimeConnectionString,
+                PredecessorDirectory,
+                PluginMetadata.AssemblyFileName);
+            try
+            {
+                using var rollbackHttpPort = LoopbackPortReservation.Acquire(leaseRoot);
+                using var rollbackHttpsPort = LoopbackPortReservation.Acquire(leaseRoot);
+                layout.WriteNetworkConfiguration(rollbackHttpPort.Port, rollbackHttpsPort.Port);
+                await using var rollback = JellyfinHostProcess.StartForRestartableLifecycle(
+                    layout,
+                    rollbackHttpPort,
+                    redactor,
+                    ffmpeg);
+                await rollback.WaitUntilReadyAsync(TimeSpan.FromMinutes(2), cancellationToken);
+                adminToken = await AuthenticateAsync(
+                    rollback,
+                    "lifecycle-admin",
+                    adminPassword,
+                    "package-rollback",
+                    cancellationToken);
+                redactor.Add(adminToken);
+                evidenceRedactor.Add(adminToken);
+                await rollback.StopGracefullyAsync(adminToken, TimeSpan.FromSeconds(30), cancellationToken);
+            }
+            finally
+            {
+                Directory.Move(heldCurrentForRollback, currentPluginDirectory);
+            }
+
+            Assert.Contains(
+                "Npgsql database provider 0.0.9.0 loaded",
+                ReadCollectedLogs(layout),
+                StringComparison.Ordinal);
+            Assert.Equal(upgradedHistory, await ReadHistoryAsync(database.RuntimeConnectionString, cancellationToken));
+            layout.WriteDatabaseConfiguration(
+                database.RuntimeConnectionString,
+                PluginMetadata.InstallationDirectory,
+                PluginMetadata.AssemblyFileName);
 
             using var restartedHttpPort = LoopbackPortReservation.Acquire(leaseRoot);
             using var restartedHttpsPort = LoopbackPortReservation.Acquire(leaseRoot);
@@ -635,6 +730,63 @@ public sealed class StockServerLifecycleTests
             Assert.Equal(upgradedHistory, await ReadHistoryAsync(database.RuntimeConnectionString, cancellationToken));
             Assert.Equal(2, await CountUsersAsync(database.RuntimeConnectionString, cancellationToken));
 
+            var metadataPath = Path.Combine(currentPluginDirectory, "meta.json");
+            var activeMetadata = await File.ReadAllBytesAsync(metadataPath, cancellationToken);
+            await File.WriteAllTextAsync(
+                metadataPath,
+                Encoding.UTF8.GetString(activeMetadata)
+                    .Replace("\"status\": \"Active\"", "\"status\": \"Disabled\"", StringComparison.Ordinal),
+                cancellationToken);
+            try
+            {
+                using var disabledHttpPort = LoopbackPortReservation.Acquire(leaseRoot);
+                using var disabledHttpsPort = LoopbackPortReservation.Acquire(leaseRoot);
+                layout.WriteNetworkConfiguration(disabledHttpPort.Port, disabledHttpsPort.Port);
+                await using var disabled = JellyfinHostProcess.StartForRestartableLifecycle(
+                    layout,
+                    disabledHttpPort,
+                    redactor,
+                    ffmpeg);
+                await disabled.WaitForExpectedStartupFailureAsync(TimeSpan.FromSeconds(30), cancellationToken);
+                await disabled.TerminateAsync();
+                Assert.Contains(
+                    "ordinary plugin metadata is missing, disabled, malformed",
+                    ReadCollectedLogs(layout),
+                    StringComparison.OrdinalIgnoreCase);
+                Assert.Equal(upgradedHistory, await ReadHistoryAsync(database.RuntimeConnectionString, cancellationToken));
+                Assert.Empty(FindSqliteFiles(layout));
+            }
+            finally
+            {
+                await File.WriteAllBytesAsync(metadataPath, activeMetadata, CancellationToken.None);
+            }
+
+            var heldPluginDirectory = Path.Combine(artifacts.CaseDirectory, "uninstalled-current-plugin");
+            Directory.Move(currentPluginDirectory, heldPluginDirectory);
+            try
+            {
+                using var uninstalledHttpPort = LoopbackPortReservation.Acquire(leaseRoot);
+                using var uninstalledHttpsPort = LoopbackPortReservation.Acquire(leaseRoot);
+                layout.WriteNetworkConfiguration(uninstalledHttpPort.Port, uninstalledHttpsPort.Port);
+                await using var uninstalled = JellyfinHostProcess.StartForRestartableLifecycle(
+                    layout,
+                    uninstalledHttpPort,
+                    redactor,
+                    ffmpeg);
+                await uninstalled.WaitForExpectedStartupFailureAsync(TimeSpan.FromSeconds(30), cancellationToken);
+                await uninstalled.TerminateAsync();
+                Assert.Contains(
+                    "requested custom database plugin",
+                    ReadCollectedLogs(layout),
+                    StringComparison.OrdinalIgnoreCase);
+                Assert.Equal(upgradedHistory, await ReadHistoryAsync(database.RuntimeConnectionString, cancellationToken));
+                Assert.Empty(FindSqliteFiles(layout));
+            }
+            finally
+            {
+                Directory.Move(heldPluginDirectory, currentPluginDirectory);
+            }
+
             var providerAssembly = Path.Combine(currentPluginDirectory, PluginMetadata.AssemblyFileName);
             var heldProviderAssembly = Path.Combine(artifacts.CaseDirectory, "missing-provider-fixture.dll");
             File.Move(providerAssembly, heldProviderAssembly);
@@ -649,6 +801,7 @@ public sealed class StockServerLifecycleTests
                     redactor,
                     ffmpeg);
                 await missingProvider.WaitForExpectedStartupFailureAsync(TimeSpan.FromSeconds(30), cancellationToken);
+                await missingProvider.TerminateAsync();
                 var diagnostics = ReadCollectedLogs(layout);
                 Assert.Contains("Could not find the requested assembly", diagnostics, StringComparison.Ordinal);
                 Assert.DoesNotContain(password, diagnostics, StringComparison.Ordinal);
@@ -658,6 +811,27 @@ public sealed class StockServerLifecycleTests
             finally
             {
                 File.Move(heldProviderAssembly, providerAssembly);
+            }
+
+            using (var recoveryHttpPort = LoopbackPortReservation.Acquire(leaseRoot))
+            using (var recoveryHttpsPort = LoopbackPortReservation.Acquire(leaseRoot))
+            {
+                layout.WriteNetworkConfiguration(recoveryHttpPort.Port, recoveryHttpsPort.Port);
+                await using var recovered = JellyfinHostProcess.StartForRestartableLifecycle(
+                    layout,
+                    recoveryHttpPort,
+                    redactor,
+                    ffmpeg);
+                await recovered.WaitUntilReadyAsync(TimeSpan.FromMinutes(2), cancellationToken);
+                adminToken = await AuthenticateAsync(
+                    recovered,
+                    "lifecycle-admin",
+                    adminPassword,
+                    "recovered",
+                    cancellationToken);
+                redactor.Add(adminToken);
+                evidenceRedactor.Add(adminToken);
+                await recovered.StopGracefullyAsync(adminToken, TimeSpan.FromSeconds(30), cancellationToken);
             }
 
             Assert.Empty(FindSqliteFiles(layout));
@@ -1129,8 +1303,9 @@ public sealed class StockServerLifecycleTests
         using var archive = ZipFile.Open(packagePath, ZipArchiveMode.Create);
         foreach (var file in PackageFiles.Order(StringComparer.Ordinal))
         {
-            var entry = archive.CreateEntry(file, CompressionLevel.Optimal);
+            var entry = archive.CreateEntry(file, CompressionLevel.NoCompression);
             entry.LastWriteTime = new DateTimeOffset(2000, 1, 1, 0, 0, 0, TimeSpan.Zero);
+            entry.ExternalAttributes = Convert.ToInt32("100644", 8) << 16;
             using var input = file.StartsWith("Npgsql", StringComparison.Ordinal)
                 ? currentArchive.GetEntry(file)?.Open()
                     ?? throw new InvalidDataException($"The current package did not contain required runtime dependency '{file}'.")

@@ -4,6 +4,8 @@ set -euo pipefail
 PLUGIN_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PACKAGE_DIR="$PLUGIN_ROOT/artifacts/package"
 PACKAGE_ZIP="$PLUGIN_ROOT/artifacts/jellyfin-plugin-database-npgsql_0.1.0.0.zip"
+PACKAGE_CHECKSUM="$PACKAGE_ZIP.sha256"
+SYMBOL_FILE="$PLUGIN_ROOT/artifacts/symbols/Jellyfin.Plugin.Database.Npgsql.pdb"
 PROVIDER_PROJECT="$PLUGIN_ROOT/src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj"
 NEGATIVE_CONTROL_PROJECT="$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests/Jellyfin.Plugin.Database.Npgsql.IntegrationTests.csproj"
 REFERENCE_REPORT_DIR="$PLUGIN_ROOT/artifacts/evaluated-references"
@@ -17,13 +19,69 @@ fail() {
 
 [ -f "$PLUGIN_ROOT/build/Package.proj" ] \
     || fail "tracked packaging source build/Package.proj is missing"
-if git -C "$PLUGIN_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if [ "${STANDALONE_RELOCATED_COPY:-false}" != true ] \
+    && git -C "$PLUGIN_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git -C "$PLUGIN_ROOT" ls-files --error-unmatch -- build/Package.proj >/dev/null 2>&1 \
         || fail "build/Package.proj is not tracked; enclosing ignore rules may have hidden it"
 fi
 
 [ -f "$PACKAGE_ZIP" ] || fail "package ZIP is missing; run the package command first"
+[ -f "$PACKAGE_CHECKSUM" ] || fail "package SHA-256 sidecar is missing"
+[ -f "$SYMBOL_FILE" ] || fail "portable provider symbols are missing"
 [ -d "$PACKAGE_DIR" ] || fail "staged package directory is missing"
+
+python3 - "$PACKAGE_ZIP" "$PACKAGE_CHECKSUM" "$SYMBOL_FILE" <<'PY'
+import hashlib
+import pathlib
+import re
+import sys
+import zipfile
+
+package = pathlib.Path(sys.argv[1])
+checksum = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+symbol = pathlib.Path(sys.argv[3])
+match = re.fullmatch(r"([0-9A-Fa-f]{64})  ([^/\\\r\n]+)\r?\n?", checksum)
+if match is None or match.group(2) != package.name:
+    raise SystemExit("FAIL: package checksum sidecar is not canonical SHA256SUMS format")
+actual = hashlib.sha256(package.read_bytes()).hexdigest()
+if actual != match.group(1).lower():
+    raise SystemExit("FAIL: package checksum sidecar does not match the ZIP")
+if symbol.read_bytes()[:4] != b"BSJB":
+    raise SystemExit("FAIL: provider symbol artifact is not a portable PDB")
+with zipfile.ZipFile(package) as archive:
+    for entry in archive.infolist():
+        if entry.date_time != (2000, 1, 1, 0, 0, 0):
+            raise SystemExit(f"FAIL: non-reproducible ZIP timestamp for {entry.filename}: {entry.date_time}")
+PY
+
+python3 - "$PLUGIN_ROOT/build.yaml" "$PLUGIN_ROOT/meta.json" "$PLUGIN_ROOT/build/release-policy.json" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+build_text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+metadata = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+policy = json.loads(pathlib.Path(sys.argv[3]).read_text(encoding="utf-8"))
+
+def scalar(name):
+    match = re.search(rf"(?m)^{re.escape(name)}: \"([^\"]+)\"$", build_text)
+    if match is None:
+        raise SystemExit(f"FAIL: build.yaml has no canonical quoted {name}")
+    return match.group(1)
+
+for key in ("name", "guid", "version", "targetAbi"):
+    if scalar(key) != metadata[key]:
+        raise SystemExit(f"FAIL: build.yaml and meta.json disagree on {key}")
+    if policy[key] != metadata[key]:
+        raise SystemExit(f"FAIL: release policy and meta.json disagree on {key}")
+if scalar("framework") != policy["framework"]:
+    raise SystemExit("FAIL: release policy and build.yaml disagree on framework")
+if metadata.get("status") != "Active" or metadata.get("autoUpdate") is not False:
+    raise SystemExit("FAIL: metadata must be Active and must not claim catalog auto-update support")
+if metadata.get("assemblies") != ["Jellyfin.Plugin.Database.Npgsql.dll"]:
+    raise SystemExit("FAIL: metadata ordinary-plugin assembly allowlist changed")
+PY
 
 grep -F '"status": "Active"' "$PACKAGE_DIR/meta.json" >/dev/null \
     || fail "packaged metadata must keep the full-system restore guard active"
@@ -87,6 +145,11 @@ expected_files=(
 [ "${actual_files[*]}" = "${expected_files[*]}" ] \
     || fail "unexpected package contents: ${actual_files[*]}"
 
+mapfile -t policy_files < <(python3 -c 'import json, sys
+print("\n".join(sorted(json.load(open(sys.argv[1], encoding="utf-8"))["zipArtifacts"])))' "$PLUGIN_ROOT/build/release-policy.json")
+[ "${policy_files[*]}" = "${expected_files[*]}" ] \
+    || fail "release-policy.json artifacts differ from the release allowlist: ${policy_files[*]}"
+
 mapfile -t manifest_files < <(
     awk '
         /^artifacts:/ { in_artifacts = 1; next }
@@ -104,6 +167,8 @@ with zipfile.ZipFile(sys.argv[1]) as archive:
 )
 [ "${zip_files[*]}" = "${expected_files[*]}" ] \
     || fail "ZIP contents differ from the artifact allowlist: ${zip_files[*]}"
+
+python3 "$PLUGIN_ROOT/scripts/audit-dependencies.py" "$PLUGIN_ROOT"
 
 if find "$PACKAGE_DIR" -maxdepth 1 -type f \
     \( -name 'Jellyfin.Database.Implementations.dll' \
@@ -143,11 +208,20 @@ done
 # Regression control: import one known ProjectReference outside PLUGIN_ROOT and
 # prove the same target rejects it. This also guards against an audit target
 # that silently stops running after an SDK/MSBuild change.
-# Keep this deliberately outside PLUGIN_ROOT so the boundary check sees an
-# escaping ProjectReference, but inside the enclosing writable workspace rather
-# than /tmp. The fixture is tiny and overwritten in place on every run.
-negative_root="$PLUGIN_ROOT/../tmp/jellyfin-plugin-database-npgsql-audit-negative-control"
-mkdir -p "$negative_root/forbidden"
+# Keep the fixture in marker-owned repository-local scratch while overriding
+# the audit's synthetic repository boundary to its `repository` child. The
+# injected sibling ProjectReference then proves the boundary check rejects an
+# escape without leaving undeletable shared scratch.
+scratch_id=$(tr -d '-' < /proc/sys/kernel/random/uuid)
+negative_root="$PLUGIN_ROOT/.artifacts/audit-negative-$scratch_id"
+negative_repository="$negative_root/repository"
+harness="$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/bin/Release/net10.0/Jellyfin.Plugin.Database.Npgsql.TestHarness.dll"
+dotnet "$harness" create-owned-artifacts "$PLUGIN_ROOT" "$negative_root" >/dev/null
+cleanup_negative_control() {
+    dotnet "$harness" delete-owned-artifacts "$PLUGIN_ROOT" "$negative_root"
+}
+trap cleanup_negative_control EXIT
+mkdir -p "$negative_root/forbidden" "$negative_repository"
 cat >"$negative_root/forbidden/Forbidden.csproj" <<'EOF'
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
@@ -167,6 +241,7 @@ negative_log="$negative_root/audit.log"
 if dotnet msbuild "$NEGATIVE_CONTROL_PROJECT" \
     -nologo \
     -property:Configuration=Release \
+    -property:StandaloneAuditRepositoryRoot="$negative_repository" \
     -property:CustomAfterMicrosoftCommonTargets="$negative_root/inject-forbidden-reference.targets" \
     -target:AuditStandaloneReferences >"$negative_log" 2>&1; then
     fail "negative control unexpectedly accepted an external ProjectReference"
@@ -177,4 +252,4 @@ if ! grep -F "ProjectReference escapes the standalone repository:" "$negative_lo
     fail "negative control failed for an unexpected reason"
 fi
 
-echo "Build audit passed: build.yaml, the staged package, and ZIP match the seven-file allowlist; all evaluated project references are internal; and the external-reference negative control was rejected."
+echo "Build audit passed: metadata, licenses, symbols, checksum, staged package, and ZIP match the release policy; all evaluated project references are internal; and the external-reference negative control was rejected."

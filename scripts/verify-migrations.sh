@@ -4,6 +4,7 @@ set -euo pipefail
 plugin_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 export DOTNET_CLI_HOME="$plugin_root/.dotnet"
 export NUGET_PACKAGES="$plugin_root/.packages"
+export NUGET_HTTP_CACHE_PATH="$plugin_root/.nuget-http"
 
 provider_project="$plugin_root/src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj"
 design_project="$plugin_root/tools/Jellyfin.Plugin.Database.Npgsql.Migrations/Jellyfin.Plugin.Database.Npgsql.Migrations.csproj"

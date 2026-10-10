@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "guid": "8a6e4c5e-2185-45df-a30f-cc828529330b",
+  "name": "Npgsql Database",
+  "version": "0.1.0.0",
+  "targetAbi": "12.2.0.0",
+  "framework": "net10.0",
+  "installationDirectory": "Npgsql Database_0.1.0.0",
+  "packageFile": "jellyfin-plugin-database-npgsql_0.1.0.0.zip",
+  "checksumFile": "jellyfin-plugin-database-npgsql_0.1.0.0.zip.sha256",
+  "symbolFile": "Jellyfin.Plugin.Database.Npgsql.pdb",
+  "zipArtifacts": [
+    "Jellyfin.Plugin.Database.Npgsql.deps.json",
+    "Jellyfin.Plugin.Database.Npgsql.dll",
+    "LICENSE",
+    "Npgsql.EntityFrameworkCore.PostgreSQL.dll",
+    "Npgsql.dll",
+    "THIRD-PARTY-NOTICES.md",
+    "meta.json"
+  ],
+  "redistributedPackages": {
+    "Npgsql": {
+      "version": "10.0.3",
+      "license": "PostgreSQL",
+      "artifact": "Npgsql.dll"
+    },
+    "Npgsql.EntityFrameworkCore.PostgreSQL": {
+      "version": "10.0.3",
+      "license": "PostgreSQL",
+      "artifact": "Npgsql.EntityFrameworkCore.PostgreSQL.dll"
+    }
+  }
+}

@@ -1211,7 +1211,7 @@ openssl req \
     -sha256 \
     -days 1 \
     -nodes \
-    -subj "/CN=jellyfin-smoke-$SMOKE_ID" \
+    -subj "/CN=jellyfin-smoke-${SMOKE_ID##*-}" \
     -keyout "$CLIENT_KEY" \
     -out "$CLIENT_CERTIFICATE" \
     >/dev/null 2>&1

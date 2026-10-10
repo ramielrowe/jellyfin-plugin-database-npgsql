@@ -47,10 +47,18 @@ similarly named folder from silently selecting an unintended binary.
 
 For upgrades or rollback, extract the complete package to its new versioned
 directory first, then change `PluginName` in one configuration edit and restart.
-Leave the prior directory installed until the new version starts successfully.
-If startup reports a missing dependency or unsupported database ABI, restore the
-prior `PluginName` (or the prior Jellyfin version) and restart. Do not partially
-overwrite a live version directory.
+Keep the prior package and migration snapshot outside Jellyfin's plugin root
+until the new version starts successfully; ordinary plugin housekeeping may
+delete an older same-GUID directory. If startup reports a missing dependency or
+unsupported database ABI, move the newer package out of the plugin root,
+restore the complete prior package and matching `PluginName` (or the prior
+Jellyfin version), and restart. Do not partially overwrite a live version
+directory.
+
+The complete operational procedure—including interrupted staging, package-only
+downgrade limits, dashboard disable, uninstall, missing-file recovery, portable
+symbols, and checksum verification—is in
+[`docs/installation-lifecycle.md`](docs/installation-lifecycle.md).
 
 The packaged `meta.json` must remain `Active`. `database.xml` selects the early
 database provider, while active ordinary discovery installs the independent
@@ -174,14 +182,18 @@ dotnet msbuild build/Package.proj -target:Package -property:Configuration=Releas
 ./scripts/verify-migrations.sh
 ```
 
-The package target writes a staged, allowlisted layout and ZIP beneath
-`artifacts/`; the audit rejects host-owned runtime assemblies, any ZIP entry
+The package target writes a staged, allowlisted layout and reproducible ZIP,
+SHA-256 sidecar, and portable PDB beneath `artifacts/`; the audit rejects
+host-owned runtime assemblies, any ZIP entry
 outside the seven-file allowlist, and external project
 references in every solution project after MSBuild resolves them. The audit also
 runs a negative control that injects a known external project reference and proves
 the guard rejects it. Builds are isolated from an enclosing Git repository so
 moving the workspace does not change the release binary. `build.yaml` lists the
 same seven package artifacts for the official Jellyfin plugin packager.
+`build/release-policy.json` is the machine-readable release identity, install
+directory, output, redistribution, and license contract. The PDB is a separate
+diagnostic artifact and is not installed in the plugin directory.
 
 Reusable opt-in PostgreSQL and pristine-host infrastructure is documented in
 [`docs/test-infrastructure.md`](docs/test-infrastructure.md). Default test runs

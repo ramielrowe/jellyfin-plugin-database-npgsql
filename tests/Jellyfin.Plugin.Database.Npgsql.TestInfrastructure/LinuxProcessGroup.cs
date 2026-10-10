@@ -304,14 +304,21 @@ internal sealed class LinuxProcessIdentity : IDisposable
 
     private static bool HasExited(int descriptor)
     {
-        var item = new PollDescriptor { FileDescriptor = descriptor, Events = 1 };
-        var result = poll(ref item, 1, 0);
-        if (result < 0)
+        while (true)
         {
-            throw new IOException("Could not poll a test-process pidfd.");
-        }
+            var item = new PollDescriptor { FileDescriptor = descriptor, Events = 1 };
+            var result = poll(ref item, 1, 0);
+            if (result >= 0)
+            {
+                return result != 0;
+            }
 
-        return result != 0;
+            var error = Marshal.GetLastPInvokeError();
+            if (error != 4) // EINTR: retry when another test process changes state concurrently.
+            {
+                throw new IOException($"Could not poll a test-process pidfd (errno {error}).");
+            }
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)]

@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 10.0.100
+          cache: true
+          cache-dependency-path: '**/packages.lock.json'
+      - run: ./scripts/verify-release.sh
+      - run: dotnet format Jellyfin.Plugin.Database.Npgsql.slnx --verify-no-changes --no-restore
+
+  vanilla-jellyfin-black-box:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: plugin
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: jellyfin/jellyfin
+          ref: ca0f16eb7c195f720a1493ed469a27c4657db0c6
+          path: jellyfin
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 10.0.100
+          cache: true
+          cache-dependency-path: |
+            plugin/**/packages.lock.json
+            jellyfin/**/packages.lock.json
+      - name: Publish untouched pinned Jellyfin host
+        run: dotnet publish jellyfin/Jellyfin.Server/Jellyfin.Server.csproj --configuration Release --output host --no-self-contained
+      - name: Hash vanilla host
+        working-directory: plugin
+        run: |
+          dotnet restore Jellyfin.Plugin.Database.Npgsql.slnx --locked-mode
+          dotnet build tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/Jellyfin.Plugin.Database.Npgsql.TestHarness.csproj --configuration Release --no-restore
+          dotnet tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/bin/Release/net10.0/Jellyfin.Plugin.Database.Npgsql.TestHarness.dll hash-publish ../host > .host-sha256
+      - name: Verify relocated ZIP on vanilla Jellyfin and PostgreSQL 16
+        working-directory: plugin
+        env:
+          RUN_BLACK_BOX: 'true'
+          JELLYFIN_HOST_PUBLISH: ../host
+        run: |
+          export JELLYFIN_HOST_SHA256="$(cat .host-sha256)"
+          ./scripts/verify-release.sh

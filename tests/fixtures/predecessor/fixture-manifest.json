@@ -3,7 +3,7 @@
   "historicalSourceCommit": "f7575d769132236431388eddbcd13525d4507150",
   "sourceSha256": "f92d197100862260d384be14aa4bf2935ed9aae56a11e860c1cea86a7d2fa699",
   "assemblySha256": "5d8f95fc84305c385264bf4ba552774b9f2fb751bf72ab67991a1cfd73d470f1",
-  "packageSha256": "19405a82900ff4d0d97dec59d4b6d695546126b8fa436cda249a36261a52ebc4",
+  "packageSha256": "699c62340f84d8cb7613a17b19d2107adbec313a33c6fe813423d9baf2dd4844",
   "lastMigration": "20261009061446_AddActivityLogTypeDateIndex",
   "expectedHistoryRows": 51,
   "forbiddenPostReleaseSymbols": [

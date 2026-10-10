@@ -3,18 +3,29 @@
     <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
     <PluginRoot>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..'))</PluginRoot>
     <ProviderProject>$(PluginRoot)src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj</ProviderProject>
+    <PackagingProject>$(PluginRoot)tools/Jellyfin.Plugin.Database.Npgsql.Packaging/Jellyfin.Plugin.Database.Npgsql.Packaging.csproj</PackagingProject>
+    <PackagingTool>$(PluginRoot)tools/Jellyfin.Plugin.Database.Npgsql.Packaging/bin/$(Configuration)/net10.0/Jellyfin.Plugin.Database.Npgsql.Packaging.dll</PackagingTool>
     <ArtifactsDirectory>$(PluginRoot)artifacts/</ArtifactsDirectory>
     <PublishDirectory>$(ArtifactsDirectory)publish/</PublishDirectory>
     <PackageDirectory>$(ArtifactsDirectory)package/</PackageDirectory>
+    <SymbolsDirectory>$(ArtifactsDirectory)symbols/</SymbolsDirectory>
     <PackagePath>$(ArtifactsDirectory)jellyfin-plugin-database-npgsql_0.1.0.0.zip</PackagePath>
+    <PackageChecksumPath>$(PackagePath).sha256</PackageChecksumPath>
   </PropertyGroup>
 
   <Target Name="CleanPackage">
     <RemoveDir Directories="$(ArtifactsDirectory)" />
-    <MakeDir Directories="$(PublishDirectory);$(PackageDirectory)" />
+    <MakeDir Directories="$(PublishDirectory);$(PackageDirectory);$(SymbolsDirectory)" />
   </Target>
 
-  <Target Name="PublishPlugin" DependsOnTargets="CleanPackage">
+  <Target Name="BuildPackagingTool">
+    <MSBuild
+      Projects="$(PackagingProject)"
+      Targets="Build"
+      Properties="Configuration=$(Configuration);RestoreLockedMode=true" />
+  </Target>
+
+  <Target Name="PublishPlugin" DependsOnTargets="BuildPackagingTool;CleanPackage">
     <MSBuild
       Projects="$(ProviderProject)"
       Targets="Publish"
@@ -37,6 +48,9 @@
       Condition="!Exists('%(PackageArtifact.Identity)')"
       Text="Required plugin artifact is missing: %(PackageArtifact.Identity)" />
     <Copy SourceFiles="@(PackageArtifact)" DestinationFolder="$(PackageDirectory)" />
+    <Copy
+      SourceFiles="$(PublishDirectory)Jellyfin.Plugin.Database.Npgsql.pdb"
+      DestinationFolder="$(SymbolsDirectory)" />
     <ItemGroup>
       <StagedArtifact Include="$(PackageDirectory)*" />
       <ForbiddenHostAssembly Include="$(PackageDirectory)Jellyfin.Database.Implementations.dll" Condition="Exists('$(PackageDirectory)Jellyfin.Database.Implementations.dll')" />
@@ -52,10 +66,18 @@
       Condition="'@(UnexpectedArtifact)' != ''"
       Text="The staged package contains an artifact outside the release allowlist: @(UnexpectedArtifact, ', ')" />
     <Touch Files="@(StagedArtifact)" Time="2000-01-01T00:00:00Z" />
-    <ZipDirectory
-      SourceDirectory="$(PackageDirectory)"
-      DestinationFile="$(PackagePath)"
-      Overwrite="true" />
+    <Touch Files="$(SymbolsDirectory)Jellyfin.Plugin.Database.Npgsql.pdb" Time="2000-01-01T00:00:00Z" />
+    <Exec Command="dotnet &quot;$(PackagingTool)&quot; &quot;$(PackageDirectory)&quot; &quot;$(PackagePath)&quot;" />
+    <GetFileHash Files="$(PackagePath)" Algorithm="SHA256" HashEncoding="hex">
+      <Output TaskParameter="Items" ItemName="PackageHash" />
+    </GetFileHash>
+    <WriteLinesToFile
+      File="$(PackageChecksumPath)"
+      Lines="%(PackageHash.FileHash)  $([System.IO.Path]::GetFileName('$(PackagePath)'))"
+      Overwrite="true"
+      WriteOnlyWhenDifferent="true" />
+    <Touch Files="$(PackageChecksumPath)" Time="2000-01-01T00:00:00Z" />
     <Message Importance="high" Text="Created $(PackagePath)" />
+    <Message Importance="high" Text="Created $(PackageChecksumPath) and portable symbols in $(SymbolsDirectory)" />
   </Target>
 </Project>
