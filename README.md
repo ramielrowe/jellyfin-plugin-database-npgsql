@@ -10,9 +10,13 @@ change it between releases.
 
 ## Compatibility baseline
 
-The release project targets .NET 10 and compiles against the published
-`Jellyfin.Database.Implementations` 12.2.0 contract. It pins EF Core 10.0.11 and
-Npgsql 10.0.3, matching the successful feasibility run documented in
+The supported production matrix is deliberately narrow: plugin `0.1.0.0`, exact
+Jellyfin database ABI `12.2.0.0` (the vanilla Jellyfin `12.2.0.0` host), and
+PostgreSQL `16.6`. The release project targets .NET 10, compiles against the
+published `Jellyfin.Database.Implementations` 12.2.0 contract, and pins EF Core
+10.0.11 and Npgsql 10.0.3. No other Jellyfin or PostgreSQL version is supported
+by this release, even if it appears to start. Do not bypass the version guards.
+The evidence behind this matrix is documented in
 [`docs/feasibility-report.md`](docs/feasibility-report.md). Jellyfin and EF Core
 assemblies are host-owned compile contracts; only the provider and Npgsql runtime
 assemblies belong in the plugin package.
@@ -59,6 +63,8 @@ The complete operational procedure—including interrupted staging, package-only
 downgrade limits, dashboard disable, uninstall, missing-file recovery, portable
 symbols, and checksum verification—is in
 [`docs/installation-lifecycle.md`](docs/installation-lifecycle.md).
+The end-to-end database provisioning and operator runbook is in
+[`docs/operator-guide.md`](docs/operator-guide.md).
 
 The packaged `meta.json` must remain `Active`. `database.xml` selects the early
 database provider, while active ordinary discovery installs the independent
@@ -230,6 +236,9 @@ documented in [`docs/migration-backups.md`](docs/migration-backups.md).
 The checked-in predecessor package and exact fresh-start, upgrade, restart, and
 failure matrix are documented in
 [`docs/stock-lifecycle.md`](docs/stock-lifecycle.md).
+The final contributor qualification, release audits, relocation proof, and
+evidence contract are documented in
+[`docs/release-process.md`](docs/release-process.md).
 
 The black-box smoke test exercises the packaged ZIP, early dependency/ABI
 guards, restricted PostgreSQL role, and untouched vanilla startup path:
