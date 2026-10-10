@@ -142,8 +142,7 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
             return;
         }
 
-        ThrowIfTerminalShutdownFault();
-        ProviderOperationGate.Wait(deadline.Token);
+        WaitForProviderGateAsync(deadline.Token).GetAwaiter().GetResult();
         var handoffStarted = false;
         ShutdownGateRelease? release = null;
         CancellationTokenRegistration stoppedRegistration = default;
@@ -170,6 +169,8 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
 
             release = new ShutdownGateRelease(this.logger, GetShutdownDeadline());
             stoppedRegistration = this.applicationLifetime.ApplicationStopped.Register(release.Release);
+            NpgsqlBackupFileSystem.Checkpoint("schedule-restore-before-publication");
+            ThrowIfTerminalShutdownFault();
             this.inner.ScheduleRestoreAndRestartServer(archivePath);
             handoffStarted = true;
         }
@@ -191,6 +192,14 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
         Volatile.Write(
             ref shutdownFaultSignal,
             new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+    }
+
+    /// <summary>Publishes the terminal shutdown signal at an exact synchronous test boundary.</summary>
+    /// <param name="message">The observable fail-closed diagnostic.</param>
+    internal static void InjectTerminalShutdownFaultForTests(string message)
+    {
+        Volatile.Write(ref terminalShutdownFault, message);
+        Volatile.Read(ref shutdownFaultSignal).TrySetResult();
     }
 
 #pragma warning disable SA1201 // Gate callback is kept beside the scheduling operation it protects.
@@ -261,6 +270,7 @@ internal sealed class NpgsqlBackupServiceDecorator : IBackupService
         }
 
         await wait.ConfigureAwait(false);
+        ThrowIfTerminalShutdownFault();
     }
 
     private static TimeSpan GetShutdownDeadline()

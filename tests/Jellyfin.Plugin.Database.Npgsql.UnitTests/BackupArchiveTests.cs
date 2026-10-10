@@ -857,6 +857,40 @@ public sealed class BackupArchiveTests : IDisposable
     }
 
     [Fact]
+    public async Task ProviderGate_SynchronousScheduleRejectsTerminalFaultAtPrepublicationBoundary()
+    {
+        var restorePath = this.CreateStockArchive(historyJson: CreateExactHistoryJson());
+        await NpgsqlBackupArchive.BindAsync(restorePath, true, TestContext.Current.CancellationToken);
+        var inner = new ScheduledBackupService(this.CreateStockArchive(databaseIncluded: false));
+        var lifetime = new TestHostApplicationLifetime();
+        await using var services = new ServiceCollection()
+            .AddSingleton<IHostApplicationLifetime>(lifetime)
+            .AddSingleton<IDbContextFactory<JellyfinDbContext>>(new TestDbContextFactory())
+            .BuildServiceProvider();
+        var decorator = new NpgsqlBackupServiceDecorator(inner, true, services);
+        try
+        {
+            using var faults = NpgsqlBackupFileSystem.InjectFaults(point =>
+            {
+                if (point == "schedule-restore-before-publication")
+                {
+                    NpgsqlBackupServiceDecorator.InjectTerminalShutdownFaultForTests("terminal prepublication fault");
+                }
+            });
+
+            var failure = Assert.Throws<InvalidOperationException>(
+                () => decorator.ScheduleRestoreAndRestartServer(restorePath));
+            Assert.Contains("prepublication", failure.Message, StringComparison.Ordinal);
+            Assert.Equal(0, inner.ScheduleCalls);
+        }
+        finally
+        {
+            lifetime.SignalStopped();
+            NpgsqlBackupServiceDecorator.ResetShutdownFaultForTests();
+        }
+    }
+
+    [Fact]
     public async Task ModelPreflight_AcceptsExactEmptyModelAndHistory()
     {
         var path = this.CreateStockArchive(historyJson: CreateExactHistoryJson());
@@ -1165,7 +1199,8 @@ public sealed class BackupArchiveTests : IDisposable
         const int records = 200;
         var root = Path.Combine(this.testRoot, "canceled-" + phase + "-index");
         using var cancellation = new CancellationTokenSource();
-        using (NpgsqlExactDiskIndex.InjectSortMemoryForTests(64))
+        using (NpgsqlExactDiskIndex.InjectSortMemoryForTests(
+            string.Equals(phase, "sort", StringComparison.Ordinal) ? 1024 * 1024 : 64))
         using (var index = new NpgsqlExactDiskIndex(root, cancellation.Token))
         {
             for (var value = 0; value < records; value++)
@@ -1181,10 +1216,10 @@ public sealed class BackupArchiveTests : IDisposable
             using (NpgsqlBackupFileSystem.InjectFaults(point =>
             {
                 if ((string.Equals(phase, "sort", StringComparison.Ordinal)
-                        && point == "validation-index-before-sort")
+                        && point == "validation-index-sort-compare")
                     || (string.Equals(phase, "merge", StringComparison.Ordinal)
-                        && point == "validation-index-write"
-                        && ++writes > records))
+                        && point == "validation-index-merge-compare"
+                        && ++writes > 2))
                 {
                     cancellation.Cancel();
                 }
@@ -1208,16 +1243,34 @@ public sealed class BackupArchiveTests : IDisposable
         var owned = NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation");
         var unknown = Path.Combine(root, "validation-unknown");
         Directory.CreateDirectory(unknown);
-        var markerPath = Path.Combine(owned, ".jellyfin-npgsql-owner.json");
-        var marker = JsonNode.Parse(File.ReadAllText(markerPath))!.AsObject();
-        marker["ProcessId"] = int.MaxValue;
-        marker["ProcessStartUtc"] = DateTime.UnixEpoch;
-        File.WriteAllText(markerPath, marker.ToJsonString());
 
-        NpgsqlScratchSpace.ScavengeValidationDirectories(root);
+        using (NpgsqlScratchSpace.InjectOwnerLivenessForTests((_, _) => false))
+        {
+            NpgsqlScratchSpace.ScavengeValidationDirectories(root);
+        }
 
         Assert.False(Directory.Exists(owned));
         Assert.True(Directory.Exists(unknown));
+    }
+
+    [Fact]
+    public void ValidationScratch_ScavengesOnlyOldEmptyPreMarkerGeneration()
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux handle-relative scratch contract.");
+        var root = Path.Combine(this.testRoot, "validation-partial-scavenge");
+        Directory.CreateDirectory(root);
+        var partial = Path.Combine(root, ".init-validation-" + Guid.NewGuid().ToString("N"));
+        var nonempty = Path.Combine(root, ".init-validation-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(partial);
+        Directory.CreateDirectory(nonempty);
+        File.WriteAllText(Path.Combine(nonempty, "unrelated"), "keep");
+        Directory.SetLastWriteTimeUtc(partial, DateTime.UtcNow - TimeSpan.FromHours(2));
+        Directory.SetLastWriteTimeUtc(nonempty, DateTime.UtcNow - TimeSpan.FromHours(2));
+
+        NpgsqlScratchSpace.ScavengeValidationDirectories(root);
+
+        Assert.False(Directory.Exists(partial));
+        Assert.Equal("keep", File.ReadAllText(Path.Combine(nonempty, "unrelated")));
     }
 
     [Fact]
@@ -1274,10 +1327,174 @@ public sealed class BackupArchiveTests : IDisposable
     }
 
     [Theory]
+    [InlineData("file")]
+    [InlineData("directory")]
+    [InlineData("symlink")]
+    public void ScratchCleanup_PostCheckReplacementIsPreservedAtPinnedUnlinkBoundary(string kind)
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux handle-relative scratch contract.");
+        var root = Path.Combine(this.testRoot, "scratch-unlink-race-" + kind);
+        var owned = NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation");
+        var payload = Path.Combine(owned, "payload");
+        switch (kind)
+        {
+            case "file":
+                File.WriteAllText(payload, "owned");
+                break;
+            case "directory":
+                Directory.CreateDirectory(payload);
+                break;
+            case "symlink":
+                File.CreateSymbolicLink(payload, Path.Combine(root, "outside-target"));
+                break;
+        }
+
+        var raced = false;
+        using (NpgsqlBackupFileSystem.InjectFaults(point =>
+        {
+            if (point != "scratch-after-pinned-unlink-check" || raced)
+            {
+                return;
+            }
+
+            var trash = Directory.GetDirectories(root, ".trash-*", SearchOption.TopDirectoryOnly).Single();
+            var claimed = Directory.EnumerateFileSystemEntries(trash, ".delete-*", SearchOption.TopDirectoryOnly).Single();
+            var displaced = claimed + ".displaced";
+            if (kind == "directory")
+            {
+                Directory.Move(claimed, displaced);
+                Directory.CreateDirectory(claimed);
+            }
+            else
+            {
+                File.Move(claimed, displaced);
+                if (kind == "symlink")
+                {
+                    File.CreateSymbolicLink(claimed, Path.Combine(root, "replacement-target"));
+                }
+                else
+                {
+                    File.WriteAllText(claimed, "racer replacement");
+                }
+            }
+
+            raced = true;
+        }))
+        {
+            Assert.Throws<InvalidDataException>(() => NpgsqlScratchSpace.ClaimAndDelete(owned, "validation"));
+        }
+
+        var retainedTrash = Directory.GetDirectories(root, ".trash-*", SearchOption.TopDirectoryOnly).Single();
+        var replacement = Directory.EnumerateFileSystemEntries(retainedTrash, ".delete-*", SearchOption.TopDirectoryOnly)
+            .Single(path => !path.EndsWith(".displaced", StringComparison.Ordinal));
+        if (kind == "directory")
+        {
+            Assert.True(Directory.Exists(replacement));
+        }
+        else if (kind == "symlink")
+        {
+            Assert.Equal(Path.Combine(root, "replacement-target"), new FileInfo(replacement).LinkTarget);
+        }
+        else
+        {
+            Assert.Equal("racer replacement", File.ReadAllText(replacement));
+        }
+    }
+
+    [Fact]
+    public void ScratchCleanup_CopiedOwnerMarkerCannotAuthorizeAnotherGeneration()
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux handle-relative scratch contract.");
+        var firstParent = Path.Combine(this.testRoot, "scratch-owner-first");
+        var owned = NpgsqlScratchSpace.CreateOwnedDirectory(firstParent, "validation");
+        var secondParent = Path.Combine(this.testRoot, "scratch-owner-second");
+        Directory.CreateDirectory(secondParent);
+        var forged = Path.Combine(secondParent, Path.GetFileName(owned));
+        Directory.CreateDirectory(forged);
+        File.Copy(
+            Path.Combine(owned, ".jellyfin-npgsql-owner.json"),
+            Path.Combine(forged, ".jellyfin-npgsql-owner.json"));
+        File.WriteAllText(Path.Combine(forged, "replacement"), "unrelated");
+
+        Assert.Throws<InvalidDataException>(() => NpgsqlScratchSpace.ClaimAndDelete(forged, "validation"));
+        Assert.Equal("unrelated", File.ReadAllText(Path.Combine(forged, "replacement")));
+    }
+
+    [Fact]
+    public void ScratchCleanup_RootReplacementAtPinnedUnlinkBoundaryIsPreserved()
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux handle-relative scratch contract.");
+        var root = Path.Combine(this.testRoot, "scratch-root-unlink-race");
+        var owned = NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation");
+        var raced = false;
+        using (NpgsqlBackupFileSystem.InjectFaults(point =>
+        {
+            if (point != "scratch-after-pinned-unlink-check" || raced)
+            {
+                return;
+            }
+
+            var trash = Directory.GetDirectories(root, ".trash-*", SearchOption.TopDirectoryOnly).Single();
+            if (Directory.EnumerateFileSystemEntries(trash).Any())
+            {
+                return;
+            }
+
+            Directory.Move(trash, trash + ".displaced");
+            Directory.CreateDirectory(trash);
+            File.WriteAllText(Path.Combine(trash, "replacement"), "unrelated");
+            raced = true;
+        }))
+        {
+            Assert.Throws<InvalidDataException>(() => NpgsqlScratchSpace.ClaimAndDelete(owned, "validation"));
+        }
+
+        var replacement = Directory.GetDirectories(root, ".trash-*", SearchOption.TopDirectoryOnly)
+            .Single(path => !path.EndsWith(".displaced", StringComparison.Ordinal));
+        Assert.Equal("unrelated", File.ReadAllText(Path.Combine(replacement, "replacement")));
+    }
+
+    [Fact]
+    public void ScratchCleanup_SidecarReplacementAtPinnedUnlinkBoundaryIsPreserved()
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux handle-relative scratch contract.");
+        var root = Path.Combine(this.testRoot, "scratch-sidecar-unlink-race");
+        var owned = NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation");
+        var raced = false;
+        using (NpgsqlBackupFileSystem.InjectFaults(point =>
+        {
+            if (point != "scratch-after-pinned-unlink-check" || raced)
+            {
+                return;
+            }
+
+            var sidecarClaim = Directory.GetFiles(root, ".delete-claim-*", SearchOption.TopDirectoryOnly).SingleOrDefault();
+            if (sidecarClaim is null)
+            {
+                return;
+            }
+
+            File.Move(sidecarClaim, sidecarClaim + ".displaced");
+            File.WriteAllText(sidecarClaim, "unrelated");
+            raced = true;
+        }))
+        {
+            Assert.Throws<InvalidDataException>(() => NpgsqlScratchSpace.ClaimAndDelete(owned, "validation"));
+        }
+
+        Assert.Equal(
+            "unrelated",
+            File.ReadAllText(Directory.GetFiles(root, ".delete-claim-*", SearchOption.TopDirectoryOnly)
+                .Single(path => !path.EndsWith(".displaced", StringComparison.Ordinal))));
+    }
+
+    [Theory]
     [InlineData("scratch-before-claim-rename")]
     [InlineData("scratch-after-claim-rename")]
     [InlineData("flush-scratch-claim-parent")]
+    [InlineData("flush-scratch-claim-sidecar-parent")]
     [InlineData("scratch-before-child-rename")]
+    [InlineData("scratch-after-pinned-unlink-check")]
     [InlineData("scratch-after-child-delete")]
     [InlineData("scratch-before-delete-root")]
     [InlineData("flush-scratch-delete-parent")]
@@ -1327,6 +1544,61 @@ public sealed class BackupArchiveTests : IDisposable
                 "Host=should-not-connect.invalid;Database=none;Username=none",
                 TestContext.Current.CancellationToken));
         Assert.Contains("fail-closed", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RestoreRecovery_RootSwapAfterLeaseFailsClosedWithoutTouchingReplacement()
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux restore recovery contract.");
+        var data = Path.Combine(this.testRoot, "recovery-root-swap");
+        var recovery = Path.Combine(data, ".jellyfin-npgsql-restore-recovery");
+        var displaced = recovery + ".displaced";
+        Directory.CreateDirectory(recovery);
+        using var faults = NpgsqlBackupFileSystem.InjectFaults(point =>
+        {
+            if (point == "restore-recovery-after-lease")
+            {
+                Directory.Move(recovery, displaced);
+                Directory.CreateDirectory(recovery);
+                File.WriteAllText(Path.Combine(recovery, "replacement"), "unrelated");
+            }
+        });
+
+        await Assert.ThrowsAsync<InvalidDataException>(
+            () => NpgsqlRestoreFileSnapshot.RecoverPendingAsync(
+                data,
+                "Host=should-not-connect.invalid;Database=none;Username=none",
+                TestContext.Current.CancellationToken));
+        Assert.Equal("unrelated", File.ReadAllText(Path.Combine(recovery, "replacement")));
+        Assert.True(Directory.Exists(displaced));
+    }
+
+    [Fact]
+    public async Task RestoreRecovery_ReplaysClaimedScratchThroughPinnedRecoveryRoot()
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux restore recovery contract.");
+        var data = Path.Combine(this.testRoot, "recovery-claimed-scratch");
+        var recovery = Path.Combine(data, ".jellyfin-npgsql-restore-recovery");
+        var owned = NpgsqlScratchSpace.CreateOwnedDirectory(recovery, "restore");
+        File.WriteAllText(Path.Combine(owned, "payload"), "owned");
+        using (NpgsqlBackupFileSystem.InjectFaults(point =>
+        {
+            if (point == "scratch-after-claim-rename")
+            {
+                throw new IOException("simulated cleanup crash");
+            }
+        }))
+        {
+            Assert.Throws<IOException>(() => NpgsqlScratchSpace.ClaimAndDelete(owned, "restore"));
+        }
+
+        await NpgsqlRestoreFileSnapshot.RecoverPendingAsync(
+            data,
+            "Host=should-not-connect.invalid;Database=none;Username=none",
+            TestContext.Current.CancellationToken);
+
+        Assert.Empty(Directory.GetDirectories(recovery, ".trash-*", SearchOption.TopDirectoryOnly));
+        Assert.Empty(Directory.GetFiles(recovery, ".trash-*.claim", SearchOption.TopDirectoryOnly));
     }
 
     [Fact]

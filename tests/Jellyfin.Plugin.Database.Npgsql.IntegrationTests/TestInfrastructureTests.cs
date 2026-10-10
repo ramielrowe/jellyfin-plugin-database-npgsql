@@ -709,6 +709,12 @@ public sealed class TestInfrastructureTests
             }
 
             Assert.True(File.Exists(ready), "The first process did not publish its restore recovery lease.");
+            Assert.False(
+                File.Exists(Path.Combine(applicationData, ".jellyfin-npgsql-recovery.lock")),
+                "Recovery lease evidence must not violate Jellyfin's application-data marker contract.");
+            var recoveryRoot = Path.Combine(applicationData, ".jellyfin-npgsql-restore-recovery");
+            Directory.Move(recoveryRoot, recoveryRoot + ".held-generation");
+            Directory.CreateDirectory(recoveryRoot);
             var blocked = await ExternalCommand.RunAsync(
                 "dotnet",
                 new[] { helper, "restore-recovery-lease-expect-blocked", applicationData },
@@ -716,6 +722,9 @@ public sealed class TestInfrastructureTests
                 TestContext.Current.CancellationToken);
             blocked.EnsureSuccess("Proving restore recovery process exclusion", new SensitiveDataRedactor());
             (await holder).EnsureSuccess("Holding the restore recovery process lease", new SensitiveDataRedactor());
+
+            Directory.Delete(recoveryRoot, recursive: true);
+            Directory.Move(recoveryRoot + ".held-generation", recoveryRoot);
 
             var afterExit = await ExternalCommand.RunAsync(
                 "dotnet",
@@ -727,6 +736,52 @@ public sealed class TestInfrastructureTests
         finally
         {
             Directory.Delete(applicationData, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData("scratch-before-claim-rename")]
+    [InlineData("scratch-after-claim-rename")]
+    [InlineData("flush-scratch-claim-parent")]
+    [InlineData("flush-scratch-claim-sidecar-parent")]
+    [InlineData("scratch-before-child-rename")]
+    [InlineData("scratch-after-pinned-unlink-check")]
+    [InlineData("scratch-after-child-delete")]
+    [InlineData("scratch-before-delete-root")]
+    [InlineData("flush-scratch-delete-parent")]
+    [InlineData("scratch-after-delete-root")]
+    public async Task ScratchCleanup_ProcessKillAtEveryDurableBoundaryConvergesOnRestart(string point)
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "Linux process crash cleanup contract.");
+        var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
+        var helper = Path.Combine(repositoryRoot, "tests", "Jellyfin.Plugin.Database.Npgsql.TestHarness", "bin", "Release", "net10.0", "Jellyfin.Plugin.Database.Npgsql.TestHarness.dll");
+        var root = Path.Combine(repositoryRoot, ".artifacts", "scratch-crash-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var owned = NpgsqlScratchSpace.CreateOwnedDirectory(root, "validation");
+            Directory.CreateDirectory(Path.Combine(owned, "nested"));
+            await File.WriteAllTextAsync(
+                Path.Combine(owned, "nested", "payload"),
+                "owned",
+                TestContext.Current.CancellationToken);
+            var crashed = await ExternalCommand.RunAsync(
+                "dotnet",
+                new[] { helper, "scratch-cleanup-crash", owned, point },
+                TimeSpan.FromSeconds(15),
+                TestContext.Current.CancellationToken);
+            Assert.NotEqual(0, crashed.ExitCode);
+
+            using (NpgsqlScratchSpace.InjectOwnerLivenessForTests((_, _) => false))
+            {
+                NpgsqlScratchSpace.ScavengeValidationDirectories(root);
+            }
+
+            Assert.Empty(Directory.EnumerateFileSystemEntries(root));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
         }
     }
 

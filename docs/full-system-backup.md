@@ -60,11 +60,15 @@ key limit and an enforced 8 GiB physical-write quota (including unsorted data,
 runs, and merged output) while the archive remains capped at ten million rows.
 It uses bounded 16 MiB sort chunks and at most 32 merge readers, threads the
 operation cancellation token through ingestion, sorting, run creation, and
-multi-pass merge, needs no SQLite library from the host, and fails
+multi-pass merge, uses cancellation-aware comparison checkpoints inside both
+CPU sorting and priority-queue merge, needs no SQLite library from the host, and fails
 deterministically if its real write accounting exceeds quota. Owner
-markers include process identity; dead validation directories are scavenged on
-the next validation while live/concurrent or unmarked directories are never
-removed. ZIP central-directory size and count are checked before `ZipArchive`
+markers bind the random owner generation, exact basename, and directory
+device/inode with a SHA-256 proof. Dead validation directories are scavenged on
+the next validation while live/concurrent, forged, or unmarked published
+directories are never removed. Empty pre-marker staging generations use a reserved name and
+are reclaimed only after a one-hour inactivity bound; nonempty unknown staging
+is preserved fail closed. ZIP central-directory size and count are checked before `ZipArchive`
 materializes entries.
 
 A process-wide provider gate serializes backup and restore from preflight
@@ -108,17 +112,27 @@ state (committed marker) or the exact old file state (no marker). Once the
 committed journal is durable, marker and snapshot cleanup are best effort and
 retryable; cleanup failure cannot misreport a committed restore as failed.
 Terminal cleanup first validates the owner marker through an open no-follow
-directory handle, atomically renames that exact device/inode generation to a
-unique same-parent tombstone, fsyncs the parent, and only then performs
-handle-relative deletion. A replacement at the old name is therefore never
-deleted. Interrupted tombstones are idempotently scavenged. Recovery itself is
-serialized across processes by an OS file lease with durable PID evidence;
-kernel lease release after a crash permits the next startup to resume.
+directory handle, atomically renames that exact device/inode generation with
+`renameat2(RENAME_NOREPLACE)` to a unique, owner-bound same-parent tombstone,
+fsyncs that already-open parent, and only then performs handle-relative
+deletion. Children, tombstone roots, and claim sidecars are independently
+claimed and revalidated against their pinned handles immediately before
+unlink. Kernels without the no-replace primitive fail closed before a cleanup
+claim. A replacement at any old or claimed name is therefore never deleted.
+Interrupted tombstones and durable claim sidecars are idempotently scavenged
+with parent-fsync ordering. Recovery itself is serialized across processes by
+an OS lock held on the stable application-data directory inode; the separately
+held recovery-root handle and its generation are revalidated throughout replay,
+so swapping the configured recovery root cannot establish a second lease
+namespace. Kernel lease release after a crash permits the next startup to resume.
 Missing, corrupt, escaping, or root-identity-mismatched journals fail startup
 closed. A separate process is killed with `Environment.FailFast` immediately
 after each durable journal transition (including both visible and absent commit
-marker outcomes); recovery is then exercised against real PostgreSQL and rerun
-to prove idempotence.
+marker outcomes). Separate processes are also killed at every scratch
+claim/delete boundary, including `flush-scratch-claim-sidecar-parent`; restart
+scavenging must converge without deleting file, directory, symlink, root, or
+sidecar replacements. Recovery is then exercised against real PostgreSQL and
+rerun to prove idempotence.
 
 If the ordinary plugin metadata is disabled, deleted, malformed, or mismatched
 while the early provider is selected, the provider refuses startup before a

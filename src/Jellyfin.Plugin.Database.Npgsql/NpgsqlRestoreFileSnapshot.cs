@@ -72,7 +72,8 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
         List<string> absentDirectories,
         Dictionary<string, RootHandle> roots,
         Guid? restoreId = null,
-        FileIdentity? expectedScratchIdentity = null)
+        FileIdentity? expectedScratchIdentity = null,
+        SafeFileHandle? existingScratchHandle = null)
     {
         this.scratchRoot = scratchRoot;
         this.stockFilesystemArchivePath = stockFilesystemArchivePath;
@@ -82,7 +83,9 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
         this.absentDirectories = absentDirectories;
         this.roots = roots;
         this.journalPath = Path.Combine(scratchRoot, "recovery-journal.json");
-        var scratchDescriptor = NativeOpen(scratchRoot, OpenDirectoryFlag | OpenNoFollow | OpenCloseOnExec);
+        var scratchDescriptor = existingScratchHandle is null
+            ? NativeOpen(scratchRoot, OpenDirectoryFlag | OpenNoFollow | OpenCloseOnExec)
+            : NativeDup(existingScratchHandle.DangerousGetHandle().ToInt32());
         if (scratchDescriptor < 0)
         {
             throw new InvalidDataException(
@@ -351,18 +354,24 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
             return;
         }
 
-        await using var recoveryLease = AcquireRecoveryLease(recoveryRoot);
+        await using var recoveryLease = AcquireRecoveryLease(applicationDataPath, recoveryRoot);
+        recoveryLease.VerifyNamespace();
+        NpgsqlBackupFileSystem.Checkpoint("restore-recovery-after-lease");
+        NpgsqlScratchSpace.ScavengeClaimedFromHandle(recoveryLease.RecoveryRoot.Handle, "restore");
+        recoveryLease.VerifyNamespace();
 
-        // Only terminal directories already claimed to trash are scavenged here. Live
-        // restore-* names contain replayable journals and must never be age/PID deleted.
-        NpgsqlScratchSpace.Scavenge(recoveryRoot, "restore", ".no-live-restore-prefix-");
-
-        foreach (var directory in Directory.EnumerateDirectories(recoveryRoot, "restore-*", SearchOption.TopDirectoryOnly))
+        foreach (var heldDirectory in Directory.EnumerateDirectories(
+            GetHandlePath(recoveryLease.RecoveryRoot.Handle),
+            "restore-*",
+            SearchOption.TopDirectoryOnly))
         {
             cancellationToken.ThrowIfCancellationRequested();
+            recoveryLease.VerifyNamespace();
+            var directoryName = Path.GetFileName(heldDirectory);
+            var directory = Path.Combine(recoveryRoot, directoryName);
             var journalPath = Path.Combine(directory, "recovery-journal.json");
             RestoreJournal journal;
-            using var recoveryDirectory = OpenRoot(directory);
+            using var recoveryDirectory = OpenRootAt(recoveryLease.RecoveryRoot.Handle, directoryName, directory);
             try
             {
                 NpgsqlScratchSpace.ValidateOwnedHandle(recoveryDirectory.Handle, "restore", Path.GetFileName(directory));
@@ -435,7 +444,8 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
                     journal.AbsentDirectories,
                     roots,
                     journal.RestoreId,
-                    recoveryDirectory.Identity);
+                    recoveryDirectory.Identity,
+                    recoveryDirectory.Handle);
                 roots = null!;
                 await using (snapshot.ConfigureAwait(false))
                 {
@@ -484,45 +494,64 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
                     }
                 }
             }
+
+            recoveryLease.VerifyNamespace();
         }
+
+        recoveryLease.VerifyNamespace();
     }
 
-    private static FileStream AcquireRecoveryLease(string recoveryRoot)
+    private static RecoveryLease AcquireRecoveryLease(string applicationDataPath, string recoveryRoot)
     {
-        using var root = OpenRoot(recoveryRoot);
-        var descriptor = NativeOpenAt(
-            root.Handle.DangerousGetHandle().ToInt32(),
-            ".jellyfin-npgsql-recovery.lock",
-            OpenReadWrite | OpenCreate | OpenNoFollow | OpenCloseOnExec,
-            384);
-        if (descriptor < 0)
+        var parent = OpenRoot(applicationDataPath);
+        const int lockExclusiveNonBlocking = 2 | 4;
+        if (NativeFlock(parent.Handle.DangerousGetHandle().ToInt32(), lockExclusiveNonBlocking) != 0)
         {
+            var error = Marshal.GetLastPInvokeError();
+            parent.Dispose();
             throw new InvalidOperationException(
-                $"PostgreSQL restore recovery could not safely open its process lease (errno {Marshal.GetLastPInvokeError()}).");
+                $"Another Jellyfin process owns PostgreSQL restore recovery. Startup remains fail-closed until that process exits (errno {error}).");
         }
 
-        var handle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
-        var stream = new FileStream(handle, FileAccess.ReadWrite);
+        RootHandle? recovery = null;
+        FileStream? stream = null;
         try
         {
-            stream.Lock(0, 1);
+            recovery = OpenRootAt(parent.Handle, Path.GetFileName(recoveryRoot), recoveryRoot);
+            var descriptor = NativeOpenAt(
+                recovery.Handle.DangerousGetHandle().ToInt32(),
+                ".jellyfin-npgsql-recovery.lock",
+                OpenReadWrite | OpenCreate | OpenNoFollow | OpenCloseOnExec,
+                384);
+            if (descriptor < 0)
+            {
+                throw new InvalidOperationException(
+                    $"PostgreSQL restore recovery could not safely open its process lease evidence (errno {Marshal.GetLastPInvokeError()}).");
+            }
+
+            stream = new FileStream(new SafeFileHandle((nint)descriptor, ownsHandle: true), FileAccess.ReadWrite);
             stream.SetLength(0);
             stream.Position = 0;
             using (var writer = new StreamWriter(stream, System.Text.Encoding.UTF8, 1024, leaveOpen: true))
             {
-                writer.Write(Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                writer.Write(
+                    Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    + "|"
+                    + parent.Identity
+                    + "|"
+                    + recovery.Identity);
                 writer.Flush();
             }
 
             stream.Flush(flushToDisk: true);
-            return stream;
+            return new RecoveryLease(parent, recovery, stream);
         }
-        catch (IOException exception)
+        catch
         {
-            stream.Dispose();
-            throw new InvalidOperationException(
-                "Another Jellyfin process owns PostgreSQL restore recovery. Startup remains fail-closed until that process exits.",
-                exception);
+            stream?.Dispose();
+            recovery?.Dispose();
+            parent.Dispose();
+            throw;
         }
     }
 
@@ -533,7 +562,7 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
     {
         var recoveryRoot = Path.Combine(applicationDataPath, RecoveryDirectoryName);
         Directory.CreateDirectory(recoveryRoot);
-        return AcquireRecoveryLease(recoveryRoot);
+        return AcquireRecoveryLease(applicationDataPath, recoveryRoot);
     }
 
     private static void ValidateJournal(string directory, RestoreJournal journal)
@@ -1500,6 +1529,30 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
         }
     }
 
+    private static RootHandle OpenRootAt(SafeFileHandle parent, string name, string displayPath)
+    {
+        var descriptor = NativeOpenAt(
+            parent.DangerousGetHandle().ToInt32(),
+            name,
+            OpenReadOnly | OpenDirectoryFlag | OpenNoFollow | OpenCloseOnExec);
+        if (descriptor < 0)
+        {
+            throw new InvalidDataException(
+                $"Stock restore root '{displayPath}' is missing, linked, or cannot be opened safely (errno {Marshal.GetLastPInvokeError()}).");
+        }
+
+        var handle = new SafeFileHandle((nint)descriptor, ownsHandle: true);
+        try
+        {
+            return new RootHandle(displayPath, handle, ReadIdentity(handle));
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+    }
+
     private RootHandle FindRoot(string path)
     {
         var fullPath = Path.GetFullPath(path);
@@ -1791,6 +1844,10 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
     [DllImport("libc", EntryPoint = "dup", SetLastError = true)]
     [DefaultDllImportSearchPaths(DllImportSearchPath.SafeDirectories)]
     private static extern int NativeDup(int fileDescriptor);
+
+    [DllImport("libc", EntryPoint = "flock", SetLastError = true)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.SafeDirectories)]
+    private static extern int NativeFlock(int fileDescriptor, int operation);
 #pragma warning restore SYSLIB1054
 #pragma warning restore CA2101
 
@@ -1911,6 +1968,33 @@ internal sealed class NpgsqlRestoreFileSnapshot : IAsyncDisposable
         }
 
         public void Dispose() => this.Handle.Dispose();
+    }
+
+    private sealed class RecoveryLease(
+        RootHandle applicationDataRoot,
+        RootHandle recoveryRoot,
+        FileStream stream) : IDisposable, IAsyncDisposable
+    {
+        internal RootHandle RecoveryRoot { get; } = recoveryRoot;
+
+        internal void VerifyNamespace()
+        {
+            applicationDataRoot.VerifyNamespace();
+            this.RecoveryRoot.VerifyNamespace();
+        }
+
+        public void Dispose()
+        {
+            stream.Dispose();
+            this.RecoveryRoot.Dispose();
+            applicationDataRoot.Dispose();
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            this.Dispose();
+            return ValueTask.CompletedTask;
+        }
     }
 #pragma warning restore SA1202
 

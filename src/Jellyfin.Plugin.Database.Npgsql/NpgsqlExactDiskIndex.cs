@@ -240,7 +240,16 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
 
             this.cancellationToken.ThrowIfCancellationRequested();
             NpgsqlBackupFileSystem.Checkpoint("validation-index-before-sort");
-            records.Sort(ByteArrayComparer.Instance);
+            try
+            {
+                records.Sort(new CancellationAwareComparer("validation-index-sort-compare", this.cancellationToken));
+            }
+            catch (InvalidOperationException) when (this.cancellationToken.IsCancellationRequested)
+            {
+                this.cancellationToken.ThrowIfCancellationRequested();
+                throw;
+            }
+
             this.cancellationToken.ThrowIfCancellationRequested();
             var run = Path.Combine(this.root, $"run-{Guid.NewGuid():N}");
             using (var writer = OpenWrite(run))
@@ -324,7 +333,8 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
         var readers = paths.Select(path => new RecordReader(path, sorted: true, this.cancellationToken)).ToArray();
         try
         {
-            var queue = new PriorityQueue<(byte[] Value, int Reader), byte[]>(ByteArrayComparer.Instance);
+            var queue = new PriorityQueue<(byte[] Value, int Reader), byte[]>(
+                new CancellationAwareComparer("validation-index-merge-compare", this.cancellationToken));
             for (var index = 0; index < readers.Length; index++)
             {
                 this.cancellationToken.ThrowIfCancellationRequested();
@@ -517,6 +527,22 @@ internal sealed class NpgsqlExactDiskIndex : IDisposable
             => left is null ? (right is null ? 0 : -1)
                 : right is null ? 1
                 : left.AsSpan().SequenceCompareTo(right);
+    }
+
+    private sealed class CancellationAwareComparer(string checkpoint, CancellationToken cancellationToken) : IComparer<byte[]>
+    {
+        private int comparisons;
+
+        public int Compare(byte[]? left, byte[]? right)
+        {
+            if ((++this.comparisons & 15) == 0)
+            {
+                NpgsqlBackupFileSystem.Checkpoint(checkpoint);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            return ByteArrayComparer.Instance.Compare(left, right);
+        }
     }
 
     private sealed class CallbackScope(Action callback) : IDisposable

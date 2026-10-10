@@ -3,6 +3,19 @@ using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
 using MediaBrowser.Controller;
 using Npgsql;
 
+if (args.Length == 3 && args[0] == "scratch-cleanup-crash")
+{
+    using var crash = NpgsqlBackupFileSystem.InjectFaults(point =>
+    {
+        if (string.Equals(point, args[2], StringComparison.Ordinal))
+        {
+            Environment.FailFast("Intentional scratch cleanup crash at " + point);
+        }
+    });
+    NpgsqlScratchSpace.ClaimAndDelete(args[1], "validation");
+    throw new InvalidOperationException("The requested scratch cleanup crash checkpoint was not reached.");
+}
+
 if (args.Length == 4 && args[0] == "restore-recovery-lease-hold")
 {
     using var lease = NpgsqlRestoreFileSnapshot.AcquireRecoveryLeaseForTests(args[1]);
