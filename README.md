@@ -10,7 +10,7 @@ change it between releases.
 
 ## Compatibility baseline
 
-The supported production matrix is deliberately narrow: plugin `0.1.1.0`, exact
+The supported production matrix is deliberately narrow: plugin `0.1.2.0`, exact
 Jellyfin database ABI `12.2.0.0` (the vanilla Jellyfin `12.2.0.0` host), and
 PostgreSQL `16.6`. The release project targets .NET 10, compiles against the
 published `Jellyfin.Database.Implementations` 12.2.0 contract, and pins EF Core
@@ -46,7 +46,7 @@ preliminary migration container can change PostgreSQL.
 ## Installation and version selection
 
 Extract one complete release ZIP into the exact versioned directory
-`Npgsql Database_0.1.1.0`. In `database.xml`, select `PLUGIN_PROVIDER`, set
+`Npgsql Database_0.1.2.0`. In `database.xml`, select `PLUGIN_PROVIDER`, set
 `PluginName` to that exact directory name, and set `PluginAssembly` to
 `Jellyfin.Plugin.Database.Npgsql.dll`. The plugin validates the exact directory
 because vanilla Jellyfin uses a prefix search; this prevents a leftover older or
@@ -96,7 +96,7 @@ configuration is:
 <DatabaseConfigurationOptions>
   <DatabaseType>PLUGIN_PROVIDER</DatabaseType>
   <CustomProviderOptions>
-    <PluginName>Npgsql Database_0.1.1.0</PluginName>
+    <PluginName>Npgsql Database_0.1.2.0</PluginName>
     <PluginAssembly>Jellyfin.Plugin.Database.Npgsql.dll</PluginAssembly>
     <ConnectionString>Host=db.example;Database=jellyfin;Username=jellyfin_runtime;Passfile=/run/secrets/jellyfin-pgpass;SSL Mode=VerifyFull;Root Certificate=/run/secrets/postgresql-root.crt</ConnectionString>
     <Options>
@@ -113,8 +113,12 @@ configuration is:
 The command timeout is case-insensitive and bounded from 1 to 3600 seconds.
 Connection, cancellation, and pool sizes are also bounded. The provider requires
 an explicit host, database, and username, forces UTC and the `public` search path,
-and rejects connection settings that log parameters, include potentially secret
-server details, retain security information, or preserve pooled session state.
+disables PostgreSQL JIT for its connections, and rejects connection settings that
+log parameters, include potentially secret server details, retain security
+information, preserve pooled session state, or supply arbitrary server startup
+options. Disabling JIT avoids request-blocking compilation overhead on Jellyfin's
+large generated Continue Watching query; operators cannot override the fixed
+`Options=-c jit=off` session policy through `database.xml`.
 TLS certificate settings are validated and loaded before Npgsql startup, then
 their paths are removed from the normalized connection string. A configured
 passfile is preflighted, its path is removed, and a password callback safely

@@ -6,7 +6,7 @@ by copying the tracked source into an isolated directory outside the checkout.
 
 ## Compatibility policy
 
-The `0.1.1.0` release is pinned to the exact Jellyfin database ABI `12.2.0.0`,
+The `0.1.2.0` release is pinned to the exact Jellyfin database ABI `12.2.0.0`,
 the audited vanilla Jellyfin `12.2.0.0` host and its 49 code migrations, EF Core
 10.0.11, Npgsql/EF provider 10.0.3, .NET 10, and PostgreSQL 16.6. PostgreSQL 16.6
 is the exact qualified server and the only version in the support matrix; the
@@ -101,7 +101,7 @@ root, and proves the input is unchanged. Cleanup is performed by the ownership-
 checking C# harness. Do not replace it with ad-hoc recursive shell deletion.
 
 The package must be the canonical file
-`artifacts/jellyfin-plugin-database-npgsql_0.1.1.0.zip` and contain exactly the
+`artifacts/jellyfin-plugin-database-npgsql_0.1.2.0.zip` and contain exactly the
 seven entries in `build/release-policy.json`. Its adjacent `.zip.sha256` is in
 canonical SHA256SUMS form. The portable PDB and its own checksum live under
 `artifacts/symbols/`; the package builder verifies that the PDB debug identifier
@@ -120,7 +120,7 @@ and prove the branch consists only of upstream master plus standalone-plugin
 work. Do not publish, push, create a catalog entry, issue, or pull request as
 part of local qualification.
 
-Accepted limitations for `0.1.1.0` are exact Jellyfin 12.2/PostgreSQL 16.6 only;
+Accepted limitations for `0.1.2.0` are exact Jellyfin 12.2/PostgreSQL 16.6 only;
 no SQLite migration; no HA claim; no cross-server migration-backup portability;
 no qualified operator database restore; and fail-closed dashboard, API,
 scheduled, and startup full-system restore.

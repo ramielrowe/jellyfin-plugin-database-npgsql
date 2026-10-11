@@ -6,12 +6,12 @@ existing installation.
 
 ## Supported matrix and hard limits
 
-| Component | Supported by plugin 0.1.1.0 |
+| Component | Supported by plugin 0.1.2.0 |
 | --- | --- |
 | Jellyfin host | Exact database ABI `12.2.0.0`, tested with vanilla Jellyfin `12.2.0.0` |
 | PostgreSQL server | Exact qualification target and supported matrix: PostgreSQL `16.6` |
 | Runtime | .NET 10 on Linux x64, as exercised by release qualification |
-| Plugin directory | Exact `Npgsql Database_0.1.1.0` |
+| Plugin directory | Exact `Npgsql Database_0.1.2.0` |
 | Provider assembly | Exact `Jellyfin.Plugin.Database.Npgsql.dll` |
 
 Do not force an unsupported Jellyfin version by editing metadata, renaming
@@ -94,6 +94,11 @@ Use `SSL Mode=VerifyFull` and a trusted root certificate for a network database.
 The provider validates credential and certificate files before Npgsql startup,
 then removes their paths from the normalized connection string. It rejects
 connection options that expose parameter values or retain pooled session state.
+It also rejects operator-supplied `Options` and injects the fixed
+`Options=-c jit=off` startup parameter on every plugin connection. This prevents
+PostgreSQL from spending seconds compiling Jellyfin's large generated Continue
+Watching query during a synchronous HTTP request. Restart Jellyfin after upgrading
+so all physical connections are recreated with the new session policy.
 Do not put a password directly in `database.xml` unless your deployment cannot
 provide a protected passfile or certificate; configuration backups and support
 bundles must be treated as secrets if you do.
@@ -122,9 +127,9 @@ cannot contribute files to a retry.
 set -eu
 export RELEASE_DIR='/absolute/path/to/downloaded-release'
 export JELLYFIN_PLUGIN_ROOT='/absolute/path/to/jellyfin/plugins'
-export PACKAGE_NAME=jellyfin-plugin-database-npgsql_0.1.1.0.zip
-export CHECKSUM_NAME=jellyfin-plugin-database-npgsql_0.1.1.0.zip.sha256
-export PLUGIN_NAME='Npgsql Database_0.1.1.0'
+export PACKAGE_NAME=jellyfin-plugin-database-npgsql_0.1.2.0.zip
+export CHECKSUM_NAME=jellyfin-plugin-database-npgsql_0.1.2.0.zip.sha256
+export PLUGIN_NAME='Npgsql Database_0.1.2.0'
 
 cd "$RELEASE_DIR"
 sha256sum --check --strict "$CHECKSUM_NAME"
@@ -216,7 +221,7 @@ the endpoint and secret-file paths:
 <DatabaseConfigurationOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <DatabaseType>PLUGIN_PROVIDER</DatabaseType>
   <CustomProviderOptions>
-    <PluginName>Npgsql Database_0.1.1.0</PluginName>
+    <PluginName>Npgsql Database_0.1.2.0</PluginName>
     <PluginAssembly>Jellyfin.Plugin.Database.Npgsql.dll</PluginAssembly>
     <ConnectionString>Host=db.example;Port=5432;Database=jellyfin;Username=jellyfin_runtime;Passfile=/run/secrets/jellyfin-pgpass;SSL Mode=VerifyFull;Root Certificate=/run/secrets/postgresql-root.crt;Maximum Pool Size=20;Timeout=15;Cancellation Timeout=2000</ConnectionString>
     <Options>
@@ -237,6 +242,8 @@ All six selection fields are significant: `PLUGIN_PROVIDER`, `PluginName`,
 keeps the owner-only default. Connection timeout is 1–120 seconds, cancellation
 timeout is 1–30000 milliseconds, and pool sizes are bounded to 0–200 minimum
 and 1–200 maximum. The provider forces UTC and the exact `public` search path.
+It also forces PostgreSQL JIT off for plugin sessions; do not add an `Options`
+parameter to the configured connection string.
 
 Start Jellyfin only after the package, credentials, PostgreSQL service, and
 configuration are all in place. On first start the plugin validates its early

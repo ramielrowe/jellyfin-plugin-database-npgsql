@@ -64,6 +64,38 @@ stock retry-strategy transaction guard. A transient error aborts that explicit
 transaction and is returned to its owner; individual commands are never replayed
 inside it because doing so could duplicate effects.
 
+Item persistence needs one narrower conflict-resolution path. Jellyfin 12.2's
+`ItemPersistenceService.UpdateOrInsertItems` reads the existing `ItemValues`, then
+adds each missing value and its `ItemValuesMap` rows inside a caller-owned
+transaction. Concurrent scans can both observe a new tag as missing. Retrying the
+losing `SaveChanges` would be incorrect: its tracker still contains a different
+proposed `ItemValueId`, so its maps would not automatically reference the winning
+row. `NpgsqlItemValueConcurrencyInterceptor` instead runs only when that explicit
+transaction is already active. Before EF emits the tracked batch, it performs an
+atomic `INSERT ... ON CONFLICT ... DO UPDATE RETURNING ItemValueId` for each mapped
+Added `ItemValue`, marks an inserted winner unchanged, or replaces a loser's pending map
+foreign keys with the returned canonical ID. EF then saves the maps and all other
+changes in the original transaction. The physical
+`IX_ItemValues_Type_ValueInternId` constraint remains the uniqueness authority;
+the interceptor neither retries `SaveChanges` nor suppresses an unknown constraint
+failure. Added values are resolved in stable type/value/ID order to reduce
+multi-value lock inversions. Added values without a new map stay on EF's ordinary
+constraint path, so an unrelated explicit duplicate insert is still rejected.
+
+`UserDataManager.SaveUserData` has the same read-before-insert window for
+`(ItemId, UserId, CustomDataKey)`, including the playback-start path. Its conflict
+semantics differ from item-value interning: a user-data write is a complete
+last-writer-wins playback snapshot, not a delta, and the host updates its LRU cache
+only after committing. `NpgsqlUserDataConcurrencyInterceptor` therefore atomically
+inserts or updates every non-key `UserData` field for Added entries inside the
+existing caller-owned transaction, returns the trigger-owned intern ID, and marks
+the tracked entry unchanged. The host then follows its normal commit, cache
+`AddOrUpdate`, item-row rehydration, and event sequence. It never observes a false
+successful insert and never caches before the database commit. Modified entries
+continue through EF's ordinary update path. The
+`IX_UserData_ItemId_UserId_CustomDataKeyInternId` constraint remains the identity
+authority, and no `SaveChanges` retry is introduced.
+
 The initial PostgreSQL migration must install `NpgsqlTextInterning.InstallSql` in
 the same transaction which creates the owning tables, and must omit/drop the
 three unsafe full-text database primary-key constraints. The EF logical keys are
@@ -150,6 +182,31 @@ The full-host model test now uses the production provider package against a
 wholly disposable database. The provider's migration backup implementation lets
 the untouched vanilla host apply the real baseline, and the test verifies the
 resulting model and lifecycle without a bridge assembly.
+
+The concurrent-item-value regression has two layers. A deterministic PostgreSQL
+test holds two caller-owned transactions after both have read the same new tag as
+missing, then proves both operations commit, exactly one `ItemValues` row exists,
+and both `ItemValuesMap` rows reference it. The untouched-host parity test also
+issues two concurrent metadata-edit persistence operations for different scanned
+items. A test-only trigger widens the insert window, reproducing the released
+0.1.1.0 failure deterministically while verifying the fixed provider through the
+public Jellyfin API.
+
+User-data coverage follows the same two-layer structure. The deterministic test
+holds two explicit transactions after both existence checks report the same key
+missing, then verifies one row containing one complete submitted playback snapshot
+rather than a torn mixture. The untouched-host test authenticates two real sessions
+for one user and issues concurrent `Sessions/Playing` requests for the same item.
+A test-only trigger widens the insert window; both `OnPlaybackStart` calls must
+succeed, one physical row must remain, and `UserItems/{id}/UserData` must return the
+same play count as a direct no-tracking database read, proving cache consistency.
+
+No Jellyfin host patch or schema migration is required: both resolvers are provider
+runtime behavior and remain pinned to the existing Jellyfin database ABI
+12.2.0.0. The already-published 0.1.1.0 binary does not contain it and remains
+affected. The fix ships as plugin 0.1.2.0; select its new versioned installation
+directory rather than overwriting an installed 0.1.1.0 directory in place. The
+normal package/host compatibility and rollback rules still apply.
 
 The checked-in migration reproduces this finalized model exactly. It installs
 both LIKE forms and the bounded-prefix function, the non-locking interning

@@ -9,8 +9,8 @@
   "versions": [],
   "status": "Active",
   "targetAbi": "12.2.0.0",
-  "version": "0.1.1.0",
-  "changelog": "Adds qualified LinuxServer and Kubernetes seed images, secure direct Kubernetes Secret passfiles, and hardened release verification.",
+  "version": "0.1.2.0",
+  "changelog": "Fixes concurrent metadata and user-data insertion so scans share canonical ItemValues rows and playback requests preserve one complete cached UserData snapshot; disables PostgreSQL JIT on plugin connections to avoid Continue Watching query stalls.",
   "autoUpdate": false,
   "assemblies": [
     "Jellyfin.Plugin.Database.Npgsql.dll"

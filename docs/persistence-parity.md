@@ -43,7 +43,22 @@ redacted and bounded; copied hosts and raw data remain inside an ownership-
 marked ignored repository-local scratch root and are deleted by the C# harness.
 The API layer also creates six API keys concurrently, revokes one, favorites
 and deletes a scanned item, and verifies Jellyfin's detached user-data retention
-and orphan cleanup while another scanned item's graph remains intact.
+and orphan cleanup while another scanned item's graph remains intact. It also
+runs two concurrent metadata edits through the untouched host, assigning the
+same previously unseen tag to different items. A test-only PostgreSQL trigger
+widens the vulnerable insert window; both HTTP operations must succeed, one
+canonical `ItemValues` row must remain, and both `ItemValuesMap` rows must point
+to that row. A second forced race sends playback-start reports from two authenticated
+sessions for one user and item. Both real `SaveUserData` calls must succeed, the
+database must contain one complete last-writer-wins snapshot, and the user-data API
+must return the same play count from Jellyfin's LRU cache.
+
+The stock-server proof forces the test database's JIT cost threshold to zero,
+then times the first real `GET /UserItems/Resume` request. The request must return
+the expected empty Continue Watching page in under ten seconds. A separate real-
+PostgreSQL test executes `SHOW jit` through a plugin-configured context and pins
+the session value to `off`; together these checks prevent the 1,401-function JIT
+compilation path from returning to synchronous requests.
 
 ## Intentional provider differences
 
