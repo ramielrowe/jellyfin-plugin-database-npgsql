@@ -39,6 +39,9 @@ internal static class NpgsqlOptionsBootstrap
     /// <summary>The database.xml option controlling Unix passfile permissions.</summary>
     internal const string PassfilePermissionPolicyOption = "passfile-permission-policy";
 
+    /// <summary>The fixed PostgreSQL startup option used for every plugin connection.</summary>
+    internal const string PostgreSqlSessionOptions = "-c jit=off";
+
     /// <summary>The explicit policy value permitting read access through a private process group.</summary>
     internal const string OwnerOrGroupReadPolicy = "owner-or-group-read";
 
@@ -74,7 +77,10 @@ internal static class NpgsqlOptionsBootstrap
         options
             .ReplaceService<IModelCustomizer, NpgsqlModelCustomizer>()
             .ReplaceService<IRelationalDatabaseCreator, NpgsqlExistingDatabaseOnlyCreator>()
-            .AddInterceptors(NpgsqlQueryExpressionInterceptor.Instance);
+            .AddInterceptors(
+                NpgsqlQueryExpressionInterceptor.Instance,
+                NpgsqlItemValueConcurrencyInterceptor.Instance,
+                NpgsqlUserDataConcurrencyInterceptor.Instance);
         return configured;
     }
 
@@ -169,6 +175,11 @@ internal static class NpgsqlOptionsBootstrap
 
         builder.SearchPath = "public";
         builder.Timezone = "UTC";
+
+        // Jellyfin's generated Continue Watching query can cross PostgreSQL's JIT
+        // cost threshold while returning no rows, making compilation dominate a
+        // synchronous request. Apply this only after rejecting arbitrary Options.
+        builder.Options = PostgreSqlSessionOptions;
         builder.CommandTimeout = validatedOptions.CommandTimeout;
         builder.LogParameters = false;
         builder.IncludeErrorDetail = false;
