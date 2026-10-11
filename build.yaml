@@ -1,7 +1,7 @@
 ---
 name: "Npgsql Database"
 guid: "8a6e4c5e-2185-45df-a30f-cc828529330b"
-version: "0.1.0.0"
+version: "0.1.1.0"
 targetAbi: "12.2.0.0"
 framework: "net10.0"
 overview: "PostgreSQL database provider for Jellyfin; full-system restore is unsupported"
@@ -20,5 +20,5 @@ artifacts:
   - "LICENSE"
   - "THIRD-PARTY-NOTICES.md"
 changelog: >
-  Initial standalone provider package with a fail-closed full-system restore
-  guard.
+  Adds qualified LinuxServer and Kubernetes seed images, secure direct
+  Kubernetes Secret passfiles, and hardened release verification.

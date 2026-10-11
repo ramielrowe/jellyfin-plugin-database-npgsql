@@ -50,7 +50,11 @@ jobs:
           grep -Fq 'type: Recreate' docker/kubernetes/deployment.yaml
           grep -Fq 'automountServiceAccountToken: false' docker/kubernetes/deployment.yaml
           grep -Fq 'kubernetes.io/arch: amd64' docker/kubernetes/deployment.yaml
-          ! grep -Fq 'fsGroup' docker/kubernetes/deployment.yaml
+          grep -Fq 'fsGroup: 1000' docker/kubernetes/deployment.yaml
+          grep -Fq 'fsGroupChangePolicy: OnRootMismatch' docker/kubernetes/deployment.yaml
+          grep -Fq 'supplementalGroupsPolicy: Strict' docker/kubernetes/deployment.yaml
+          grep -Fq 'secretName: REPLACE_WITH_POSTGRES_PASSFILE_SECRET' docker/kubernetes/deployment.yaml
+          grep -Fq 'defaultMode: 0400' docker/kubernetes/deployment.yaml
           grep -Fq 'pre-owned by `1000:1000`' docker/kubernetes/README.md
           grep -Fq 'linuxserver/jellyfin:12.2ubu2604-ls53@sha256:1bb4f88d822a0510bb3604b68aacb80d77c1d2a30181e500090c65111b98723b' docker/kubernetes/deployment.yaml
           test "$(printf '%s\n' \

@@ -5,7 +5,7 @@ export LC_ALL=C
 
 image=${1:-jellyfin-npgsql-linuxserver:test}
 postgres_image='postgres:16.6@sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36'
-installation_directory='Npgsql Database_0.1.0.0'
+installation_directory='Npgsql Database_0.1.1.0'
 password='jellyfin-smoke-password'
 suffix="${GITHUB_RUN_ID:-local}-$$"
 network="jellyfin-npgsql-smoke-$suffix"
@@ -103,7 +103,7 @@ verify_plugin() {
     docker exec "$app" /bin/bash -euo pipefail -c '
         export LC_ALL=C
         seed=/usr/local/share/jellyfin-npgsql
-        destination="/config/data/plugins/Npgsql Database_0.1.0.0"
+        destination="/config/data/plugins/Npgsql Database_0.1.1.0"
         expected=$(mktemp)
         actual=$(mktemp)
         trap '\''rm -f -- "$expected" "$actual"'\'' EXIT
@@ -117,7 +117,7 @@ verify_plugin() {
             test "$(stat -c "%a %u:%g" "$destination/$name")" = "640 $(id -u abc):$(id -g abc)"
         done < "$expected"
         grep -Fq "<DatabaseType>PLUGIN_PROVIDER</DatabaseType>" /config/database.xml
-        grep -Fq "<PluginName>Npgsql Database_0.1.0.0</PluginName>" /config/database.xml
+        grep -Fq "<PluginName>Npgsql Database_0.1.1.0</PluginName>" /config/database.xml
         test -z "$(find /config -type f \( -name "jellyfin.db" -o -name "jellyfin.db-*" -o -name "*.sqlite" -o -name "*.sqlite3" \) -print -quit)"
     '
     # Do not use grep -q here: with pipefail it can close the pipe early and

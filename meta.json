@@ -9,8 +9,8 @@
   "versions": [],
   "status": "Active",
   "targetAbi": "12.2.0.0",
-  "version": "0.1.0.0",
-  "changelog": "Initial standalone provider package. Full-system restore is disabled while PostgreSQL is selected; provider migration rollback remains supported.",
+  "version": "0.1.1.0",
+  "changelog": "Adds qualified LinuxServer and Kubernetes seed images, secure direct Kubernetes Secret passfiles, and hardened release verification.",
   "autoUpdate": false,
   "assemblies": [
     "Jellyfin.Plugin.Database.Npgsql.dll"

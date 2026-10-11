@@ -6,7 +6,7 @@ export LC_ALL=C
 image=${1:-jellyfin-npgsql-seed:test}
 linuxserver_image='lscr.io/linuxserver/jellyfin:12.2ubu2604-ls53@sha256:1bb4f88d822a0510bb3604b68aacb80d77c1d2a30181e500090c65111b98723b'
 postgres_image='postgres:16.6@sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36'
-installation_directory='Npgsql Database_0.1.0.0'
+installation_directory='Npgsql Database_0.1.1.0'
 password='jellyfin-seed-smoke-password'
 suffix="${GITHUB_RUN_ID:-local}-$$"
 prefix="jellyfin-npgsql-seed-$suffix"
@@ -92,7 +92,7 @@ assert_conflict_unchanged() {
 assert_exact_plugin() {
     local volume=$1 uid=${2:-1000} gid=${3:-1000}
     root_in_volume "$volume" '
-        destination="/config/data/plugins/Npgsql Database_0.1.0.0"
+        destination="/config/data/plugins/Npgsql Database_0.1.1.0"
         test "$(stat -c "%a %u:%g" "$destination")" = "750 $1:$2"
         find "$destination" -mindepth 1 -maxdepth 1 -type f -printf "%f\n" | sort >/tmp/actual
         sort /usr/local/share/jellyfin-npgsql/package-files.txt >/tmp/expected
@@ -150,43 +150,43 @@ make_conflict_volume() {
 
 make_conflict_volume content
 conflict=$conflict_volume
-root_in_volume "$conflict" 'printf corrupt >>"/config/data/plugins/Npgsql Database_0.1.0.0/Npgsql.dll"'
+root_in_volume "$conflict" 'printf corrupt >>"/config/data/plugins/Npgsql Database_0.1.1.0/Npgsql.dll"'
 assert_conflict_unchanged "$conflict" content
 
 make_conflict_volume missing
 conflict=$conflict_volume
-root_in_volume "$conflict" 'rm -- "/config/data/plugins/Npgsql Database_0.1.0.0/Npgsql.dll"'
+root_in_volume "$conflict" 'rm -- "/config/data/plugins/Npgsql Database_0.1.1.0/Npgsql.dll"'
 assert_conflict_unchanged "$conflict" missing
 
 make_conflict_volume extra
 conflict=$conflict_volume
-root_in_volume "$conflict" 'touch "/config/data/plugins/Npgsql Database_0.1.0.0/extra.dll"; chown 1000:1000 "/config/data/plugins/Npgsql Database_0.1.0.0/extra.dll"'
+root_in_volume "$conflict" 'touch "/config/data/plugins/Npgsql Database_0.1.1.0/extra.dll"; chown 1000:1000 "/config/data/plugins/Npgsql Database_0.1.1.0/extra.dll"'
 assert_conflict_unchanged "$conflict" extra
 
 make_conflict_volume nonregular
 conflict=$conflict_volume
-root_in_volume "$conflict" 'mkdir "/config/data/plugins/Npgsql Database_0.1.0.0/untrusted-directory"; chown 1000:1000 "/config/data/plugins/Npgsql Database_0.1.0.0/untrusted-directory"'
+root_in_volume "$conflict" 'mkdir "/config/data/plugins/Npgsql Database_0.1.1.0/untrusted-directory"; chown 1000:1000 "/config/data/plugins/Npgsql Database_0.1.1.0/untrusted-directory"'
 assert_conflict_unchanged "$conflict" nonregular
 
 make_conflict_volume symlink
 conflict=$conflict_volume
-root_in_volume "$conflict" 'ln -s Npgsql.dll "/config/data/plugins/Npgsql Database_0.1.0.0/linked.dll"'
+root_in_volume "$conflict" 'ln -s Npgsql.dll "/config/data/plugins/Npgsql Database_0.1.1.0/linked.dll"'
 assert_conflict_unchanged "$conflict" symlink
 
 make_conflict_volume mode
 conflict=$conflict_volume
-root_in_volume "$conflict" 'chmod 0660 "/config/data/plugins/Npgsql Database_0.1.0.0/Npgsql.dll"'
+root_in_volume "$conflict" 'chmod 0660 "/config/data/plugins/Npgsql Database_0.1.1.0/Npgsql.dll"'
 assert_conflict_unchanged "$conflict" mode
 
 make_conflict_volume owner
 conflict=$conflict_volume
-root_in_volume "$conflict" 'chown 0:0 "/config/data/plugins/Npgsql Database_0.1.0.0/Npgsql.dll"'
+root_in_volume "$conflict" 'chown 0:0 "/config/data/plugins/Npgsql Database_0.1.1.0/Npgsql.dll"'
 assert_conflict_unchanged "$conflict" owner
 
 new_volume destination-symlink
 conflict=$created_volume
 prepare_volume "$conflict"
-root_in_volume "$conflict" 'mkdir -p /config/data/plugins; chown -R 1000:1000 /config/data; ln -s /tmp "/config/data/plugins/Npgsql Database_0.1.0.0"'
+root_in_volume "$conflict" 'mkdir -p /config/data/plugins; chown -R 1000:1000 /config/data; ln -s /tmp "/config/data/plugins/Npgsql Database_0.1.1.0"'
 assert_conflict_unchanged "$conflict" destination-symlink
 
 # Corrupt seed names and symlink components fail before touching the PVC.
@@ -236,7 +236,7 @@ root_in_volume "$system_volume" '
 <DatabaseConfigurationOptions>
   <DatabaseType>PLUGIN_PROVIDER</DatabaseType>
   <CustomProviderOptions>
-    <PluginName>Npgsql Database_0.1.0.0</PluginName>
+    <PluginName>Npgsql Database_0.1.1.0</PluginName>
     <PluginAssembly>Jellyfin.Plugin.Database.Npgsql.dll</PluginAssembly>
     <ConnectionString>Host=db;Port=5432;Database=jellyfin;Username=jellyfin;Password=jellyfin-seed-smoke-password</ConnectionString>
     <Options />

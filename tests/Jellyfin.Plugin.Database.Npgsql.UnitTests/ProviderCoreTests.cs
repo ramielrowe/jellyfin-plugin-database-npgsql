@@ -29,7 +29,7 @@ public sealed class ProviderCoreTests
             <DatabaseConfigurationOptions>
               <DatabaseType>PLUGIN_PROVIDER</DatabaseType>
               <CustomProviderOptions>
-                <PluginName>Npgsql Database_0.1.0.0</PluginName>
+                <PluginName>Npgsql Database_0.1.1.0</PluginName>
                 <PluginAssembly>Jellyfin.Plugin.Database.Npgsql.dll</PluginAssembly>
                 <ConnectionString>Host=database.internal;Database=jellyfin;Username=jellyfin_runtime;Password=secret</ConnectionString>
                 <Options>
