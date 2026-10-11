@@ -17,7 +17,10 @@ internal sealed class UtcDateTimeValueConverter : ValueConverter<DateTime, DateT
     {
     }
 
-    private static DateTime Normalize(DateTime value)
+    /// <summary>Normalizes a value with the same semantics used by the provider conversion.</summary>
+    /// <param name="value">The date-time value to normalize.</param>
+    /// <returns>The value expressed as UTC.</returns>
+    internal static DateTime Normalize(DateTime value)
         => value.Kind switch
         {
             DateTimeKind.Utc => value,
