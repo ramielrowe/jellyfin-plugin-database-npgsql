@@ -82,6 +82,14 @@ Mode `0400` is also accepted. Group or other permission bits are rejected.
 On Windows, restrict the equivalent ACLs to the Jellyfin service identity and
 trusted administrators; the plugin does not interpret Windows ACL inheritance.
 
+For a Kubernetes Secret-volume passfile, the explicit
+`passfile-permission-policy=owner-or-group-read` custom option also permits mode
+`0440`/`0640` on Linux when the file's group is one of Jellyfin's actual process
+groups. Group write, group execute, all other permissions, and group-readable
+TLS private keys remain rejected. Use a dedicated Pod `fsGroup`; do not use a
+shared application group. See the [Kubernetes image guide](../docker/kubernetes/README.md#postgresql-passfile-secret)
+for the complete configuration and PVC ownership caveats.
+
 Use `SSL Mode=VerifyFull` and a trusted root certificate for a network database.
 The provider validates credential and certificate files before Npgsql startup,
 then removes their paths from the normalized connection string. It rejects
@@ -223,11 +231,12 @@ the endpoint and secret-file paths:
 ```
 
 All six selection fields are significant: `PLUGIN_PROVIDER`, `PluginName`,
-`PluginAssembly`, `ConnectionString`, `Options`, and `NoLock`. Only
-`command-timeout` is accepted in `Options`; it is 1–3600 seconds. Connection
-timeout is 1–120 seconds, cancellation timeout is 1–30000 milliseconds, and
-pool sizes are bounded to 0–200 minimum and 1–200 maximum. The provider forces
-UTC and the exact `public` search path.
+`PluginAssembly`, `ConnectionString`, `Options`, and `NoLock`. The
+`command-timeout` option accepts 1–3600 seconds. The optional
+`passfile-permission-policy` accepts only `owner-or-group-read`; omitting it
+keeps the owner-only default. Connection timeout is 1–120 seconds, cancellation
+timeout is 1–30000 milliseconds, and pool sizes are bounded to 0–200 minimum
+and 1–200 maximum. The provider forces UTC and the exact `public` search path.
 
 Start Jellyfin only after the package, credentials, PostgreSQL service, and
 configuration are all in place. On first start the plugin validates its early

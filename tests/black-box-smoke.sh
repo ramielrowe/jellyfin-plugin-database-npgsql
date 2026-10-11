@@ -731,6 +731,25 @@ tree.write(path, encoding="utf-8", xml_declaration=True)' \
         "$RUN_ROOT/runtime/config/database.xml"
 }
 
+set_database_option() {
+    local key=$1
+    local value=$2
+    python3 - "$RUN_ROOT/runtime/config/database.xml" "$key" "$value" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+path, key, value = sys.argv[1:]
+tree = ET.parse(path)
+options = tree.find("./CustomProviderOptions/Options")
+if options is None:
+    raise SystemExit("database.xml has no Options element")
+option = ET.SubElement(options, "CustomDatabaseOption")
+ET.SubElement(option, "Key").text = key
+ET.SubElement(option, "Value").text = value
+tree.write(path, encoding="utf-8", xml_declaration=True)
+PY
+}
+
 assert_log_redacted() {
     local log_file=$1
     shift
@@ -1167,11 +1186,27 @@ for insecure_mode in 0640 0644 0666; do
     set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Passfile=$INSECURE_PASSFILE"
     assert_secret_file_rejected \
         "insecure-passfile-$insecure_mode" \
-        "Passfile must name a readable, well-formed PostgreSQL password file and, on Unix, use owner-only permissions" \
+        "Passfile must name a readable, well-formed PostgreSQL password file and, on Unix, satisfy the configured passfile permission policy" \
         "$INSECURE_PASSFILE" \
         "$SECRET_FILE_MARKER"
     chmod 600 "$INSECURE_PASSFILE"
 done
+
+# Kubernetes Secret projections commonly use root:<fsGroup> mode 0440. This
+# process-owned 0640 file exercises the same group-read decision: the explicit
+# policy accepts read-only access by a group the Jellyfin process actually has,
+# while the default tests above continue to reject it.
+GROUP_READABLE_PASSFILE="$RUN_ROOT/sensitive-private-group-$SMOKE_ID.pgpass"
+printf '127.0.0.1:%s:jellyfin:jellyfin:%s\n' "$POSTGRES_PORT" "$SECRET_FILE_MARKER" >"$GROUP_READABLE_PASSFILE"
+chmod 0640 "$GROUP_READABLE_PASSFILE"
+restore_database_configuration
+set_database_connection_string "Host=127.0.0.1;Port=$POSTGRES_PORT;Database=jellyfin;Username=jellyfin;Passfile=$GROUP_READABLE_PASSFILE"
+set_database_option "passfile-permission-policy" "owner-or-group-read"
+assert_secret_configuration_accepted \
+    "private-group-readable-passfile" \
+    "$GROUP_READABLE_PASSFILE" \
+    "$SECRET_FILE_MARKER"
+chmod 0600 "$GROUP_READABLE_PASSFILE"
 
 MISSING_ROOT_CERTIFICATE="$RUN_ROOT/sensitive-missing-root-$SMOKE_ID.pem"
 restore_database_configuration
@@ -1505,7 +1540,7 @@ assert_pristine_host_unchanged
     echo "early_failure_guards=missing-npgsql-driver,missing-npgsql-ef-provider,ambiguous-prefix,unsupported-abi"
     echo "normal_plugin_scans=active-guard,active-restart,malformed-metadata-fail-closed"
     echo "passfile_multi_host_failover=true"
-    echo "credential_file_modes=0600-accepted,0640-0644-0666-rejected"
+    echo "credential_file_modes=0600-default,0640-private-group-opt-in,0644-0666-rejected"
 } | tee "$RUN_ROOT/evidence.txt"
 
 echo "Black-box smoke test passed. Sanitized evidence will be retained under $RUN_ROOT"

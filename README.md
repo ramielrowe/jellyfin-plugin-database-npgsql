@@ -140,16 +140,24 @@ remains private callback state so it can be reopened, but neither the path nor
 any credential is placed in the normalized connection string or provider
 diagnostics.
 
-On Unix, a configured passfile, PEM client private key, or client PFX/PKCS#12
-file must have no group or other permission bits; mode `0600` is recommended
-(`0400` is also accepted). The check uses the opened file handle, so a symlink
-is judged by the permissions of the target actually read and a pathname swap
-cannot substitute an unchecked file. Certificate-only PEM files may remain
-world-readable. On Windows, Unix mode checks do not apply: the plugin preloads
-the configured files and removes their paths, but it does not attempt to
-interpret Windows ACL inheritance. Administrators must restrict each passfile,
-client private key, and client PFX/PKCS#12 ACL to the Jellyfin service identity
-and trusted administrators.
+On Unix, the default passfile policy and every client private-key policy require
+no group or other permission bits; mode `0600` is recommended (`0400` is also
+accepted). Linux deployments that cannot control the passfile owner, notably a
+Kubernetes Secret projection, may explicitly set the custom option
+`passfile-permission-policy` to `owner-or-group-read`. That policy additionally
+accepts group read only when the opened file's GID is one of the Jellyfin
+process's effective or supplementary groups; group write, group execute, and
+every other permission remain forbidden. It does not relax PEM key or
+PFX/PKCS#12 permissions. This is intentionally opt-in because it differs from
+libpq's owner-only passfile convention and every member of the selected group
+can read the credential. The check uses the opened file handle, so a symlink is
+judged by the permissions and GID of the target actually read and a pathname
+swap cannot substitute an unchecked file. Certificate-only PEM files may
+remain world-readable. On Windows, Unix mode checks do not apply: the plugin
+preloads the configured files and removes their paths, but it does not attempt
+to interpret Windows ACL inheritance. Administrators must restrict each
+passfile, client private key, and client PFX/PKCS#12 ACL to the Jellyfin service
+identity and trusted administrators.
 
 Npgsql 10.0.3 recognizes several PostgreSQL environment fallbacks. To keep
 `database.xml` authoritative, startup rejects `PGUSER`, `PGPASSWORD`,

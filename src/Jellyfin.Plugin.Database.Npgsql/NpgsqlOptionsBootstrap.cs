@@ -36,6 +36,12 @@ internal static class NpgsqlOptionsBootstrap
     /// <summary>The database.xml option for overriding the command timeout.</summary>
     internal const string CommandTimeoutOption = "command-timeout";
 
+    /// <summary>The database.xml option controlling Unix passfile permissions.</summary>
+    internal const string PassfilePermissionPolicyOption = "passfile-permission-policy";
+
+    /// <summary>The explicit policy value permitting read access through a private process group.</summary>
+    internal const string OwnerOrGroupReadPolicy = "owner-or-group-read";
+
     /// <summary>
     /// Validates database.xml settings and configures EF after adjacent dependencies are loaded.
     /// </summary>
@@ -107,7 +113,7 @@ internal static class NpgsqlOptionsBootstrap
         RequireValue(builder.Database, "Database");
         RequireValue(builder.Username, "Username");
 
-        var commandTimeout = ReadCommandTimeout(customOptions, builder.CommandTimeout);
+        var validatedOptions = ReadCustomOptions(customOptions, builder.CommandTimeout);
         ValidateRange("connection Timeout", builder.Timeout, MinimumCommandTimeoutSeconds, MaximumConnectionTimeoutSeconds);
         ValidateRange(
             "connection Cancellation Timeout",
@@ -157,11 +163,13 @@ internal static class NpgsqlOptionsBootstrap
         }
 
         var passfileConfigured = !string.IsNullOrWhiteSpace(builder.Passfile);
-        var configureDataSource = NpgsqlConfigurationSecurity.PrepareSecretFiles(builder);
+        var configureDataSource = NpgsqlConfigurationSecurity.PrepareSecretFiles(
+            builder,
+            validatedOptions.PassfilePermissionPolicy);
 
         builder.SearchPath = "public";
         builder.Timezone = "UTC";
-        builder.CommandTimeout = commandTimeout;
+        builder.CommandTimeout = validatedOptions.CommandTimeout;
         builder.LogParameters = false;
         builder.IncludeErrorDetail = false;
         builder.IncludeFailedBatchedCommand = false;
@@ -179,15 +187,16 @@ internal static class NpgsqlOptionsBootstrap
             builder.SslMode.ToString(),
             builder.Pooling,
             passfileConfigured,
-            commandTimeout,
+            validatedOptions.CommandTimeout,
             configureDataSource);
     }
 
-    private static int ReadCommandTimeout(
+    private static ValidatedCustomOptions ReadCustomOptions(
         Collection<CustomDatabaseOption>? customOptions,
         int connectionStringTimeout)
     {
-        CustomDatabaseOption? configuredOption = null;
+        CustomDatabaseOption? commandTimeoutOption = null;
+        CustomDatabaseOption? passfilePermissionPolicyOption = null;
         if (customOptions is not null)
         {
             foreach (var option in customOptions)
@@ -197,23 +206,41 @@ internal static class NpgsqlOptionsBootstrap
                     throw ConfigurationError("CustomProviderOptions.Options contains an empty key");
                 }
 
-                if (!string.Equals(option.Key, CommandTimeoutOption, StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(option.Key, CommandTimeoutOption, StringComparison.OrdinalIgnoreCase))
                 {
-                    throw ConfigurationError($"CustomProviderOptions.Options contains unsupported key '{option.Key}'");
+                    if (commandTimeoutOption is not null)
+                    {
+                        throw ConfigurationError(
+                            $"CustomProviderOptions.Options contains duplicate key '{CommandTimeoutOption}'");
+                    }
+
+                    commandTimeoutOption = option;
+                    continue;
                 }
 
-                if (configuredOption is not null)
+                if (string.Equals(option.Key, PassfilePermissionPolicyOption, StringComparison.OrdinalIgnoreCase))
                 {
-                    throw ConfigurationError($"CustomProviderOptions.Options contains duplicate key '{CommandTimeoutOption}'");
+                    if (passfilePermissionPolicyOption is not null)
+                    {
+                        throw ConfigurationError(
+                            $"CustomProviderOptions.Options contains duplicate key '{PassfilePermissionPolicyOption}'");
+                    }
+
+                    passfilePermissionPolicyOption = option;
+                    continue;
                 }
 
-                configuredOption = option;
+                throw ConfigurationError($"CustomProviderOptions.Options contains unsupported key '{option.Key}'");
             }
         }
 
         var commandTimeout = connectionStringTimeout;
-        if (configuredOption is not null
-            && !int.TryParse(configuredOption.Value, NumberStyles.None, CultureInfo.InvariantCulture, out commandTimeout))
+        if (commandTimeoutOption is not null
+            && !int.TryParse(
+                commandTimeoutOption.Value,
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out commandTimeout))
         {
             throw ConfigurationError(
                 $"CustomProviderOptions.Options[{CommandTimeoutOption}] must be a whole number of seconds");
@@ -224,7 +251,23 @@ internal static class NpgsqlOptionsBootstrap
             commandTimeout,
             MinimumCommandTimeoutSeconds,
             MaximumCommandTimeoutSeconds);
-        return commandTimeout;
+
+        var passfilePermissionPolicy = PassfilePermissionPolicy.OwnerOnly;
+        if (passfilePermissionPolicyOption is not null)
+        {
+            if (!string.Equals(
+                    passfilePermissionPolicyOption.Value,
+                    OwnerOrGroupReadPolicy,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw ConfigurationError(
+                    $"CustomProviderOptions.Options[{PassfilePermissionPolicyOption}] must be '{OwnerOrGroupReadPolicy}'");
+            }
+
+            passfilePermissionPolicy = PassfilePermissionPolicy.OwnerOrGroupRead;
+        }
+
+        return new ValidatedCustomOptions(commandTimeout, passfilePermissionPolicy);
     }
 
     private static void RequireValue(string? value, string name)
@@ -245,4 +288,8 @@ internal static class NpgsqlOptionsBootstrap
 
     private static InvalidOperationException ConfigurationError(string detail)
         => new($"The Npgsql provider configuration in database.xml is invalid: {detail}. No database connection was attempted.");
+
+    private readonly record struct ValidatedCustomOptions(
+        int CommandTimeout,
+        PassfilePermissionPolicy PassfilePermissionPolicy);
 }

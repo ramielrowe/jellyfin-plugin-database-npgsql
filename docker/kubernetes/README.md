@@ -38,15 +38,24 @@ that can create SQLite state before the provider is selected.
 The init process runs as numeric UID/GID `1000:1000`, with no passwd entry,
 read-only root filesystem, no Linux capabilities, and only its memory-backed
 `/tmp` plus the config PVC writable. Its UID/GID must equal LinuxServer's
-`PUID`/`PGID`. It never changes ownership. The PVC must therefore already
-be pre-provisioned and pre-owned by `1000:1000`, allow that identity to create
-`/config/data/plugins`, and retain Unix modes and ownership. The reference Pod
-deliberately does **not** set `fsGroup` or `fsGroupChangePolicy`: kubelet and
-some CSI drivers may recursively rewrite ownership or permission bits before
-the init container starts, which would violate the installer's fail-closed,
-no-mutation contract. Arrange ownership out of band using the storage system's
-provisioning controls. An ownership or mode mismatch in an existing plugin
-directory is a hard error and is left untouched.
+`PUID`/`PGID`. It never changes ownership. The PVC must therefore already be
+pre-provisioned and pre-owned by `1000:1000`, allow that identity to create
+`/config/data/plugins`, and retain Unix modes and ownership. An ownership or
+mode mismatch in an existing plugin directory is a hard error and is left
+untouched.
+
+The reference Pod sets `fsGroup: 1000` so a native Secret projection can be
+read without copying it. That setting is Pod-wide and can also rewrite the
+config PVC. Pre-provision the PVC root with GID `1000`, the setgid bit, and at
+least owner/group read, write, and search permissions (for example mode
+`2770`), so `fsGroupChangePolicy: OnRootMismatch` skips recursive changes.
+Confirm this behavior with the actual storage driver before production: a CSI
+driver that handles `VOLUME_MOUNT_GROUP` itself ignores
+`fsGroupChangePolicy`. If kubelet or the driver rewrites the installed plugin's
+required `0750` directory and `0640` files, the seed installer fails closed.
+The manifest also uses `supplementalGroupsPolicy: Strict`, which requires
+Kubernetes 1.33 or later, to prevent image-defined supplementary groups from
+silently widening access.
 
 The installer validates immutable seed metadata, exact allowlist, file types,
 and checksums. It rejects symbolic path components and conflicting existing
@@ -60,6 +69,79 @@ the active plugin root and read the
 [installation lifecycle](../../docs/installation-lifecycle.md). A package-only
 rollback after a successful schema migration is unsupported without separately
 qualified PostgreSQL recovery.
+
+## PostgreSQL passfile Secret
+
+Yes, a native Secret can be mounted directly without a passfile-copy init
+container. The reference manifest uses the broadly available group-based
+model:
+
+- the Secret volume requests `defaultMode: 0400`;
+- Pod `fsGroup: 1000` makes the projected file root-owned, group `1000`, and
+  effectively mode `0440`;
+- Jellyfin runs as UID/GID `1000:1000`; and
+- `database.xml` explicitly opts into the plugin's private-group policy.
+
+Create the Secret from a local mode-`0600` passfile rather than placing its
+value in a checked-in manifest:
+
+```sh
+kubectl create secret generic jellyfin-postgres-passfile \
+  --from-file=pgpass=/secure/local/path/jellyfin.pgpass \
+  --from-file=root.crt=/secure/local/path/postgresql-root.crt
+```
+
+Replace `REPLACE_WITH_POSTGRES_PASSFILE_SECRET` in `deployment.yaml`, then use
+the mounted path and policy in the pre-provisioned `database.xml`:
+
+```xml
+<ConnectionString>Host=postgres.example;Port=5432;Database=jellyfin;Username=jellyfin_runtime;Passfile=/run/secrets/postgresql/pgpass;SSL Mode=VerifyFull;Root Certificate=/run/secrets/postgresql/root.crt</ConnectionString>
+<Options>
+  <CustomDatabaseOption>
+    <Key>passfile-permission-policy</Key>
+    <Value>owner-or-group-read</Value>
+  </CustomDatabaseOption>
+</Options>
+```
+
+The opt-in policy accepts owner-only files as before. On Linux it additionally
+accepts group read only when the opened file's GID is one of Jellyfin's actual
+effective or supplementary groups. It still rejects group write, group
+execute, every `other` bit, and group-readable TLS private keys. The permission
+and GID are rechecked on every passfile open. This deliberately differs from
+libpq's owner-only passfile convention, so use a dedicated `fsGroup`, mount the
+Secret only into the Jellyfin container, keep `supplementalGroupsPolicy:
+Strict`, and do not add sidecars to that group unless they are trusted with the
+database credential.
+
+Do not mount the individual key with `subPath`: Kubernetes does not propagate
+Secret updates through a `subPath` mount. A normal Secret-volume update becomes
+visible to subsequent passfile opens, although existing pooled PostgreSQL
+connections continue using their established authentication until replaced.
+Kubernetes Secret objects are only base64-encoded by default; protect Secret
+API access with narrow RBAC and enable control-plane encryption at rest. Node
+administrators and kubelet-level access remain inside the credential trust
+boundary.
+
+Kubernetes 1.37 offers a closer owner-only model through the alpha, disabled by
+default `AtomicWriteVolumeUserFields` feature. When every relevant component
+has that gate enabled, set `secret.defaultUser: 1000` with `defaultMode: 0400`,
+remove the passfile policy option, and omit `fsGroup` if no other volume needs
+it. This avoids group exposure and Pod-wide PVC permission changes, but an
+alpha API is not the portable production recommendation yet. On older clusters
+where the PVC cannot safely coexist with Pod-wide `fsGroup`, a Secret Store CSI
+driver with verified UID support or the copy-to-`emptyDir` init-container model
+remains necessary.
+
+These recommendations follow Kubernetes' [Secret-volume and file-owner
+contract](https://kubernetes.io/docs/concepts/storage/volumes/#secret), its
+[documented `fsGroup` and `OnRootMismatch`
+behavior](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#configure-volume-permission-and-ownership-change-policy-for-pods),
+and the kubelet's [read-only `0440` group-permission
+mask](https://github.com/kubernetes/kubernetes/blob/v1.37.1/pkg/volume/volume_linux.go).
+The opt-in is necessary because PostgreSQL's [standard passfile
+rule](https://www.postgresql.org/docs/current/libpq-pgpass.html) rejects all
+group and world access.
 
 ## Local build and qualification
 

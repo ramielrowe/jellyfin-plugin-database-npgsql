@@ -268,6 +268,25 @@ public sealed class ReleaseContractTests
         Assert.DoesNotContain("JELLYFIN_HOST_PUBLISH: ../host", workflow, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void KubernetesDeploymentDocumentsDirectPrivateGroupPassfileProjection()
+    {
+        var root = FindRepositoryRoot();
+        var deployment = File.ReadAllText(Path.Combine(root, "docker", "kubernetes", "deployment.yaml"));
+        var guide = File.ReadAllText(Path.Combine(root, "docker", "kubernetes", "README.md"));
+
+        Assert.Contains("fsGroup: 1000", deployment, StringComparison.Ordinal);
+        Assert.Contains("fsGroupChangePolicy: OnRootMismatch", deployment, StringComparison.Ordinal);
+        Assert.Contains("supplementalGroupsPolicy: Strict", deployment, StringComparison.Ordinal);
+        Assert.Contains("secretName: REPLACE_WITH_POSTGRES_PASSFILE_SECRET", deployment, StringComparison.Ordinal);
+        Assert.Contains("defaultMode: 0400", deployment, StringComparison.Ordinal);
+        Assert.Contains("mountPath: /run/secrets/postgresql", deployment, StringComparison.Ordinal);
+        Assert.Contains("passfile-permission-policy", guide, StringComparison.Ordinal);
+        Assert.Contains("owner-or-group-read", guide, StringComparison.Ordinal);
+        Assert.Contains("AtomicWriteVolumeUserFields", guide, StringComparison.Ordinal);
+        Assert.Contains("copy-to-`emptyDir`", guide, StringComparison.Ordinal);
+    }
+
     private static bool HasFinalScansAfterBlackBox(string script)
     {
         const string MetadataAssertion = "assert_relocated_obj_metadata \"$ORIGINAL_CHECKOUT\" \"$RELOCATED\"";

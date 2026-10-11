@@ -9,6 +9,16 @@ using Npgsql;
 
 namespace Jellyfin.Plugin.Database.Npgsql;
 
+/// <summary>Controls which Unix permission models are accepted for a PostgreSQL passfile.</summary>
+internal enum PassfilePermissionPolicy
+{
+    /// <summary>Requires every group and other permission bit to be clear.</summary>
+    OwnerOnly,
+
+    /// <summary>Also permits group read when the file group belongs to the Jellyfin process.</summary>
+    OwnerOrGroupRead,
+}
+
 /// <summary>
 /// Owns security-sensitive configuration checks before Npgsql can consume ambient state or named files.
 /// </summary>
@@ -38,13 +48,19 @@ internal static class NpgsqlConfigurationSecurity
 
     private const long MaximumPassfileBytes = 1024 * 1024;
     private const long MaximumCertificateBytes = 4 * 1024 * 1024;
-    private const UnixFileMode GroupOrOtherPermissions =
+    private const UnixFileMode GroupPermissions =
         UnixFileMode.GroupRead
         | UnixFileMode.GroupWrite
-        | UnixFileMode.GroupExecute
-        | UnixFileMode.OtherRead
+        | UnixFileMode.GroupExecute;
+
+    private const UnixFileMode OtherPermissions =
+        UnixFileMode.OtherRead
         | UnixFileMode.OtherWrite
         | UnixFileMode.OtherExecute;
+
+    private const UnixFileMode GroupWriteOrExecute =
+        UnixFileMode.GroupWrite
+        | UnixFileMode.GroupExecute;
 
     /// <summary>
     /// Rejects ambient PostgreSQL settings so database.xml is the sole configuration authority.
@@ -65,8 +81,11 @@ internal static class NpgsqlConfigurationSecurity
     /// Validates configured secret files without allowing their paths or contents into an exception chain.
     /// </summary>
     /// <param name="builder">The parsed database.xml connection settings.</param>
+    /// <param name="passfilePermissionPolicy">The configured Unix passfile permission policy.</param>
     /// <returns>A data-source configurator that owns or safely resolves the secret material, or <see langword="null" />.</returns>
-    internal static Action<NpgsqlDataSourceBuilder>? PrepareSecretFiles(NpgsqlConnectionStringBuilder builder)
+    internal static Action<NpgsqlDataSourceBuilder>? PrepareSecretFiles(
+        NpgsqlConnectionStringBuilder builder,
+        PassfilePermissionPolicy passfilePermissionPolicy)
     {
         ArgumentNullException.ThrowIfNull(builder);
 
@@ -82,7 +101,7 @@ internal static class NpgsqlConfigurationSecurity
             if (builder.Password is null)
             {
                 passfilePath = builder.Passfile;
-                ValidateConfiguredFile(passfilePath, MaximumPassfileBytes, requireOwnerOnlyOnUnix: true);
+                ValidateConfiguredFile(passfilePath, MaximumPassfileBytes, passfilePermissionPolicy);
             }
 
             builder.Passfile = null;
@@ -145,8 +164,9 @@ internal static class NpgsqlConfigurationSecurity
                 // child pool. Resolve against those per-pool settings at open
                 // time so each host gets its own first matching credential.
                 dataSourceBuilder.UsePasswordProvider(
-                    settings => ResolvePassfilePassword(passfilePath!, settings)!,
-                    (settings, _) => ValueTask.FromResult(ResolvePassfilePassword(passfilePath!, settings)!));
+                    settings => ResolvePassfilePassword(passfilePath!, settings, passfilePermissionPolicy)!,
+                    (settings, _) => ValueTask.FromResult(
+                        ResolvePassfilePassword(passfilePath!, settings, passfilePermissionPolicy)!));
             }
 
 #pragma warning disable CS0618 // This Npgsql release has no non-obsolete collection API that preserves client certificate chains.
@@ -170,12 +190,16 @@ internal static class NpgsqlConfigurationSecurity
     /// </summary>
     /// <param name="path">The configured passfile path.</param>
     /// <param name="settings">The settings for the physical connection pool requesting a password.</param>
+    /// <param name="passfilePermissionPolicy">The configured Unix passfile permission policy.</param>
     /// <returns>The first matching password, or <see langword="null" />.</returns>
-    internal static string? ResolvePassfilePassword(string path, NpgsqlConnectionStringBuilder settings)
+    internal static string? ResolvePassfilePassword(
+        string path,
+        NpgsqlConnectionStringBuilder settings,
+        PassfilePermissionPolicy passfilePermissionPolicy = PassfilePermissionPolicy.OwnerOnly)
     {
         try
         {
-            using var handle = OpenConfiguredFile(path, MaximumPassfileBytes, requireOwnerOnlyOnUnix: true);
+            using var handle = OpenConfiguredFile(path, MaximumPassfileBytes, passfilePermissionPolicy);
             return ReadFirstMatchingPassfilePassword(handle, settings);
         }
         catch (Exception exception) when (IsSecretFileFailure(exception))
@@ -186,6 +210,17 @@ internal static class NpgsqlConfigurationSecurity
                 "The configured PostgreSQL passfile could not be read safely or parsed. No password was returned to PostgreSQL.");
         }
     }
+
+    /// <summary>Determines whether the opened passfile's GID belongs to the Jellyfin process.</summary>
+    /// <param name="fileGroupId">The GID read from the opened file handle.</param>
+    /// <param name="effectiveGroupId">The process effective GID.</param>
+    /// <param name="supplementaryGroupIds">The process supplementary GIDs.</param>
+    /// <returns><see langword="true" /> when the process belongs to the file's group.</returns>
+    internal static bool ProcessGroupIncludesFileGroup(
+        uint fileGroupId,
+        uint effectiveGroupId,
+        ReadOnlySpan<uint> supplementaryGroupIds)
+        => fileGroupId == effectiveGroupId || supplementaryGroupIds.Contains(fileGroupId);
 
     private static string? ReadFirstMatchingPassfilePassword(
         SafeFileHandle handle,
@@ -518,7 +553,10 @@ internal static class NpgsqlConfigurationSecurity
         {
             if (IsPkcs12Path(certificatePath))
             {
-                var bytes = ReadConfiguredFile(certificatePath, MaximumCertificateBytes, requireOwnerOnlyOnUnix: true);
+                var bytes = ReadConfiguredFile(
+                    certificatePath,
+                    MaximumCertificateBytes,
+                    PassfilePermissionPolicy.OwnerOnly);
                 try
                 {
                     var certificates = X509CertificateLoader.LoadPkcs12Collection(
@@ -544,13 +582,19 @@ internal static class NpgsqlConfigurationSecurity
                 throw new FormatException();
             }
 
-            var certificateBytes = ReadConfiguredFile(certificatePath, MaximumCertificateBytes, requireOwnerOnlyOnUnix: false);
+            var certificateBytes = ReadConfiguredFile(
+                certificatePath,
+                MaximumCertificateBytes,
+                passfilePermissionPolicy: null);
             byte[]? keyBytes = null;
             char[]? certificateChars = null;
             char[]? keyChars = null;
             try
             {
-                keyBytes = ReadConfiguredFile(keyPath, MaximumCertificateBytes, requireOwnerOnlyOnUnix: true);
+                keyBytes = ReadConfiguredFile(
+                    keyPath,
+                    MaximumCertificateBytes,
+                    PassfilePermissionPolicy.OwnerOnly);
                 certificateChars = Encoding.UTF8.GetChars(certificateBytes);
                 keyChars = Encoding.UTF8.GetChars(keyBytes);
 #pragma warning disable CA2000 // Ownership transfers to the collection retained by the Npgsql data source.
@@ -599,7 +643,7 @@ internal static class NpgsqlConfigurationSecurity
         try
         {
             var certificates = new X509Certificate2Collection();
-            var bytes = ReadConfiguredFile(path, MaximumCertificateBytes, requireOwnerOnlyOnUnix: false);
+            var bytes = ReadConfiguredFile(path, MaximumCertificateBytes, passfilePermissionPolicy: null);
             try
             {
                 if (!IsPkcs12Path(path))
@@ -637,20 +681,26 @@ internal static class NpgsqlConfigurationSecurity
         }
     }
 
-    private static void ValidateConfiguredFile(string path, long maximumBytes, bool requireOwnerOnlyOnUnix)
+    private static void ValidateConfiguredFile(
+        string path,
+        long maximumBytes,
+        PassfilePermissionPolicy? passfilePermissionPolicy)
     {
         try
         {
-            using var handle = OpenConfiguredFile(path, maximumBytes, requireOwnerOnlyOnUnix);
+            using var handle = OpenConfiguredFile(path, maximumBytes, passfilePermissionPolicy);
         }
         catch (Exception exception) when (IsSecretFileFailure(exception))
         {
             throw ConfigurationError(
-                "Passfile must name a readable, well-formed PostgreSQL password file and, on Unix, use owner-only permissions");
+                "Passfile must name a readable, well-formed PostgreSQL password file and, on Unix, satisfy the configured passfile permission policy");
         }
     }
 
-    private static SafeFileHandle OpenConfiguredFile(string path, long maximumBytes, bool requireOwnerOnlyOnUnix)
+    private static SafeFileHandle OpenConfiguredFile(
+        string path,
+        long maximumBytes,
+        PassfilePermissionPolicy? passfilePermissionPolicy)
     {
         // Keep credential bytes out of FileStream's private read-ahead buffer.
         // Callers use RandomAccess so every managed buffer is visible and can
@@ -672,10 +722,10 @@ internal static class NpgsqlConfigurationSecurity
             // Inspect the object represented by the open handle rather than
             // the pathname. A symlink or pathname swap is therefore judged by
             // the permissions of the same object whose bytes are consumed.
-            if (requireOwnerOnlyOnUnix && !OperatingSystem.IsWindows())
+            if (passfilePermissionPolicy is not null && !OperatingSystem.IsWindows())
             {
                 var mode = File.GetUnixFileMode(handle);
-                if ((mode & GroupOrOtherPermissions) != 0)
+                if (!UnixPassfileModeIsAllowed(handle, mode, passfilePermissionPolicy.Value))
                 {
                     throw new UnauthorizedAccessException();
                 }
@@ -690,9 +740,89 @@ internal static class NpgsqlConfigurationSecurity
         }
     }
 
-    private static byte[] ReadConfiguredFile(string path, long maximumBytes, bool requireOwnerOnlyOnUnix)
+    private static bool UnixPassfileModeIsAllowed(
+        SafeFileHandle handle,
+        UnixFileMode mode,
+        PassfilePermissionPolicy permissionPolicy)
     {
-        using var handle = OpenConfiguredFile(path, maximumBytes, requireOwnerOnlyOnUnix);
+        var groupPermissions = mode & GroupPermissions;
+        if ((mode & OtherPermissions) != 0)
+        {
+            return false;
+        }
+
+        if (permissionPolicy == PassfilePermissionPolicy.OwnerOnly)
+        {
+            return groupPermissions == 0;
+        }
+
+        if ((groupPermissions & GroupWriteOrExecute) != 0)
+        {
+            return false;
+        }
+
+        return (groupPermissions & UnixFileMode.GroupRead) == 0
+            || LinuxFileGroupMatchesProcess(handle);
+    }
+
+    private static bool LinuxFileGroupMatchesProcess(SafeFileHandle handle)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return false;
+        }
+
+        var referenceAdded = false;
+        try
+        {
+            handle.DangerousAddRef(ref referenceAdded);
+            var descriptor = checked((int)handle.DangerousGetHandle());
+            if (Native.Statx(
+                    descriptor,
+                    Native.EmptyPath,
+                    Native.AtEmptyPath,
+                    Native.StatxGroupId,
+                    out var status) != 0
+                || (status.Mask & Native.StatxGroupId) == 0)
+            {
+                return false;
+            }
+
+            var effectiveGroupId = Native.GetEffectiveGroupId();
+            if (status.GroupId == effectiveGroupId)
+            {
+                return true;
+            }
+
+            var groupCount = Native.GetGroups(0, null);
+            if (groupCount <= 0)
+            {
+                return false;
+            }
+
+            var groups = new uint[groupCount];
+            return Native.GetGroups(groups.Length, groups) == groups.Length
+                && ProcessGroupIncludesFileGroup(status.GroupId, effectiveGroupId, groups);
+        }
+        catch (Exception exception) when (exception is DllNotFoundException or EntryPointNotFoundException or OverflowException)
+        {
+            return false;
+        }
+        finally
+        {
+            if (referenceAdded)
+            {
+                handle.DangerousRelease();
+            }
+        }
+    }
+
+    private static byte[] ReadConfiguredFile(
+        string path,
+        long maximumBytes,
+        PassfilePermissionPolicy? passfilePermissionPolicy)
+    {
+        using var handle = OpenConfiguredFile(path, maximumBytes, passfilePermissionPolicy);
 
         var length = RandomAccess.GetLength(handle);
         if (length > maximumBytes)
@@ -825,4 +955,78 @@ internal static class NpgsqlConfigurationSecurity
 
     private static InvalidOperationException ConfigurationError(string detail)
         => new($"The Npgsql provider configuration in database.xml is invalid: {detail}. No database connection was attempted.");
+
+    private static class Native
+    {
+        internal const int AtEmptyPath = 0x1000;
+        internal const uint StatxGroupId = 0x0010;
+        internal static readonly byte[] EmptyPath = [0];
+
+        [DllImport("libc", EntryPoint = "statx", SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.SafeDirectories)]
+        internal static extern int Statx(
+            int directoryDescriptor,
+            [In] byte[] path,
+            int flags,
+            uint mask,
+            out StatxBuffer buffer);
+
+        [DllImport("libc", EntryPoint = "getegid", SetLastError = false)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.SafeDirectories)]
+        internal static extern uint GetEffectiveGroupId();
+
+        [DllImport("libc", EntryPoint = "getgroups", SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.SafeDirectories)]
+        internal static extern int GetGroups(int size, [Out] uint[]? groups);
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct StatxTimestamp
+        {
+            internal long Seconds;
+            internal uint Nanoseconds;
+            internal int Reserved;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct StatxBuffer
+        {
+            internal uint Mask;
+            internal uint BlockSize;
+            internal ulong Attributes;
+            internal uint LinkCount;
+            internal uint UserId;
+            internal uint GroupId;
+            internal ushort Mode;
+            internal ushort Reserved0;
+            internal ulong Inode;
+            internal ulong Size;
+            internal ulong Blocks;
+            internal ulong AttributesMask;
+            internal StatxTimestamp AccessTime;
+            internal StatxTimestamp BirthTime;
+            internal StatxTimestamp ChangeTime;
+            internal StatxTimestamp ModificationTime;
+            internal uint DeviceMajor;
+            internal uint DeviceMinor;
+            internal uint SpecialDeviceMajor;
+            internal uint SpecialDeviceMinor;
+            internal ulong MountId;
+            internal uint DirectIoMemoryAlign;
+            internal uint DirectIoOffsetAlign;
+            internal ulong Subvolume;
+            internal uint AtomicWriteUnitMin;
+            internal uint AtomicWriteUnitMax;
+            internal uint AtomicWriteSegmentsMax;
+            internal uint DirectIoReadOffsetAlign;
+            internal ulong Reserved1;
+            internal ulong Reserved2;
+            internal ulong Reserved3;
+            internal ulong Reserved4;
+            internal ulong Reserved5;
+            internal ulong Reserved6;
+            internal ulong Reserved7;
+            internal ulong Reserved8;
+            internal ulong Reserved9;
+        }
+    }
 }

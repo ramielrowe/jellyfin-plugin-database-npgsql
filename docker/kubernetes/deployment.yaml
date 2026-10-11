@@ -20,6 +20,11 @@ spec:
       nodeSelector:
         kubernetes.io/arch: amd64
       securityContext:
+        # The Secret projection is root-owned. fsGroup makes its mode-0400
+        # passfile root:1000 mode 0440 without a writable copy.
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        supplementalGroupsPolicy: Strict
         seccompProfile:
           type: RuntimeDefault
       initContainers:
@@ -82,10 +87,13 @@ spec:
             - name: media
               mountPath: /media
               readOnly: true
+            - name: postgres-passfile
+              mountPath: /run/secrets/postgresql
+              readOnly: true
       volumes:
-        # This claim must already exist, be pre-owned by 1000:1000, and contain
-        # database.xml before the first Pod starts. See README.md; neither
-        # kubelet nor the init image is asked to change its ownership.
+        # This claim must already exist, be pre-owned by 1000:1000, have an
+        # fsGroup-compatible root, and contain database.xml before the first
+        # Pod starts. OnRootMismatch must skip recursive mutation. See README.
         - name: config
           persistentVolumeClaim:
             claimName: REPLACE_WITH_EXISTING_CONFIG_PVC
@@ -96,3 +104,12 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 32Mi
+        - name: postgres-passfile
+          secret:
+            secretName: REPLACE_WITH_POSTGRES_PASSFILE_SECRET
+            defaultMode: 0400
+            items:
+              - key: pgpass
+                path: pgpass
+              - key: root.crt
+                path: root.crt

@@ -134,7 +134,27 @@ public sealed class ProviderCoreTests
         Assert.Throws<InvalidOperationException>(
             () => NpgsqlOptionsBootstrap.Parse(
                 ValidConnectionString,
+                Options(
+                    ("passfile-permission-policy", "owner-or-group-read"),
+                    ("PASSFILE-PERMISSION-POLICY", "owner-or-group-read"))));
+        Assert.Throws<InvalidOperationException>(
+            () => NpgsqlOptionsBootstrap.Parse(
+                ValidConnectionString,
                 Options(("command_timeout", "30"))));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("owner-only")]
+    [InlineData("group-read")]
+    public void Parse_RejectsUnsupportedPassfilePermissionPolicy(string value)
+    {
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => NpgsqlOptionsBootstrap.Parse(
+                ValidConnectionString,
+                Options(("passfile-permission-policy", value))));
+
+        Assert.Contains("owner-or-group-read", exception.Message, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -555,6 +575,63 @@ public sealed class ProviderCoreTests
             files);
     }
 
+    [Fact]
+    public void Parse_AcceptsPrivateProcessGroupReadableUnixPassfileOnlyWhenExplicitlyConfigured()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        using var files = SecretFiles.Create();
+        File.SetUnixFileMode(
+            files.Passfile,
+            UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead);
+
+        var configured = NpgsqlOptionsBootstrap.Parse(
+            $"Host=database.internal;Port=5544;Database=jellyfin;Username=jellyfin_runtime;Passfile={files.Passfile}",
+            Options(("passfile-permission-policy", "OWNER-OR-GROUP-READ")));
+
+        Assert.NotNull(configured.ConfigureDataSource);
+        Assert.Equal(
+            "test-password",
+            NpgsqlConfigurationSecurity.ResolvePassfilePassword(
+                files.Passfile,
+                PassfileSettings("database.internal", 5544),
+                PassfilePermissionPolicy.OwnerOrGroupRead));
+    }
+
+    [Theory]
+    [InlineData(UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.GroupWrite)]
+    [InlineData(UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.GroupExecute)]
+    [InlineData(UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.OtherRead)]
+    public void Parse_GroupReadablePolicyStillRejectsBroaderUnixPermissions(UnixFileMode mode)
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return;
+        }
+
+        using var files = SecretFiles.Create();
+        File.SetUnixFileMode(files.Passfile, mode);
+
+        AssertSanitizedCredentialFileFailure(
+            () => NpgsqlOptionsBootstrap.Parse(
+                $"Host=database.internal;Port=5544;Database=jellyfin;Username=jellyfin_runtime;Passfile={files.Passfile}",
+                Options(("passfile-permission-policy", "owner-or-group-read"))),
+            files);
+    }
+
+    [Fact]
+    public void GroupReadablePolicyRequiresTheOpenedFileGroupToBelongToTheProcess()
+    {
+        uint[] supplementaryGroups = [1001, 1002];
+
+        Assert.True(NpgsqlConfigurationSecurity.ProcessGroupIncludesFileGroup(1000, 1000, supplementaryGroups));
+        Assert.True(NpgsqlConfigurationSecurity.ProcessGroupIncludesFileGroup(1002, 1000, supplementaryGroups));
+        Assert.False(NpgsqlConfigurationSecurity.ProcessGroupIncludesFileGroup(2000, 1000, supplementaryGroups));
+    }
+
     [Theory]
     [MemberData(nameof(InsecureCredentialFileModes))]
     public void Parse_RejectsInsecureUnixPemPrivateKeyPermissions(UnixFileMode mode)
@@ -795,7 +872,7 @@ public sealed class ProviderCoreTests
     {
         var exception = Assert.Throws<InvalidOperationException>(action);
 
-        Assert.Contains("owner-only permissions", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("permission", exception.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("No database connection was attempted", exception.Message, StringComparison.Ordinal);
         Assert.DoesNotContain(files.Directory, exception.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain("test-password", exception.ToString(), StringComparison.Ordinal);
