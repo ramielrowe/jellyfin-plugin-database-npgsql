@@ -20,6 +20,25 @@ namespace Jellyfin.Plugin.Database.Npgsql.IntegrationTests;
 public sealed class ModelCompatibilityTests
 {
     [Fact]
+    public async Task PluginConnections_DisablePostgreSqlJitForRequestQueries()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await using var context = CreateContext(database.RuntimeConnectionString);
+            Assert.Equal("off", await ScalarAsync<string>(context, "SHOW jit", cancellationToken));
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Fact]
     public async Task FinalModel_CreatesAndHandlesLongTextNormalDetachedRestoreUpdateAndDelete()
     {
         var options = PostgreSqlTestOptions.FromEnvironment();
@@ -203,6 +222,132 @@ public sealed class ModelCompatibilityTests
             var outcomes = await Task.WhenAll(firstSave, secondSave);
             Assert.Equal(1, outcomes.Count(outcome => outcome));
             Assert.Equal(1, outcomes.Count(outcome => !outcome));
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Fact]
+    public async Task CallerOwnedTransactions_ResolveConcurrentItemValueAndRebindBothMapsToWinner()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await CreateSchemaAsync(database.RuntimeConnectionString, cancellationToken);
+            var firstItemId = Guid.NewGuid();
+            var secondItemId = Guid.NewGuid();
+            var sharedTag = "concurrent-tag-" + Guid.NewGuid().ToString("N");
+            await using (var seed = CreateContext(database.RuntimeConnectionString))
+            {
+                seed.BaseItems.AddRange(
+                    CreateBaseItem(firstItemId, "concurrent-first"),
+                    CreateBaseItem(secondItemId, "concurrent-second"));
+                await seed.SaveChangesAsync(cancellationToken);
+            }
+
+            var firstRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var secondRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var firstOperation = PersistItemTagAfterSharedReadAsync(
+                database.RuntimeConnectionString,
+                firstItemId,
+                sharedTag,
+                firstRead,
+                secondRead,
+                cancellationToken);
+            var secondOperation = PersistItemTagAfterSharedReadAsync(
+                database.RuntimeConnectionString,
+                secondItemId,
+                sharedTag,
+                secondRead,
+                firstRead,
+                cancellationToken);
+
+            await Task.WhenAll(firstOperation, secondOperation);
+
+            await using var verification = CreateContext(database.RuntimeConnectionString);
+            var canonicalValue = await verification.ItemValues
+                .SingleAsync(
+                    value => value.Type == ItemValueType.Tags && value.Value == sharedTag,
+                    cancellationToken);
+            var maps = await verification.ItemValuesMap
+                .Where(map => map.ItemId == firstItemId || map.ItemId == secondItemId)
+                .OrderBy(map => map.ItemId)
+                .ToArrayAsync(cancellationToken);
+            Assert.Equal(2, maps.Length);
+            Assert.All(maps, map => Assert.Equal(canonicalValue.ItemValueId, map.ItemValueId));
+            Assert.Equal(2, maps.Select(map => map.ItemId).Distinct().Count());
+
+            await using var duplicate = CreateContext(database.RuntimeConnectionString);
+            await using var duplicateTransaction = await duplicate.Database.BeginTransactionAsync(cancellationToken);
+            duplicate.ItemValues.Add(CreateItemValue(sharedTag, ItemValueType.Tags));
+            await Assert.ThrowsAsync<DbUpdateException>(() => duplicate.SaveChangesAsync(cancellationToken));
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Fact]
+    public async Task CallerOwnedTransactions_UpsertConcurrentUserDataAsOneCompletePlaybackSnapshot()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await CreateSchemaAsync(database.RuntimeConnectionString, cancellationToken);
+            var itemId = Guid.NewGuid();
+            Guid userId;
+            await using (var seed = CreateContext(database.RuntimeConnectionString))
+            {
+                var user = new User("concurrent-playback", "auth", "reset");
+                userId = user.Id;
+                seed.AddRange(user, CreateBaseItem(itemId, "concurrent-playback"));
+                await seed.SaveChangesAsync(cancellationToken);
+            }
+
+            var firstRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var secondRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var firstOperation = PersistUserDataAfterSharedReadAsync(
+                database.RuntimeConnectionString,
+                CreateUserDataSnapshot(itemId, userId, "playback-key", 1, 100),
+                firstRead,
+                secondRead,
+                cancellationToken);
+            var secondOperation = PersistUserDataAfterSharedReadAsync(
+                database.RuntimeConnectionString,
+                CreateUserDataSnapshot(itemId, userId, "playback-key", 2, 200),
+                secondRead,
+                firstRead,
+                cancellationToken);
+
+            await Task.WhenAll(firstOperation, secondOperation);
+
+            await using var verification = CreateContext(database.RuntimeConnectionString);
+            var stored = await verification.UserData.SingleAsync(
+                data => data.ItemId == itemId
+                    && data.UserId == userId
+                    && data.CustomDataKey == "playback-key",
+                cancellationToken);
+            Assert.Contains(stored.PlayCount, new[] { 1, 2 });
+            Assert.Equal(stored.PlayCount * 100, stored.PlaybackPositionTicks);
+            Assert.Equal(
+                stored.PlayCount == 1 ? DateTime.UnixEpoch.AddMinutes(1) : DateTime.UnixEpoch.AddMinutes(2),
+                stored.LastPlayedDate);
+            Assert.True(verification.Entry(stored).Property<long>("CustomDataKeyInternId").CurrentValue > 0);
+
+            await using var duplicate = CreateContext(database.RuntimeConnectionString);
+            duplicate.UserData.Add(CreateUserDataSnapshot(itemId, userId, "playback-key", 3, 300));
+            await Assert.ThrowsAsync<DbUpdateException>(() => duplicate.SaveChangesAsync(cancellationToken));
         }
         finally
         {
@@ -1248,6 +1393,83 @@ public sealed class ModelCompatibilityTests
         {
             return false;
         }
+    }
+
+    private static async Task PersistItemTagAfterSharedReadAsync(
+        string connectionString,
+        Guid itemId,
+        string tag,
+        TaskCompletionSource ownRead,
+        TaskCompletionSource otherRead,
+        CancellationToken cancellationToken)
+    {
+        await using var context = CreateContext(connectionString);
+        await using var transaction = await context.Database.BeginTransactionAsync(cancellationToken);
+        var existingValue = await context.ItemValues.SingleOrDefaultAsync(
+            value => value.Type == ItemValueType.Tags && value.Value == tag,
+            cancellationToken);
+
+        ownRead.TrySetResult();
+        await otherRead.Task.WaitAsync(cancellationToken);
+
+        var itemValue = existingValue ?? CreateItemValue(tag, ItemValueType.Tags);
+        if (existingValue is null)
+        {
+            context.ItemValues.Add(itemValue);
+        }
+
+        context.ItemValuesMap.Add(new ItemValueMap
+        {
+            ItemId = itemId,
+            Item = null!,
+            ItemValueId = itemValue.ItemValueId,
+            ItemValue = null!
+        });
+        // ItemPersistenceService.SaveItems uses these synchronous calls inside its
+        // caller-owned transaction; keep the regression on that production path.
+        context.SaveChanges();
+        transaction.Commit();
+    }
+
+    private static UserData CreateUserDataSnapshot(
+        Guid itemId,
+        Guid userId,
+        string customDataKey,
+        int playCount,
+        long playbackPositionTicks)
+        => new()
+        {
+            ItemId = itemId,
+            Item = null,
+            UserId = userId,
+            User = null,
+            CustomDataKey = customDataKey,
+            PlayCount = playCount,
+            PlaybackPositionTicks = playbackPositionTicks,
+            LastPlayedDate = DateTime.UnixEpoch.AddMinutes(playCount)
+        };
+
+    private static async Task PersistUserDataAfterSharedReadAsync(
+        string connectionString,
+        UserData snapshot,
+        TaskCompletionSource ownRead,
+        TaskCompletionSource otherRead,
+        CancellationToken cancellationToken)
+    {
+        await using var context = CreateContext(connectionString);
+        await using var transaction = await context.Database.BeginTransactionAsync(cancellationToken);
+        Assert.False(await context.UserData.AnyAsync(
+            data => data.ItemId == snapshot.ItemId
+                && data.UserId == snapshot.UserId
+                && data.CustomDataKey == snapshot.CustomDataKey,
+            cancellationToken));
+
+        ownRead.TrySetResult();
+        await otherRead.Task.WaitAsync(cancellationToken);
+
+        context.UserData.Add(snapshot);
+        context.SaveChanges();
+        transaction.Commit();
     }
 
     private static async Task SaveAfterSignalWithoutHandlingAsync(

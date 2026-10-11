@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Locking;
 using Jellyfin.Plugin.Database.Npgsql.TestInfrastructure;
@@ -28,6 +30,7 @@ public sealed class StockServerPersistenceParityTests
         var cancellationToken = TestContext.Current.CancellationToken;
         await using var environment = await PostgreSqlTestEnvironment.CreateAsync(databaseOptions, cancellationToken);
         await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        await ForceDatabaseJitCompilationAsync(database, cancellationToken);
         var repositoryRoot = PluginRepository.FindRoot(AppContext.BaseDirectory);
         using var artifacts = HostTestArtifactScope.Create("stock-server-parity");
         var databasePassword = new global::Npgsql.NpgsqlConnectionStringBuilder(database.RuntimeConnectionString).Password;
@@ -91,6 +94,17 @@ public sealed class StockServerPersistenceParityTests
                 redactor.Add(token);
                 evidenceRedactor.Add(token);
                 var authorization = "MediaBrowser Token=\"" + token + "\"";
+                var secondAuthentication = await host.PostJsonAsync(
+                    "Users/AuthenticateByName",
+                    JsonSerializer.Serialize(new { Username = "parity-admin", Pw = adminPassword }),
+                    $"MediaBrowser Client=\"npgsql-parity-second\", Device=\"stock tests second\", DeviceId=\"{Guid.NewGuid():N}\", Version=\"0.1\"",
+                    cancellationToken);
+                using var secondAuthenticationDocument = JsonDocument.Parse(secondAuthentication);
+                var secondToken = secondAuthenticationDocument.RootElement.GetProperty("AccessToken").GetString();
+                Assert.False(string.IsNullOrWhiteSpace(secondToken));
+                redactor.Add(secondToken);
+                evidenceRedactor.Add(secondToken);
+                var secondAuthorization = "MediaBrowser Token=\"" + secondToken + "\"";
 
                 var createdUserJson = await host.PostJsonAsync(
                     "Users/New",
@@ -150,6 +164,11 @@ public sealed class StockServerPersistenceParityTests
                     .Single(item => item.GetProperty("Name").GetString() == "Alpha Movie")
                     .GetProperty("Id")
                     .GetString()!);
+                var mixedItemId = Guid.Parse(items.GetProperty("Items")
+                    .EnumerateArray()
+                    .Single(item => item.GetProperty("Name").GetString() == "mixed Case Movie")
+                    .GetProperty("Id")
+                    .GetString()!);
                 Assert.Contains(
                     unicodeItem.GetProperty("Genres").EnumerateArray().Select(value => value.GetString()),
                     value => value == "Sci-Fi 世界");
@@ -157,6 +176,164 @@ public sealed class StockServerPersistenceParityTests
                     unicodeItem.GetProperty("People").EnumerateArray(),
                     person => person.GetProperty("Name").GetString() == "Zoë 李"
                         && person.GetProperty("Role").GetString() == "Lead_%_Actor");
+
+                var resumeTimer = Stopwatch.StartNew();
+                using var resumeDocument = JsonDocument.Parse(await host.GetStringAsync(
+                    "UserItems/Resume?Limit=12&EnableTotalRecordCount=true&EnableUserData=true",
+                    authorization,
+                    cancellationToken));
+                resumeTimer.Stop();
+                Assert.Equal(0, resumeDocument.RootElement.GetProperty("TotalRecordCount").GetInt32());
+                Assert.Empty(resumeDocument.RootElement.GetProperty("Items").EnumerateArray());
+                Assert.True(
+                    resumeTimer.Elapsed < TimeSpan.FromSeconds(10),
+                    $"The first Continue Watching request took {resumeTimer.Elapsed.TotalMilliseconds:F0} ms with plugin-managed JIT disabled.");
+
+                const string concurrentTag = "metadata-race-seinen";
+                await using (var raceSetup = CreateContext(database.RuntimeConnectionString))
+                {
+                    await raceSetup.Database.ExecuteSqlRawAsync(
+                        """
+                        CREATE OR REPLACE FUNCTION public."__jellyfin_test_delay_concurrent_tag"()
+                        RETURNS trigger LANGUAGE plpgsql
+                        SET search_path = pg_catalog, public
+                        AS $jellyfin$
+                        BEGIN
+                            IF NEW."Type" = 4 AND NEW."Value" = 'metadata-race-seinen' THEN
+                                PERFORM pg_sleep(1);
+                            END IF;
+                            RETURN NEW;
+                        END;
+                        $jellyfin$;
+
+                        CREATE TRIGGER "ZZ_JellyfinTestDelayConcurrentTag"
+                            BEFORE INSERT ON public."ItemValues"
+                            FOR EACH ROW EXECUTE FUNCTION public."__jellyfin_test_delay_concurrent_tag"();
+                        """,
+                        cancellationToken);
+                }
+
+                var firstUpdate = JsonNode.Parse(await host.GetStringAsync(
+                    "Items/" + alphaItemId,
+                    authorization,
+                    cancellationToken))!.AsObject();
+                var secondUpdate = JsonNode.Parse(await host.GetStringAsync(
+                    "Items/" + mixedItemId,
+                    authorization,
+                    cancellationToken))!.AsObject();
+                firstUpdate["Tags"] = new JsonArray(concurrentTag);
+                secondUpdate["Tags"] = new JsonArray(concurrentTag);
+                await Task.WhenAll(
+                    host.PostJsonAsync(
+                        "Items/" + alphaItemId,
+                        firstUpdate.ToJsonString(),
+                        authorization,
+                        cancellationToken),
+                    host.PostJsonAsync(
+                        "Items/" + mixedItemId,
+                        secondUpdate.ToJsonString(),
+                        authorization,
+                        cancellationToken));
+
+                await using (var raceVerification = CreateContext(database.RuntimeConnectionString))
+                {
+                    await raceVerification.Database.ExecuteSqlRawAsync(
+                        """
+                        DROP TRIGGER "ZZ_JellyfinTestDelayConcurrentTag" ON public."ItemValues";
+                        DROP FUNCTION public."__jellyfin_test_delay_concurrent_tag"();
+                        """,
+                        cancellationToken);
+                    var sharedValueId = await raceVerification.ItemValues
+                        .Where(value => value.Type == Jellyfin.Database.Implementations.Entities.ItemValueType.Tags
+                            && value.Value == concurrentTag)
+                        .Select(value => value.ItemValueId)
+                        .SingleAsync(cancellationToken);
+                    var mappedValueIds = await raceVerification.ItemValuesMap
+                        .Where(map => map.ItemId == alphaItemId || map.ItemId == mixedItemId)
+                        .Where(map => map.ItemValueId == sharedValueId)
+                        .Select(map => map.ItemValueId)
+                        .ToArrayAsync(cancellationToken);
+                    Assert.Equal(2, mappedValueIds.Length);
+                    Assert.All(mappedValueIds, valueId => Assert.Equal(sharedValueId, valueId));
+                }
+
+                await using (var playbackRaceSetup = CreateContext(database.RuntimeConnectionString))
+                {
+                    Assert.False(await playbackRaceSetup.UserData.AnyAsync(
+                        data => data.ItemId == mixedItemId && data.UserId == adminId,
+                        cancellationToken));
+                    await playbackRaceSetup.Database.ExecuteSqlRawAsync(
+                        """
+                        CREATE OR REPLACE FUNCTION public."__jellyfin_test_delay_concurrent_user_data"()
+                        RETURNS trigger LANGUAGE plpgsql
+                        SET search_path = pg_catalog, public
+                        AS $jellyfin$
+                        BEGIN
+                            PERFORM pg_sleep(1);
+                            RETURN NEW;
+                        END;
+                        $jellyfin$;
+
+                        CREATE TRIGGER "ZZ_JellyfinTestDelayConcurrentUserData"
+                            BEFORE INSERT ON public."UserData"
+                            FOR EACH ROW EXECUTE FUNCTION public."__jellyfin_test_delay_concurrent_user_data"();
+                        """,
+                        cancellationToken);
+                }
+
+                var firstPlayback = JsonSerializer.Serialize(new
+                {
+                    ItemId = mixedItemId,
+                    MediaSourceId = mixedItemId.ToString("N"),
+                    PlaySessionId = Guid.NewGuid().ToString("N"),
+                    PlayMethod = 2,
+                    PositionTicks = 0,
+                    CanSeek = true
+                });
+                var secondPlayback = JsonSerializer.Serialize(new
+                {
+                    ItemId = mixedItemId,
+                    MediaSourceId = mixedItemId.ToString("N"),
+                    PlaySessionId = Guid.NewGuid().ToString("N"),
+                    PlayMethod = 2,
+                    PositionTicks = 0,
+                    CanSeek = true
+                });
+                await Task.WhenAll(
+                    host.PostJsonAsync("Sessions/Playing", firstPlayback, authorization, cancellationToken),
+                    host.PostJsonAsync("Sessions/Playing", secondPlayback, secondAuthorization, cancellationToken));
+
+                int storedPlayCount;
+                await using (var playbackRaceVerification = CreateContext(database.RuntimeConnectionString))
+                {
+                    await playbackRaceVerification.Database.ExecuteSqlRawAsync(
+                        """
+                        DROP TRIGGER "ZZ_JellyfinTestDelayConcurrentUserData" ON public."UserData";
+                        DROP FUNCTION public."__jellyfin_test_delay_concurrent_user_data"();
+                        """,
+                        cancellationToken);
+                    var storedPlayback = await playbackRaceVerification.UserData
+                        .SingleAsync(
+                            data => data.ItemId == mixedItemId && data.UserId == adminId,
+                            cancellationToken);
+                    storedPlayCount = storedPlayback.PlayCount;
+                    // SaveUserData persists a complete last-writer-wins snapshot, not
+                    // a database-side delta. Both racing starts observed the initial
+                    // state and submitted PlayCount = 1.
+                    Assert.Equal(1, storedPlayCount);
+                    Assert.NotNull(storedPlayback.LastPlayedDate);
+                }
+
+                using (var cachedPlaybackDocument = JsonDocument.Parse(await host.GetStringAsync(
+                    "Items?Ids=" + mixedItemId + "&EnableUserData=true&EnableTotalRecordCount=true",
+                    authorization,
+                    cancellationToken)))
+                {
+                    var cachedPlayback = cachedPlaybackDocument.RootElement
+                        .GetProperty("Items")[0]
+                        .GetProperty("UserData");
+                    Assert.Equal(storedPlayCount, cachedPlayback.GetProperty("PlayCount").GetInt32());
+                }
 
                 using var searchDocument = JsonDocument.Parse(await host.GetStringAsync(
                     "Items?Recursive=true&IncludeItemTypes=Movie&SearchTerm="
@@ -412,5 +589,17 @@ public sealed class StockServerPersistenceParityTests
             NullLogger<JellyfinDbContext>.Instance,
             provider,
             new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
+    }
+
+    private static async Task ForceDatabaseJitCompilationAsync(
+        PostgreSqlTestDatabase database,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new global::Npgsql.NpgsqlConnection(database.RuntimeConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        var databaseName = new global::Npgsql.NpgsqlCommandBuilder().QuoteIdentifier(database.DatabaseName);
+        command.CommandText = $"ALTER DATABASE {databaseName} SET jit = on; ALTER DATABASE {databaseName} SET jit_above_cost = 0;";
+        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 }
