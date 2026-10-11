@@ -17,6 +17,7 @@ public sealed class MigrationIntegrationTests
     private const string Baseline = "20261009061101_InitialPostgreSqlBaseline";
     private const string Successor = "20261009061446_AddActivityLogTypeDateIndex";
     private const string UuidAggregates = "20261009113458_AddUuidMinMaxAggregates";
+    private const string SerializeTextInterning = "20261011031154_SerializeTextInterningMisses";
     private const string CoreNormalizedUsername = "20260522092304_UpdateNormalizedUsername";
     private const string CoreDisableLegacyAuthorization = "20260531160000_DisableLegacyAuthorization";
 
@@ -76,6 +77,7 @@ public sealed class MigrationIntegrationTests
                 .Append(Baseline)
                 .Append(Successor)
                 .Append(UuidAggregates)
+                .Append(SerializeTextInterning)
                 .Order(StringComparer.Ordinal)
                 .ToArray();
             Assert.Equal(expected, await ReadHistoryAsync(context, cancellationToken));
@@ -123,7 +125,7 @@ public sealed class MigrationIntegrationTests
             Assert.True(await IndexExistsAsync(context, cancellationToken));
 
             Assert.Equal(
-                [CoreNormalizedUsername, CoreDisableLegacyAuthorization, Baseline, Successor, UuidAggregates],
+                [CoreNormalizedUsername, CoreDisableLegacyAuthorization, Baseline, Successor, UuidAggregates, SerializeTextInterning],
                 await ReadHistoryAsync(context, cancellationToken));
 
             Assert.Equal(5, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_trigger WHERE tgname LIKE 'TR_%_Intern' AND NOT tgisinternal", cancellationToken));
@@ -131,6 +133,7 @@ public sealed class MigrationIntegrationTests
             Assert.Equal(2, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace AND prokind = 'a' AND proname IN ('min', 'max') AND pg_catalog.pg_get_function_identity_arguments(oid) = 'uuid'", cancellationToken));
             Assert.Equal(4, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('__jellyfin_uuid_min', '__jellyfin_uuid_max', 'min', 'max') AND NOT EXISTS (SELECT 1 FROM pg_catalog.aclexplode(coalesce(proacl, pg_catalog.acldefault('f', proowner))) acl WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE')", cancellationToken));
             Assert.Equal(2, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_aggregate a JOIN pg_catalog.pg_proc p ON p.oid = a.aggfnoid WHERE p.pronamespace = 'public'::regnamespace AND ((p.proname = 'min' AND a.aggsortop = 'pg_catalog.<(uuid,uuid)'::regoperator) OR (p.proname = 'max' AND a.aggsortop = 'pg_catalog.>(uuid,uuid)'::regoperator))", cancellationToken));
+            Assert.True(await ScalarAsync<bool>(context, "SELECT pg_catalog.pg_get_functiondef('public.\"__jellyfin_intern_text\"(text)'::regprocedure) LIKE '%LOCK TABLE public.%IN SHARE ROW EXCLUSIVE MODE%'", cancellationToken));
             Assert.Equal(0, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_extension WHERE extname IN ('pgcrypto', 'citext')", cancellationToken));
             Assert.Equal(0, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_constraint WHERE conname IN ('PK_BaseItemProviders', 'PK_PeopleBaseItemMap', 'PK_UserData')", cancellationToken));
             Assert.True(await ScalarAsync<bool>(context, "SELECT NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = current_user", cancellationToken));
@@ -138,6 +141,7 @@ public sealed class MigrationIntegrationTests
             await migrator.MigrateAsync(Baseline, cancellationToken);
             Assert.False(await IndexExistsAsync(context, cancellationToken));
             Assert.Equal(0, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace = 'public'::regnamespace AND proname IN ('__jellyfin_uuid_min', '__jellyfin_uuid_max', 'min', 'max')", cancellationToken));
+            Assert.False(await ScalarAsync<bool>(context, "SELECT pg_catalog.pg_get_functiondef('public.\"__jellyfin_intern_text\"(text)'::regprocedure) LIKE '%LOCK TABLE public.%IN SHARE ROW EXCLUSIVE MODE%'", cancellationToken));
             Assert.Equal(1, await context.ActivityLogs.CountAsync(cancellationToken));
             Assert.Equal(
                 [CoreNormalizedUsername, CoreDisableLegacyAuthorization, Baseline],
@@ -149,9 +153,10 @@ public sealed class MigrationIntegrationTests
             Assert.True(await IndexExistsAsync(context, cancellationToken));
             Assert.Equal(1, await context.ActivityLogs.CountAsync(cancellationToken));
             Assert.Equal(
-                [CoreNormalizedUsername, CoreDisableLegacyAuthorization, Baseline, Successor, UuidAggregates],
+                [CoreNormalizedUsername, CoreDisableLegacyAuthorization, Baseline, Successor, UuidAggregates, SerializeTextInterning],
                 await ReadHistoryAsync(context, cancellationToken));
             Assert.Equal(2, await ScalarAsync<long>(context, "SELECT count(*) FROM pg_catalog.pg_aggregate a JOIN pg_catalog.pg_proc p ON p.oid = a.aggfnoid WHERE p.pronamespace = 'public'::regnamespace AND p.proname IN ('min', 'max') AND pg_catalog.pg_get_function_identity_arguments(p.oid) = 'uuid'", cancellationToken));
+            Assert.True(await ScalarAsync<bool>(context, "SELECT pg_catalog.pg_get_functiondef('public.\"__jellyfin_intern_text\"(text)'::regprocedure) LIKE '%LOCK TABLE public.%IN SHARE ROW EXCLUSIVE MODE%'", cancellationToken));
         }
         finally
         {

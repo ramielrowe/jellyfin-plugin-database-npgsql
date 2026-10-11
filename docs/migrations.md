@@ -63,6 +63,16 @@ PostgreSQL 16 has no built-in UUID minimum or maximum aggregate. The objects are
 created in the application-owned `public` schema by the restricted runtime role;
 they require no extension or elevated privilege.
 
+`20261011031154_SerializeTextInterningMisses` replaces only
+`__jellyfin_intern_text(text)`. Already interned values retain the lock-free lookup
+path; a missing value takes a transaction-scoped table write lock before creating
+trie nodes, preventing inverse-order callers from deadlocking inside an explicit
+Jellyfin transaction. The rollback restores the predecessor function. This is a
+provider migration for the unchanged Jellyfin 12.2 database ABI and requires no
+host patch. The guarantee applies to Jellyfin's default `READ COMMITTED`
+transactions; custom stronger isolation can retain a pre-wait snapshot and may
+still require retrying the complete owning operation.
+
 ## Shared migration history audit
 
 Vanilla Jellyfin deliberately stores code-migration IDs and EF migration IDs in
@@ -89,7 +99,7 @@ UpdateDefaultPluginRepository, and MoveTrickplayFiles; they still execute
 normally. Unit tests require the setup and seeded partitions to be disjoint and
 to cover all 49 pinned IDs exactly. The pristine-host migration test starts an
 untouched publish against an empty, pre-created PostgreSQL database and requires
-it to become healthy with the exact 49 code rows plus the three plugin rows. This
+it to become healthy with the exact 49 code rows plus the four plugin rows. This
 proves the legacy transforms were seeded and every setup routine completed
 without changing Jellyfin's migration service.
 

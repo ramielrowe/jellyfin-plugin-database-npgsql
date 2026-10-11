@@ -19,7 +19,7 @@ public sealed class MigrationBackupIntegrationTests
 {
     private const string Baseline = "20261009061101_InitialPostgreSqlBaseline";
     private const string Successor = "20261009061446_AddActivityLogTypeDateIndex";
-    private const string UuidAggregates = "20261009113458_AddUuidMinMaxAggregates";
+    private const string SerializeTextInterning = "20261011031154_SerializeTextInterningMisses";
     private const string HistorySchemaSqlForTest = """
         CREATE TABLE public."__EFMigrationsHistory" (
             "MigrationId" character varying(150) NOT NULL,
@@ -177,7 +177,7 @@ public sealed class MigrationBackupIntegrationTests
             long originalId;
             await using (var context = factory.CreateDbContext())
             {
-                await context.GetService<IMigrator>().MigrateAsync(UuidAggregates, cancellationToken);
+                await context.GetService<IMigrator>().MigrateAsync(SerializeTextInterning, cancellationToken);
                 var row = new ActivityLog("backup sentinel", "MigrationBackup", Guid.NewGuid());
                 context.ActivityLogs.Add(row);
                 await context.SaveChangesAsync(cancellationToken);

@@ -178,6 +178,39 @@ once. Both saves complete through the provider's automatic execution strategy;
 returned shadow IDs, tracker states, canonical node counts, and exact persisted
 rows prove retries have no duplicate side effects.
 
+Caller-owned transactions cannot use that retry path after PostgreSQL aborts a
+deadlock. The current interning function therefore resolves committed trie hits
+without a write lock, but takes a transaction-scoped `SHARE ROW EXCLUSIVE` lock
+on `__JellyfinTextNodes` before creating a missing path. This serializes only
+transactions introducing previously unseen strings, so inverse batches such as
+provider IDs or person roles `A/B` and `B/A` cannot each retain one speculative
+unique-index entry while waiting for the other. The owning Jellyfin operation is
+never replayed, exact text uniqueness and trigger-owned intern IDs are unchanged,
+and direct SQL uses the same protection as EF persistence.
+
+This guarantee is scoped to Jellyfin's normal PostgreSQL transactions, which use
+the server default `READ COMMITTED` isolation level. After a waiter acquires the
+miss lock, its next statement can see the winner's committed trie nodes. A custom
+deployment that raises these caller-owned operations to `REPEATABLE READ` or
+`SERIALIZABLE` may retain an older snapshot and require a whole-operation retry;
+the provider does not claim to make those unsupported host transactions retryable.
+
+The regression uses Jellyfin's real `JellyfinDbContext`, entity model, generated
+EF commands, explicit transaction boundary, and production database triggers. It
+does not instantiate `PeopleRepository` or `ItemPersistenceService`: those live
+in the host implementation assembly, outside the provider's packaged dependency
+boundary, and add no database step between `SaveChanges` and these triggers. The
+test first installs the predecessor function and requires one inverse-role writer
+to fail with `40P01`, then installs the successor and requires both equivalent
+writers to commit with shared canonical intern IDs. That old-versus-new proof is
+at the exact layer changed by this provider migration.
+
+`20261011031154_SerializeTextInterningMisses` replaces the function on existing
+databases and reversibly restores its predecessor on downgrade. No Jellyfin host
+patch or database-ABI change is required, but installing only the updated DLL is
+insufficient: normal startup must apply this provider migration before concurrent
+scanning resumes. Older plugin releases remain susceptible until upgraded.
+
 The full-host model test now uses the production provider package against a
 wholly disposable database. The provider's migration backup implementation lets
 the untouched vanilla host apply the real baseline, and the test verifies the
@@ -209,7 +242,7 @@ directory rather than overwriting an installed 0.1.1.0 directory in place. The
 normal package/host compatibility and rollback rules still apply.
 
 The checked-in migration reproduces this finalized model exactly. It installs
-both LIKE forms and the bounded-prefix function, the non-locking interning
+both LIKE forms and the bounded-prefix function, the miss-serialized interning
 functions and unconditional triggers, the People `text_pattern_ops` and
 ItemValue accelerators, omits the three unsafe physical primary keys, and
 verifies the runtime fingerprint before mutation. Migration snapshots are used

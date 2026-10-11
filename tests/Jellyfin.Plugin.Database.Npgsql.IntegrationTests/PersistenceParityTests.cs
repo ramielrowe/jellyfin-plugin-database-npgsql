@@ -792,7 +792,7 @@ public sealed class PersistenceParityTests
             var database = new ParityDatabase(() => CreatePostgreSqlContext(connectionString));
             await using var context = database.CreateContext();
             Assert.True(await context.Database.EnsureCreatedAsync(cancellationToken));
-            await context.Database.ExecuteSqlRawAsync(NpgsqlTextInterning.InstallSql, cancellationToken);
+            await context.Database.ExecuteSqlRawAsync(NpgsqlTextInterning.InstallCurrentSql, cancellationToken);
             await context.Database.ExecuteSqlRawAsync(NpgsqlUuidAggregates.InstallSql, cancellationToken);
             Assert.Equal(
                 NpgsqlModelCustomizer.ModelContract,

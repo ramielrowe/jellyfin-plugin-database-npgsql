@@ -122,6 +122,9 @@ public sealed class ModelCompatibilityTests
         Assert.Contains("ON CONFLICT (\"ParentId\", \"Chunk\", \"IsTerminal\")", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
         Assert.Contains("DO NOTHING", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
         Assert.DoesNotContain("DO UPDATE", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
+        Assert.DoesNotContain("LOCK TABLE public.\"__JellyfinTextNodes\"", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
+        Assert.Contains("LOCK TABLE public.\"__JellyfinTextNodes\" IN SHARE ROW EXCLUSIVE MODE", NpgsqlTextInterning.InstallCurrentSql, StringComparison.Ordinal);
+        Assert.Contains("IF path_exists THEN", NpgsqlTextInterning.InstallCurrentSql, StringComparison.Ordinal);
         Assert.Contains("BEFORE INSERT OR UPDATE ON", NpgsqlTextInterning.InstallSql, StringComparison.Ordinal);
         Assert.DoesNotContain("digest(", NpgsqlTextInterning.InstallSql, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("pgcrypto", NpgsqlTextInterning.InstallSql, StringComparison.OrdinalIgnoreCase);

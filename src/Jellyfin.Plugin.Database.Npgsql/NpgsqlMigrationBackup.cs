@@ -23,6 +23,7 @@ internal static partial class NpgsqlMigrationBackup
     private const string BaselineMigration = "20261009061101_InitialPostgreSqlBaseline";
     private const string SuccessorMigration = "20261009061446_AddActivityLogTypeDateIndex";
     private const string UuidAggregatesMigration = "20261009113458_AddUuidMinMaxAggregates";
+    private const string SerializeTextInterningMigration = "20261011031154_SerializeTextInterningMisses";
     private const string ManifestFile = "manifest.json";
     private const string CompletionFile = "complete";
     private const string HistorySchemaSql = """
@@ -476,14 +477,15 @@ internal static partial class NpgsqlMigrationBackup
         }
 
         await using var command = new NpgsqlCommand(
-            "SELECT \"MigrationId\" FROM public.\"__EFMigrationsHistory\" WHERE \"MigrationId\" IN (@baseline, @successor, @uuidAggregates) ORDER BY \"MigrationId\" DESC LIMIT 1",
+            "SELECT \"MigrationId\" FROM public.\"__EFMigrationsHistory\" WHERE \"MigrationId\" IN (@baseline, @successor, @uuidAggregates, @serializeTextInterning) ORDER BY \"MigrationId\" DESC LIMIT 1",
             connection,
             transaction);
         command.Parameters.AddWithValue("baseline", BaselineMigration);
         command.Parameters.AddWithValue("successor", SuccessorMigration);
         command.Parameters.AddWithValue("uuidAggregates", UuidAggregatesMigration);
+        command.Parameters.AddWithValue("serializeTextInterning", SerializeTextInterningMigration);
         var result = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) as string;
-        if (result is not (BaselineMigration or SuccessorMigration or UuidAggregatesMigration))
+        if (result is not (BaselineMigration or SuccessorMigration or UuidAggregatesMigration or SerializeTextInterningMigration))
         {
             throw new NotSupportedException(
                 "The populated PostgreSQL database does not have a supported plugin migration baseline. Refusing migration before mutation.");
@@ -499,6 +501,7 @@ internal static partial class NpgsqlMigrationBackup
             BaselineMigration => new[] { BaselineMigration },
             SuccessorMigration => new[] { BaselineMigration, SuccessorMigration },
             UuidAggregatesMigration => new[] { BaselineMigration, SuccessorMigration, UuidAggregatesMigration },
+            SerializeTextInterningMigration => new[] { BaselineMigration, SuccessorMigration, UuidAggregatesMigration, SerializeTextInterningMigration },
             _ => throw new NotSupportedException(
                 $"The provider migration '{sourceMigration}' is unavailable; no rollback-capable backup was published."),
         };
@@ -567,6 +570,7 @@ internal static partial class NpgsqlMigrationBackup
             BaselineMigration => new[] { BaselineMigration },
             SuccessorMigration => new[] { BaselineMigration, SuccessorMigration },
             UuidAggregatesMigration => new[] { BaselineMigration, SuccessorMigration, UuidAggregatesMigration },
+            SerializeTextInterningMigration => new[] { BaselineMigration, SuccessorMigration, UuidAggregatesMigration, SerializeTextInterningMigration },
             _ => throw new NotSupportedException(
                 "The populated PostgreSQL migration history does not end at a supported provider migration. Refusing migration before mutation."),
         };
@@ -861,7 +865,7 @@ internal static partial class NpgsqlMigrationBackup
             "__jellyfin_sqlite_like(text, text)",
             "__jellyfin_sqlite_like_escape(text, text, text)",
         };
-        if (sourceMigration == UuidAggregatesMigration)
+        if (sourceMigration is UuidAggregatesMigration or SerializeTextInterningMigration)
         {
             expectedFunctions.UnionWith(
                 [
@@ -1488,7 +1492,7 @@ internal static partial class NpgsqlMigrationBackup
             || manifest.ForeignKeys is null
             || (manifest.Empty && (manifest.HistoryOnly || manifest.Tables.Count != 0 || manifest.SchemaFile is not null))
             || (manifest.HistoryOnly && (manifest.Empty || manifest.SourceMigration is not null || manifest.SchemaFile is null || manifest.Tables.Count != 1))
-            || (!manifest.Empty && !manifest.HistoryOnly && (manifest.SourceMigration is not (BaselineMigration or SuccessorMigration or UuidAggregatesMigration) || manifest.SchemaFile is null || manifest.SchemaHash is null)))
+            || (!manifest.Empty && !manifest.HistoryOnly && (manifest.SourceMigration is not (BaselineMigration or SuccessorMigration or UuidAggregatesMigration or SerializeTextInterningMigration) || manifest.SchemaFile is null || manifest.SchemaHash is null)))
         {
             throw new InvalidDataException("The PostgreSQL migration backup manifest is incompatible or malformed; the database was not changed.");
         }

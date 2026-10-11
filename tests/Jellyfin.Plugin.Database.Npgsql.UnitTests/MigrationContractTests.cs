@@ -24,6 +24,7 @@ public sealed class MigrationContractTests
                 "20261009061101_InitialPostgreSqlBaseline",
                 "20261009061446_AddActivityLogTypeDateIndex",
                 "20261009113458_AddUuidMinMaxAggregates",
+                "20261011031154_SerializeTextInterningMisses",
             ],
             context.Database.GetMigrations());
         Assert.False(context.Database.HasPendingModelChanges());
@@ -32,7 +33,9 @@ public sealed class MigrationContractTests
         Assert.Contains("20261009061101_InitialPostgreSqlBaseline", script, StringComparison.Ordinal);
         Assert.Contains("20261009061446_AddActivityLogTypeDateIndex", script, StringComparison.Ordinal);
         Assert.Contains("20261009113458_AddUuidMinMaxAggregates", script, StringComparison.Ordinal);
+        Assert.Contains("20261011031154_SerializeTextInterningMisses", script, StringComparison.Ordinal);
         Assert.Contains("__JellyfinTextNodes", script, StringComparison.Ordinal);
+        Assert.Contains("LOCK TABLE public.\"__JellyfinTextNodes\" IN SHARE ROW EXCLUSIVE MODE", script, StringComparison.Ordinal);
         Assert.Contains("CREATE AGGREGATE public.min(uuid)", script, StringComparison.Ordinal);
         Assert.Contains("CREATE AGGREGATE public.max(uuid)", script, StringComparison.Ordinal);
         Assert.Contains("SORTOP = OPERATOR(pg_catalog.<)", script, StringComparison.Ordinal);

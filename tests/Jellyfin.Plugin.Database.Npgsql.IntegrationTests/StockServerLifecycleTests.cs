@@ -17,6 +17,7 @@ public sealed class StockServerLifecycleTests
     private const string Baseline = "20261009061101_InitialPostgreSqlBaseline";
     private const string Successor = "20261009061446_AddActivityLogTypeDateIndex";
     private const string UuidAggregates = "20261009113458_AddUuidMinMaxAggregates";
+    private const string SerializeTextInterning = "20261011031154_SerializeTextInterningMisses";
     private const string PredecessorVersion = "0.0.9.0";
     private const string PredecessorDirectory = "Npgsql Database_" + PredecessorVersion;
 
@@ -1343,7 +1344,7 @@ public sealed class StockServerLifecycleTests
             .Append(Successor);
         if (includeUuidAggregates)
         {
-            result = result.Append(UuidAggregates);
+            result = result.Append(UuidAggregates).Append(SerializeTextInterning);
         }
 
         return result.Order(StringComparer.Ordinal).ToArray();

@@ -356,7 +356,239 @@ public sealed class ModelCompatibilityTests
     }
 
     [Fact]
-    public async Task ChunkInterning_InverseOrderWholeTransactionsRetryForNewAndExistingNodes()
+    public async Task CallerOwnedTransactions_PredecessorDeadlocksButSuccessorSerializesInverseRoleInterning()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await CreateSchemaAsync(database.RuntimeConnectionString, cancellationToken);
+            var predecessorFirstItemId = Guid.NewGuid();
+            var predecessorSecondItemId = Guid.NewGuid();
+            var successorFirstItemId = Guid.NewGuid();
+            var successorSecondItemId = Guid.NewGuid();
+            var firstPersonId = Guid.Parse("10000000-0000-0000-0000-000000000001");
+            var secondPersonId = Guid.Parse("10000000-0000-0000-0000-000000000002");
+            await using (var setup = CreateContext(database.RuntimeConnectionString))
+            {
+                setup.AddRange(
+                    CreateBaseItem(predecessorFirstItemId, "inverse-intern-predecessor-first"),
+                    CreateBaseItem(predecessorSecondItemId, "inverse-intern-predecessor-second"),
+                    CreateBaseItem(successorFirstItemId, "inverse-intern-successor-first"),
+                    CreateBaseItem(successorSecondItemId, "inverse-intern-successor-second"),
+                    new People { Id = firstPersonId, Name = "Inverse Intern First", PersonType = "Actor" },
+                    new People { Id = secondPersonId, Name = "Inverse Intern Second", PersonType = "Actor" });
+                await setup.SaveChangesAsync(cancellationToken);
+                await setup.Database.ExecuteSqlRawAsync(
+                    """
+                    CREATE SEQUENCE public."__jellyfin_test_intern_barrier_one_sequence";
+                    CREATE SEQUENCE public."__jellyfin_test_intern_barrier_two_sequence";
+                    CREATE OR REPLACE FUNCTION public."__jellyfin_test_intern_barrier"()
+                    RETURNS trigger LANGUAGE plpgsql
+                    SET search_path = pg_catalog, public
+                    AS $jellyfin$
+                    DECLARE
+                        test_writer text := current_setting('jellyfin.test_intern_writer', true);
+                        writer_invocation bigint;
+                        lock_namespace bigint := (
+                            SELECT oid::bigint << 2
+                            FROM pg_catalog.pg_database
+                            WHERE datname = current_database());
+                        own_lock bigint;
+                        opposing_lock bigint;
+                        barrier_deadline timestamp with time zone := clock_timestamp() + interval '10 seconds';
+                    BEGIN
+                        IF test_writer = 'one' THEN
+                            writer_invocation := nextval('public."__jellyfin_test_intern_barrier_one_sequence"');
+                            own_lock := lock_namespace + 101;
+                            opposing_lock := lock_namespace + 102;
+                        ELSIF test_writer = 'two' THEN
+                            writer_invocation := nextval('public."__jellyfin_test_intern_barrier_two_sequence"');
+                            own_lock := lock_namespace + 102;
+                            opposing_lock := lock_namespace + 101;
+                        ELSE
+                            RAISE EXCEPTION 'missing deterministic interning-barrier writer'
+                                USING ERRCODE = '22023';
+                        END IF;
+
+                        IF writer_invocation <> 1 THEN
+                            RETURN NEW;
+                        END IF;
+
+                        -- The production interning trigger sorts before this test
+                        -- trigger. Each writer therefore retains its first new trie
+                        -- path before joining this bounded rendezvous.
+                        PERFORM pg_advisory_xact_lock(own_lock);
+                        LOOP
+                            EXIT WHEN EXISTS (
+                                SELECT 1
+                                FROM pg_catalog.pg_locks
+                                WHERE locktype = 'advisory'
+                                    AND granted
+                                    AND pid <> pg_backend_pid()
+                                    AND classid = (opposing_lock >> 32)::oid
+                                    AND objid = (opposing_lock & 4294967295)::oid
+                                    AND objsubid = 1);
+                            IF clock_timestamp() >= barrier_deadline THEN
+                                RAISE EXCEPTION 'timed out waiting for opposing interning-barrier lock'
+                                    USING ERRCODE = '57014';
+                            END IF;
+                            PERFORM pg_sleep(0.01);
+                        END LOOP;
+                        RETURN NEW;
+                    END;
+                    $jellyfin$;
+                    CREATE TRIGGER "ZZ_JellyfinTestInternBarrier"
+                        BEFORE INSERT ON public."PeopleBaseItemMap"
+                        FOR EACH ROW EXECUTE FUNCTION public."__jellyfin_test_intern_barrier"();
+                    """,
+                    cancellationToken);
+
+                await setup.Database.ExecuteSqlRawAsync(
+                    NpgsqlTextInterning.RestorePredecessorInternFunctionSql,
+                    cancellationToken);
+            }
+
+            // Both operations use the same ordered People keys, but assign opposite
+            // new roles to them. EF therefore reaches the real row triggers as A/B
+            // and B/A regardless of Add order. The test trigger runs after the
+            // interning trigger and holds both writers at a bounded advisory-lock
+            // rendezvous after their first trie insertions.
+            var predecessorFirstRole = "predecessor-role-a-" + Guid.NewGuid().ToString("N");
+            var predecessorSecondRole = "predecessor-role-b-" + Guid.NewGuid().ToString("N");
+            var firstReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var secondReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var predecessorForward = CaptureExceptionAsync(() => PersistRolesAfterBarrierAsync(
+                database.RuntimeConnectionString,
+                predecessorFirstItemId,
+                [firstPersonId, secondPersonId],
+                [predecessorFirstRole, predecessorSecondRole],
+                firstReady,
+                secondReady,
+                cancellationToken,
+                "one"));
+            var predecessorReverse = CaptureExceptionAsync(() => PersistRolesAfterBarrierAsync(
+                database.RuntimeConnectionString,
+                predecessorSecondItemId,
+                [firstPersonId, secondPersonId],
+                [predecessorSecondRole, predecessorFirstRole],
+                secondReady,
+                firstReady,
+                cancellationToken,
+                "two"));
+            var predecessorOutcomes = await Task.WhenAll(predecessorForward, predecessorReverse);
+            Assert.Single(predecessorOutcomes, exception => exception is null);
+            var predecessorFailure = Assert.Single(predecessorOutcomes, exception => exception is not null)!;
+            Assert.True(
+                HasPostgresSqlState(predecessorFailure, "40P01"),
+                $"Expected the predecessor's inverse trigger order to deadlock, but received: {predecessorFailure}");
+
+            await using (var upgrade = CreateContext(database.RuntimeConnectionString))
+            {
+                await upgrade.Database.ExecuteSqlRawAsync(
+                    """
+                    DROP TRIGGER "ZZ_JellyfinTestInternBarrier" ON public."PeopleBaseItemMap";
+                    DROP FUNCTION public."__jellyfin_test_intern_barrier"();
+                    DROP SEQUENCE public."__jellyfin_test_intern_barrier_one_sequence";
+                    DROP SEQUENCE public."__jellyfin_test_intern_barrier_two_sequence";
+                    """,
+                    cancellationToken);
+                await upgrade.Database.ExecuteSqlRawAsync(
+                    NpgsqlTextInterning.InstallDeadlockSafeInternFunctionSql,
+                    cancellationToken);
+            }
+
+            // ProviderId is itself part of EF's logical key, so EF may sort these
+            // rows into one order. This half verifies canonical provider identity;
+            // the role half above and below is the actual inverse-order regression.
+            var firstProvider = "inverse-provider-a-" + Guid.NewGuid().ToString("N");
+            var secondProvider = "inverse-provider-b-" + Guid.NewGuid().ToString("N");
+            firstReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            secondReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var forwardProviders = PersistProviderIdsAfterBarrierAsync(
+                database.RuntimeConnectionString,
+                successorFirstItemId,
+                [firstProvider, secondProvider],
+                firstReady,
+                secondReady,
+                cancellationToken);
+            var reverseProviders = PersistProviderIdsAfterBarrierAsync(
+                database.RuntimeConnectionString,
+                successorSecondItemId,
+                [secondProvider, firstProvider],
+                secondReady,
+                firstReady,
+                cancellationToken);
+            await Task.WhenAll(forwardProviders, reverseProviders);
+
+            var firstRole = "inverse-role-a-" + Guid.NewGuid().ToString("N");
+            var secondRole = "inverse-role-b-" + Guid.NewGuid().ToString("N");
+            firstReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            secondReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var forwardRoles = PersistRolesAfterBarrierAsync(
+                database.RuntimeConnectionString,
+                successorFirstItemId,
+                [firstPersonId, secondPersonId],
+                [firstRole, secondRole],
+                firstReady,
+                secondReady,
+                cancellationToken);
+            var reverseRoles = PersistRolesAfterBarrierAsync(
+                database.RuntimeConnectionString,
+                successorSecondItemId,
+                [firstPersonId, secondPersonId],
+                [secondRole, firstRole],
+                secondReady,
+                firstReady,
+                cancellationToken);
+            await Task.WhenAll(forwardRoles, reverseRoles);
+
+            await using var verification = CreateContext(database.RuntimeConnectionString);
+            var providerRows = await verification.BaseItemProviders
+                .Where(value => value.ItemId == successorFirstItemId || value.ItemId == successorSecondItemId)
+                .Select(value => new
+                {
+                    value.ProviderId,
+                    InternId = EF.Property<long>(value, "ProviderIdInternId")
+                })
+                .ToArrayAsync(cancellationToken);
+            Assert.Equal(4, providerRows.Length);
+            Assert.Equal(2, providerRows.Select(value => value.InternId).Distinct().Count());
+            Assert.All(
+                providerRows.GroupBy(value => value.ProviderId),
+                group => Assert.Single(group.Select(value => value.InternId).Distinct()));
+
+            var roleRows = await verification.PeopleBaseItemMap
+                .Where(value => value.ItemId == successorFirstItemId || value.ItemId == successorSecondItemId)
+                .Select(value => new
+                {
+                    value.Role,
+                    InternId = EF.Property<long>(value, "RoleInternId")
+                })
+                .ToArrayAsync(cancellationToken);
+            Assert.Equal(4, roleRows.Length);
+            Assert.Equal(2, roleRows.Select(value => value.InternId).Distinct().Count());
+            Assert.All(
+                roleRows.GroupBy(value => value.Role),
+                group => Assert.Single(group.Select(value => value.InternId).Distinct()));
+            Assert.Equal(
+                6,
+                await ScalarAsync<long>(
+                    verification,
+                    "SELECT count(DISTINCT \"Chunk\") FROM public.\"__JellyfinTextNodes\" WHERE NOT \"IsTerminal\"",
+                    cancellationToken));
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Fact]
+    public async Task ChunkInterning_CanonicalizesInverseOrderNewAndExistingNodes()
     {
         var options = PostgreSqlTestOptions.FromEnvironment();
         Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
@@ -369,21 +601,15 @@ public sealed class ModelCompatibilityTests
             var firstValue = "inverse-a-" + Guid.NewGuid().ToString("N");
             var secondValue = "inverse-b-" + Guid.NewGuid().ToString("N");
 
-            var firstReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            var secondReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            var forward = InternPairWithRetryAsync(
+            var forward = InternPairAsync(
                 database.RuntimeConnectionString,
                 firstValue,
                 secondValue,
-                firstReady,
-                secondReady,
                 cancellationToken);
-            var reverse = InternPairWithRetryAsync(
+            var reverse = InternPairAsync(
                 database.RuntimeConnectionString,
                 secondValue,
                 firstValue,
-                secondReady,
-                firstReady,
                 cancellationToken);
             var newNodeResults = await Task.WhenAll(forward, reverse);
             Assert.Equal(newNodeResults[0].First, newNodeResults[1].Second);
@@ -396,8 +622,8 @@ public sealed class ModelCompatibilityTests
                 cancellationToken);
             Assert.Equal(4, nodeCount);
 
-            firstReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            secondReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var firstReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var secondReady = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             forward = InternPairWithRetryAsync(
                 database.RuntimeConnectionString,
                 firstValue,
@@ -507,6 +733,21 @@ public sealed class ModelCompatibilityTests
                     cancellationToken);
             }
 
+            var forwardFirstValue = "save-race-forward-a-" + Guid.NewGuid().ToString("N");
+            var forwardSecondValue = "save-race-forward-b-" + Guid.NewGuid().ToString("N");
+            var reverseFirstValue = "save-race-reverse-a-" + Guid.NewGuid().ToString("N");
+            var reverseSecondValue = "save-race-reverse-b-" + Guid.NewGuid().ToString("N");
+            await using (var internSetup = CreateContext(database.RuntimeConnectionString))
+            await using (var internTransaction = await internSetup.Database.BeginTransactionAsync(cancellationToken))
+            {
+                foreach (var value in new[] { forwardFirstValue, forwardSecondValue, reverseFirstValue, reverseSecondValue })
+                {
+                    await InternTextAsync(internSetup, value, cancellationToken);
+                }
+
+                await internTransaction.CommitAsync(cancellationToken);
+            }
+
             await using var forwardContext = CreateContext(database.RuntimeConnectionString);
             await using var reverseContext = CreateContext(database.RuntimeConnectionString);
             await forwardContext.Database.OpenConnectionAsync(cancellationToken);
@@ -517,10 +758,6 @@ public sealed class ModelCompatibilityTests
             await reverseContext.Database.ExecuteSqlRawAsync(
                 "SET jellyfin.test_deadlock_role = 'two'",
                 cancellationToken);
-            var forwardFirstValue = "save-race-forward-a-" + Guid.NewGuid().ToString("N");
-            var forwardSecondValue = "save-race-forward-b-" + Guid.NewGuid().ToString("N");
-            var reverseFirstValue = "save-race-reverse-a-" + Guid.NewGuid().ToString("N");
-            var reverseSecondValue = "save-race-reverse-b-" + Guid.NewGuid().ToString("N");
             var forwardEntries = new[]
             {
                 forwardContext.ItemValues.Add(CreateItemValue(forwardFirstValue, ItemValueType.Genre)),
@@ -1214,6 +1451,7 @@ public sealed class ModelCompatibilityTests
                         "20261009061101_InitialPostgreSqlBaseline",
                         "20261009061446_AddActivityLogTypeDateIndex",
                         "20261009113458_AddUuidMinMaxAggregates",
+                        "20261011031154_SerializeTextInterningMisses",
                     ],
                     migrationIds);
                 await context.Database.ExecuteSqlRawAsync(
@@ -1481,6 +1719,96 @@ public sealed class ModelCompatibilityTests
         await context.SaveChangesAsync(cancellationToken);
     }
 
+    private static async Task<Exception?> CaptureExceptionAsync(Func<Task> operation)
+    {
+        try
+        {
+            await operation();
+            return null;
+        }
+        catch (Exception exception)
+        {
+            return exception;
+        }
+    }
+
+    private static bool HasPostgresSqlState(Exception? exception, string sqlState)
+        => exception switch
+        {
+            global::Npgsql.PostgresException postgresException => postgresException.SqlState == sqlState,
+            AggregateException aggregateException => aggregateException.InnerExceptions.Any(
+                innerException => HasPostgresSqlState(innerException, sqlState)),
+            null => false,
+            _ => HasPostgresSqlState(exception.InnerException, sqlState),
+        };
+
+    private static async Task PersistProviderIdsAfterBarrierAsync(
+        string connectionString,
+        Guid itemId,
+        IReadOnlyList<string> providerIds,
+        TaskCompletionSource ownReady,
+        TaskCompletionSource otherReady,
+        CancellationToken cancellationToken)
+    {
+        await using var context = CreateContext(connectionString);
+        await using var transaction = await context.Database.BeginTransactionAsync(cancellationToken);
+        Assert.Equal(IsolationLevel.ReadCommitted, transaction.GetDbTransaction().IsolationLevel);
+        foreach (var providerId in providerIds)
+        {
+            context.BaseItemProviders.Add(new BaseItemProvider
+            {
+                ItemId = itemId,
+                Item = null!,
+                ProviderId = providerId,
+                ProviderValue = "inverse-order"
+            });
+        }
+
+        ownReady.TrySetResult();
+        await otherReady.Task.WaitAsync(cancellationToken);
+        await context.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    private static async Task PersistRolesAfterBarrierAsync(
+        string connectionString,
+        Guid itemId,
+        IReadOnlyList<Guid> personIds,
+        IReadOnlyList<string> roles,
+        TaskCompletionSource ownReady,
+        TaskCompletionSource otherReady,
+        CancellationToken cancellationToken,
+        string? barrierWriter = null)
+    {
+        await using var context = CreateContext(connectionString);
+        await using var transaction = await context.Database.BeginTransactionAsync(cancellationToken);
+        Assert.Equal(IsolationLevel.ReadCommitted, transaction.GetDbTransaction().IsolationLevel);
+        if (barrierWriter is not null)
+        {
+            await context.Database.ExecuteSqlInterpolatedAsync(
+                $"SELECT set_config('jellyfin.test_intern_writer', {barrierWriter}, true)",
+                cancellationToken);
+        }
+
+        for (var index = 0; index < roles.Count; index++)
+        {
+            context.PeopleBaseItemMap.Add(new PeopleBaseItemMap
+            {
+                ItemId = itemId,
+                Item = null!,
+                PeopleId = personIds[index],
+                People = null!,
+                Role = roles[index],
+                ListOrder = index
+            });
+        }
+
+        ownReady.TrySetResult();
+        await otherReady.Task.WaitAsync(cancellationToken);
+        await context.SaveChangesAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
     private static async Task<(long First, long Second)> InternPairWithRetryAsync(
         string connectionString,
         string firstValue,
@@ -1507,6 +1835,20 @@ public sealed class ModelCompatibilityTests
             await transaction.CommitAsync(cancellationToken);
             return (first, second);
         });
+    }
+
+    private static async Task<(long First, long Second)> InternPairAsync(
+        string connectionString,
+        string firstValue,
+        string secondValue,
+        CancellationToken cancellationToken)
+    {
+        await using var context = CreateContext(connectionString);
+        await using var transaction = await context.Database.BeginTransactionAsync(cancellationToken);
+        var first = await InternTextAsync(context, firstValue, cancellationToken);
+        var second = await InternTextAsync(context, secondValue, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return (first, second);
     }
 
     private static Task<long> CountZeroInternIdsAsync(
@@ -1585,7 +1927,7 @@ public sealed class ModelCompatibilityTests
     {
         await using var context = CreateContext(connectionString);
         Assert.True(await context.Database.EnsureCreatedAsync(cancellationToken));
-        await context.Database.ExecuteSqlRawAsync(NpgsqlTextInterning.InstallSql, cancellationToken);
+        await context.Database.ExecuteSqlRawAsync(NpgsqlTextInterning.InstallCurrentSql, cancellationToken);
         Assert.Equal(
             NpgsqlModelCustomizer.ModelContract,
             context.GetService<IDesignTimeModel>().Model[NpgsqlModelCustomizer.ModelContractAnnotation]);
