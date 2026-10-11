@@ -5,8 +5,8 @@ and `database.xml` as one startup-critical release selection.
 
 ## Canonical folder protocol
 
-Release 0.1.2.0 uses the exact directory `Npgsql Database_0.1.2.0` and the exact
-`PluginName` value `Npgsql Database_0.1.2.0`. Jellyfin 12.2 searches plugin
+Release 0.1.3.0 uses the exact directory `Npgsql Database_0.1.3.0` and the exact
+`PluginName` value `Npgsql Database_0.1.3.0`. Jellyfin 12.2 searches plugin
 directories by prefix, but the provider independently compares both the
 configured name and its actual parent directory with this exact value before it
 opens PostgreSQL. An older release directory cannot match a newer fully

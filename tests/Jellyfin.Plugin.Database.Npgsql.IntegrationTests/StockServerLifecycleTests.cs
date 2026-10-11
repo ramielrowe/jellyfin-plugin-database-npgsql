@@ -248,7 +248,7 @@ public sealed class StockServerLifecycleTests
             installPackage: true,
             deleteAssembly: false,
             deleteMetadata: false,
-            pluginName: "Npgsql Database_0.1.0",
+            pluginName: PluginMetadata.InstallationDirectory[..PluginMetadata.InstallationDirectory.LastIndexOf('.')],
             expectedDiagnostic: "exact folder and PluginName",
             secret,
             cancellationToken);

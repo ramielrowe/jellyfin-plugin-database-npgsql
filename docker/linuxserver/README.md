@@ -10,7 +10,7 @@ For Kubernetes, prefer the dedicated
 stock LinuxServer image and plugin lifecycles separate while sharing this
 image's exact installer, checksums, and fail-closed package policy.
 
-The image is deliberately narrow: plugin `0.1.2.0`, Jellyfin database ABI
+The image is deliberately narrow: plugin `0.1.3.0`, Jellyfin database ABI
 `12.2.0.0`, LinuxServer.io base `12.2ubu2604-ls53`, and PostgreSQL `16.6` are
 the only supported combination. The Dockerfile pins both build and runtime
 images by digest. Published images support `linux/amd64` only.
@@ -23,15 +23,15 @@ Images are published to:
 ghcr.io/ramielrowe/jellyfin-plugin-database-npgsql-linuxserver
 ```
 
-A published release has three tags: the plugin version (for example `0.1.2.0`),
+A published release has three tags: the plugin version (for example `0.1.3.0`),
 `sha-<12-character-commit>`, and `latest`. Registry tags can be moved by a
 subsequent publish, so production deployments should resolve a tag once and
 then pull by its immutable digest:
 
 ```sh
-docker pull ghcr.io/ramielrowe/jellyfin-plugin-database-npgsql-linuxserver:0.1.2.0
+docker pull ghcr.io/ramielrowe/jellyfin-plugin-database-npgsql-linuxserver:0.1.3.0
 docker image inspect --format '{{index .RepoDigests 0}}' \
-  ghcr.io/ramielrowe/jellyfin-plugin-database-npgsql-linuxserver:0.1.2.0
+  ghcr.io/ramielrowe/jellyfin-plugin-database-npgsql-linuxserver:0.1.3.0
 docker pull ghcr.io/ramielrowe/jellyfin-plugin-database-npgsql-linuxserver@sha256:REPLACE_WITH_DIGEST
 ```
 
@@ -72,14 +72,14 @@ SQLite installation. Provision PostgreSQL `16.6` separately and follow the
 repository [operator guide](../../docs/operator-guide.md) to create
 `/config/database.xml`. Use secrets or a mode-`0600` passfile; do not place a
 password in Compose environment variables. The configured `PluginName` must be
-exactly `Npgsql Database_0.1.2.0`.
+exactly `Npgsql Database_0.1.3.0`.
 
 At each startup, an s6 oneshot runs after LinuxServer.io's Jellyfin config
 initialization and before `init-config-end`. It verifies the embedded seed's
 exact seven-file allowlist and checksums, then atomically creates:
 
 ```text
-/config/data/plugins/Npgsql Database_0.1.2.0
+/config/data/plugins/Npgsql Database_0.1.3.0
 ```
 
 Restarting with identical content and exact metadata is idempotent. The

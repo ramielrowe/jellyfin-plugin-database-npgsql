@@ -365,8 +365,8 @@ NUGET_HTTP_CACHE_PATH="$PLUGIN_ROOT/.nuget-http"
 PLUGIN_PROJECT="$PLUGIN_ROOT/src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj"
 HASH_HELPER_PROJECT="$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/Jellyfin.Plugin.Database.Npgsql.TestHarness.csproj"
 HASH_HELPER="$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.TestHarness/bin/Release/net10.0/Jellyfin.Plugin.Database.Npgsql.TestHarness.dll"
-PACKAGE_ZIP="$PLUGIN_ROOT/artifacts/jellyfin-plugin-database-npgsql_0.1.2.0.zip"
-PLUGIN_FOLDER_NAME="Npgsql Database_0.1.2.0"
+PACKAGE_ZIP="$PLUGIN_ROOT/artifacts/jellyfin-plugin-database-npgsql_0.1.3.0.zip"
+PLUGIN_FOLDER_NAME="Npgsql Database_0.1.3.0"
 PLUGIN_FOLDER="$RUN_ROOT/runtime/data/plugins/$PLUGIN_FOLDER_NAME"
 AMBIGUOUS_PLUGIN_FOLDER="$RUN_ROOT/runtime/data/plugins/$PLUGIN_FOLDER_NAME-ambiguous"
 OLD_PLUGIN_FOLDER="$RUN_ROOT/runtime/data/plugins/Npgsql Database_0.0.9.0"
@@ -1072,7 +1072,7 @@ password = open(password_file, encoding="utf-8").read()
 root = ET.Element("DatabaseConfigurationOptions")
 ET.SubElement(root, "DatabaseType").text = "PLUGIN_PROVIDER"
 custom = ET.SubElement(root, "CustomProviderOptions")
-ET.SubElement(custom, "PluginName").text = "Npgsql Database_0.1.2.0"
+ET.SubElement(custom, "PluginName").text = "Npgsql Database_0.1.3.0"
 ET.SubElement(custom, "PluginAssembly").text = "Jellyfin.Plugin.Database.Npgsql.dll"
 ET.SubElement(custom, "ConnectionString").text = f"Host=127.0.0.1;Port={port};Database=jellyfin;Username=jellyfin;Password={password};Maximum Pool Size=4"
 ET.SubElement(custom, "Options")
@@ -1388,7 +1388,7 @@ start_host \
 wait_for_health "$HTTP_PORT" || fail "vanilla Jellyfin 12.2 did not become healthy"
 assert_loopback_listener "$HTTP_PORT"
 assert_host_remains_healthy "$HTTP_PORT" "$RUN_ROOT/first-start.log"
-grep -q 'Npgsql database provider 0.1.2.0 loaded.*in Default' "$RUN_ROOT/first-start.log" \
+grep -q 'Npgsql database provider 0.1.3.0 loaded.*in Default' "$RUN_ROOT/first-start.log" \
     || fail "provider was not loaded in the default load context"
 assert_log_origin "$RUN_ROOT/first-start.log" "provider" "$PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.dll"
 assert_log_origin "$RUN_ROOT/first-start.log" "Npgsql EF" "$PLUGIN_FOLDER/Npgsql.EntityFrameworkCore.PostgreSQL.dll"

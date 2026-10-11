@@ -6,12 +6,12 @@ existing installation.
 
 ## Supported matrix and hard limits
 
-| Component | Supported by plugin 0.1.2.0 |
+| Component | Supported by plugin 0.1.3.0 |
 | --- | --- |
 | Jellyfin host | Exact database ABI `12.2.0.0`, tested with vanilla Jellyfin `12.2.0.0` |
 | PostgreSQL server | Exact qualification target and supported matrix: PostgreSQL `16.6` |
 | Runtime | .NET 10 on Linux x64, as exercised by release qualification |
-| Plugin directory | Exact `Npgsql Database_0.1.2.0` |
+| Plugin directory | Exact `Npgsql Database_0.1.3.0` |
 | Provider assembly | Exact `Jellyfin.Plugin.Database.Npgsql.dll` |
 
 Do not force an unsupported Jellyfin version by editing metadata, renaming
@@ -127,9 +127,9 @@ cannot contribute files to a retry.
 set -eu
 export RELEASE_DIR='/absolute/path/to/downloaded-release'
 export JELLYFIN_PLUGIN_ROOT='/absolute/path/to/jellyfin/plugins'
-export PACKAGE_NAME=jellyfin-plugin-database-npgsql_0.1.2.0.zip
-export CHECKSUM_NAME=jellyfin-plugin-database-npgsql_0.1.2.0.zip.sha256
-export PLUGIN_NAME='Npgsql Database_0.1.2.0'
+export PACKAGE_NAME=jellyfin-plugin-database-npgsql_0.1.3.0.zip
+export CHECKSUM_NAME=jellyfin-plugin-database-npgsql_0.1.3.0.zip.sha256
+export PLUGIN_NAME='Npgsql Database_0.1.3.0'
 
 cd "$RELEASE_DIR"
 sha256sum --check --strict "$CHECKSUM_NAME"
@@ -221,7 +221,7 @@ the endpoint and secret-file paths:
 <DatabaseConfigurationOptions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <DatabaseType>PLUGIN_PROVIDER</DatabaseType>
   <CustomProviderOptions>
-    <PluginName>Npgsql Database_0.1.2.0</PluginName>
+    <PluginName>Npgsql Database_0.1.3.0</PluginName>
     <PluginAssembly>Jellyfin.Plugin.Database.Npgsql.dll</PluginAssembly>
     <ConnectionString>Host=db.example;Port=5432;Database=jellyfin;Username=jellyfin_runtime;Passfile=/run/secrets/jellyfin-pgpass;SSL Mode=VerifyFull;Root Certificate=/run/secrets/postgresql-root.crt;Maximum Pool Size=20;Timeout=15;Cancellation Timeout=2000</ConnectionString>
     <Options>

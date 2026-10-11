@@ -237,7 +237,7 @@ same play count as a direct no-tracking database read, proving cache consistency
 No Jellyfin host patch or schema migration is required: both resolvers are provider
 runtime behavior and remain pinned to the existing Jellyfin database ABI
 12.2.0.0. The already-published 0.1.1.0 binary does not contain it and remains
-affected. The fix ships as plugin 0.1.2.0; select its new versioned installation
+affected. The fix ships as plugin 0.1.3.0; select its new versioned installation
 directory rather than overwriting an installed 0.1.1.0 directory in place. The
 normal package/host compatibility and rollback rules still apply.
 

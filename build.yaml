@@ -1,7 +1,7 @@
 ---
 name: "Npgsql Database"
 guid: "8a6e4c5e-2185-45df-a30f-cc828529330b"
-version: "0.1.2.0"
+version: "0.1.3.0"
 targetAbi: "12.2.0.0"
 framework: "net10.0"
 overview: "PostgreSQL database provider for Jellyfin; full-system restore is unsupported"
@@ -20,6 +20,5 @@ artifacts:
   - "LICENSE"
   - "THIRD-PARTY-NOTICES.md"
 changelog: >
-  Fixes concurrent metadata and user-data insertion so scans share canonical
-  ItemValues rows and playback requests preserve one complete cached UserData snapshot;
-  disables PostgreSQL JIT on plugin connections to avoid Continue Watching query stalls.
+  Prevents PostgreSQL deadlocks when concurrent Jellyfin operations intern
+  previously unseen text values in different orders.

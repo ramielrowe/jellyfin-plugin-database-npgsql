@@ -13,7 +13,7 @@ public static class PluginMetadata
 #if NPGSQL_PREDECESSOR_FIXTURE
     public const string Version = "0.0.9.0";
 #else
-    public const string Version = "0.1.2.0";
+    public const string Version = "0.1.3.0";
 #endif
 
     /// <summary>

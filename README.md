@@ -10,7 +10,7 @@ change it between releases.
 
 ## Compatibility baseline
 
-The supported production matrix is deliberately narrow: plugin `0.1.2.0`, exact
+The supported production matrix is deliberately narrow: plugin `0.1.3.0`, exact
 Jellyfin database ABI `12.2.0.0` (the vanilla Jellyfin `12.2.0.0` host), and
 PostgreSQL `16.6`. The release project targets .NET 10, compiles against the
 published `Jellyfin.Database.Implementations` 12.2.0 contract, and pins EF Core
@@ -46,7 +46,7 @@ preliminary migration container can change PostgreSQL.
 ## Installation and version selection
 
 Extract one complete release ZIP into the exact versioned directory
-`Npgsql Database_0.1.2.0`. In `database.xml`, select `PLUGIN_PROVIDER`, set
+`Npgsql Database_0.1.3.0`. In `database.xml`, select `PLUGIN_PROVIDER`, set
 `PluginName` to that exact directory name, and set `PluginAssembly` to
 `Jellyfin.Plugin.Database.Npgsql.dll`. The plugin validates the exact directory
 because vanilla Jellyfin uses a prefix search; this prevents a leftover older or
@@ -96,7 +96,7 @@ configuration is:
 <DatabaseConfigurationOptions>
   <DatabaseType>PLUGIN_PROVIDER</DatabaseType>
   <CustomProviderOptions>
-    <PluginName>Npgsql Database_0.1.2.0</PluginName>
+    <PluginName>Npgsql Database_0.1.3.0</PluginName>
     <PluginAssembly>Jellyfin.Plugin.Database.Npgsql.dll</PluginAssembly>
     <ConnectionString>Host=db.example;Database=jellyfin;Username=jellyfin_runtime;Passfile=/run/secrets/jellyfin-pgpass;SSL Mode=VerifyFull;Root Certificate=/run/secrets/postgresql-root.crt</ConnectionString>
     <Options>
