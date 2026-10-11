@@ -67,6 +67,9 @@ public sealed class ProviderCoreTests
         Assert.Equal(typeof(NpgsqlDatabaseProvider).Assembly.GetName().Name, relational.MigrationsAssembly);
         Assert.Equal(45, relational.CommandTimeout);
         Assert.Equal(45, configured.CommandTimeout);
+        Assert.Equal(
+            NpgsqlOptionsBootstrap.PostgreSqlSessionOptions,
+            new NpgsqlConnectionStringBuilder(configured.ConnectionString).Options);
         Assert.Contains(
             options.Options.Extensions,
             extension => extension.GetType().Name.Contains("NpgsqlOptionsExtension", StringComparison.Ordinal));
@@ -205,6 +208,7 @@ public sealed class ProviderCoreTests
         Assert.Equal(32, normalized.MaxPoolSize);
         Assert.Equal("public", normalized.SearchPath);
         Assert.Equal("UTC", normalized.Timezone);
+        Assert.Equal("-c jit=off", normalized.Options);
         Assert.True(configured.PassfileConfigured);
         Assert.True(configured.Pooling);
     }
