@@ -19,7 +19,7 @@ installs the predecessor before first start, and writes vanilla
 `PLUGIN_PROVIDER` configuration. It completes setup over HTTP, creates two
 users, adds and scans a metadata-rich movie library, shuts down through the
 public API, and proves the exact 51-row history.
-It then installs `0.1.3.0` in its versioned folder, atomically rewrites
+It then installs `0.1.4.0` in its versioned folder, atomically rewrites
 `database.xml`, launches a fresh process, and proves the UUID aggregate
 migration is the only new database migration. A third fresh process proves the
 52-row code/database history is idempotent and the users and media remain
@@ -55,7 +55,7 @@ ABI `12.2.0.0`, not an untested `12.2.x` range. Jellyfin tag `v12.2` and the
 supported 12.2 host release to use as a genuine host-version upgrade fixture.
 The next available host line reports ABI `13.0.0.0` and is intentionally rejected
 before connection parsing. Consequently this release proves plugin `0.0.9.0` to
-`0.1.3.0` upgrade plus restart on the one supported stock host, and explicitly
+`0.1.4.0` upgrade plus restart on the one supported stock host, and explicitly
 does not claim a host-version upgrade. A second supported host must be added to
 the integrity manifest and exercised against the same plugin/data/history/API
 state before the compatibility contract can be widened.

@@ -9,7 +9,7 @@
     <PublishDirectory>$(ArtifactsDirectory)publish/</PublishDirectory>
     <PackageDirectory>$(ArtifactsDirectory)package/</PackageDirectory>
     <SymbolsDirectory>$(ArtifactsDirectory)symbols/</SymbolsDirectory>
-    <PackagePath>$(ArtifactsDirectory)jellyfin-plugin-database-npgsql_0.1.3.0.zip</PackagePath>
+    <PackagePath>$(ArtifactsDirectory)jellyfin-plugin-database-npgsql_0.1.4.0.zip</PackagePath>
     <PackageChecksumPath>$(PackagePath).sha256</PackageChecksumPath>
     <SymbolPath>$(SymbolsDirectory)Jellyfin.Plugin.Database.Npgsql.pdb</SymbolPath>
     <SymbolChecksumPath>$(SymbolPath).sha256</SymbolChecksumPath>

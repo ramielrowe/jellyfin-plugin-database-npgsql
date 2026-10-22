@@ -9,8 +9,8 @@
   "versions": [],
   "status": "Active",
   "targetAbi": "12.2.0.0",
-  "version": "0.1.3.0",
-  "changelog": "Prevents PostgreSQL deadlocks when concurrent Jellyfin operations intern previously unseen text values in different orders.",
+  "version": "0.1.4.0",
+  "changelog": "Prevents lost metadata saves when concurrent refreshes rewrite the same item's provider IDs, which previously failed with a BaseItemProviders unique-key violation.",
   "autoUpdate": false,
   "assemblies": [
     "Jellyfin.Plugin.Database.Npgsql.dll"

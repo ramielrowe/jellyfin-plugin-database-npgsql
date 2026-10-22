@@ -1,7 +1,7 @@
 # Kubernetes plugin seed image
 
 This directory publishes a small, **init-container-only** image containing the
-exact seven files for plugin `0.1.3.0` and an atomic installer. It is intended
+exact seven files for plugin `0.1.4.0` and an atomic installer. It is intended
 to run before the unmodified, qualified LinuxServer Jellyfin image. It is not a
 Jellyfin server image and is not supported by LinuxServer.io or Jellyfin.
 
@@ -27,7 +27,7 @@ Jellyfin Pods or two seed writers to share this config volume.
 
 Before the **first** Pod starts, the external config PVC must already contain a
 valid `/config/database.xml` selecting `PLUGIN_PROVIDER`, plugin name
-`Npgsql Database_0.1.3.0`, and assembly
+`Npgsql Database_0.1.4.0`, and assembly
 `Jellyfin.Plugin.Database.Npgsql.dll`. Follow the
 [operator guide](../../docs/operator-guide.md). The seed image does not create
 that file, provision PostgreSQL, create a database or role, migrate SQLite, or

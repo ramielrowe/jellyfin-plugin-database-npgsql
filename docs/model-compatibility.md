@@ -264,11 +264,11 @@ with the production 23505 on `IX_BaseItemProviders_ItemId_ProviderIdInternId`.
 
 No Jellyfin host patch or schema migration is required: the resolvers are provider
 runtime behavior and remain pinned to the existing Jellyfin database ABI
-12.2.0.0. The already-published 0.1.1.0 binary does not contain it and remains
-affected. The fix ships as plugin 0.1.3.0; select its new versioned installation
-directory rather than overwriting an installed 0.1.1.0 directory in place. The
-normal package/host compatibility and rollback rules still apply. The provider
-resolver is not in 0.1.3.0 and ships in the release after it.
+12.2.0.0. The already-published 0.1.1.0 binary contains none of them, and 0.1.3.0
+lacks the provider resolver; both remain affected. The fixes ship as plugin
+0.1.4.0; select its new versioned installation directory rather than overwriting
+an installed older directory in place. The normal package/host compatibility and
+rollback rules still apply.
 
 The checked-in migration reproduces this finalized model exactly. It installs
 both LIKE forms and the bounded-prefix function, the miss-serialized interning

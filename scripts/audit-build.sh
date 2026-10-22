@@ -3,7 +3,7 @@ set -euo pipefail
 
 PLUGIN_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PACKAGE_DIR="$PLUGIN_ROOT/artifacts/package"
-PACKAGE_ZIP="$PLUGIN_ROOT/artifacts/jellyfin-plugin-database-npgsql_0.1.3.0.zip"
+PACKAGE_ZIP="$PLUGIN_ROOT/artifacts/jellyfin-plugin-database-npgsql_0.1.4.0.zip"
 PACKAGE_CHECKSUM="$PACKAGE_ZIP.sha256"
 SYMBOL_FILE="$PLUGIN_ROOT/artifacts/symbols/Jellyfin.Plugin.Database.Npgsql.pdb"
 SYMBOL_CHECKSUM="$SYMBOL_FILE.sha256"
@@ -109,8 +109,8 @@ if metadata.get("status") != "Active" or metadata.get("autoUpdate") is not False
 if metadata.get("assemblies") != ["Jellyfin.Plugin.Database.Npgsql.dll"]:
     raise SystemExit("FAIL: metadata ordinary-plugin assembly allowlist changed")
 expected_release_files = {
-    "packageFile": "jellyfin-plugin-database-npgsql_0.1.3.0.zip",
-    "checksumFile": "jellyfin-plugin-database-npgsql_0.1.3.0.zip.sha256",
+    "packageFile": "jellyfin-plugin-database-npgsql_0.1.4.0.zip",
+    "checksumFile": "jellyfin-plugin-database-npgsql_0.1.4.0.zip.sha256",
     "symbolFile": "Jellyfin.Plugin.Database.Npgsql.pdb",
     "symbolChecksumFile": "Jellyfin.Plugin.Database.Npgsql.pdb.sha256",
 }

@@ -218,10 +218,10 @@ public sealed class TestInfrastructureTests
             }
 
             var layout = JellyfinHostLayout.Create(Path.Combine(tempRoot, "artifacts"), publish, "worker-a");
-            var pluginDirectory = layout.InstallPluginZip(package, "Npgsql Database_0.1.3.0");
+            var pluginDirectory = layout.InstallPluginZip(package, "Npgsql Database_0.1.4.0");
             layout.WriteDatabaseConfiguration(
                 "Host=localhost;Database=test;Username=test;Password=secret",
-                "Npgsql Database_0.1.3.0",
+                "Npgsql Database_0.1.4.0",
                 "plugin.dll");
             layout.WriteNetworkConfiguration(18096, 18920);
             const string LogSecret = "must-not-survive-log-collection";
