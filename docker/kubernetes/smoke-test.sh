@@ -4,7 +4,7 @@ set -euo pipefail
 export LC_ALL=C
 
 image=${1:-jellyfin-npgsql-seed:test}
-linuxserver_image='lscr.io/linuxserver/jellyfin:12.2ubu2604-ls53@sha256:1bb4f88d822a0510bb3604b68aacb80d77c1d2a30181e500090c65111b98723b'
+linuxserver_image='ghcr.io/linuxserver/jellyfin:12.2ubu2604-ls53@sha256:1bb4f88d822a0510bb3604b68aacb80d77c1d2a30181e500090c65111b98723b'
 postgres_image='postgres:16.6@sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36'
 installation_directory='Npgsql Database_0.1.4.0'
 password='jellyfin-seed-smoke-password'
