@@ -111,9 +111,15 @@ jobs:
       NUGET_PACKAGES: ${{ github.workspace }}/.packages
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The predecessor fixture's pinned assembly hash covers its portable PDB ID,
+      # which records the exact compiler and the .NET runtime it ran on. Install
+      # the exact SDK in isolation so newer runner-image SDKs and runtimes are not
+      # selected by roll-forward.
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
         with:
-          dotnet-version: 10.0.100
+          dotnet-version: 10.0.401
           cache: true
           cache-dependency-path: '**/packages.lock.json'
       - name: Run canonical release qualification
