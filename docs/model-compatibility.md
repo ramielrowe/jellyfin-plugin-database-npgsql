@@ -96,6 +96,26 @@ continue through EF's ordinary update path. The
 `IX_UserData_ItemId_UserId_CustomDataKeyInternId` constraint remains the identity
 authority, and no `SaveChanges` retry is introduced.
 
+Item providers have a delete-then-insert window rather than a read-before-insert
+one. For an existing item, `UpdateOrInsertItems` attaches the remapped item as
+Modified, runs `ExecuteDelete` on its `BaseItemProviders`, and inserts the item's
+current provider set through `SaveChanges`, all in the same caller-owned
+transaction. When two metadata refreshes save the same item, the second delete
+waits on the first transaction's deleted rows, resumes after that commit, and
+cannot see the providers it inserted, so the second insert fails with 23505 and
+the whole save rolls back. SQLite's single writer lock serializes the two
+rewrites instead. `NpgsqlBaseItemProviderConcurrencyInterceptor` handles only
+Added providers whose owning item is tracked as Modified in the same save. It
+upserts each provider's `ProviderValue` in stable item/provider order, returns the
+trigger-owned intern ID, and marks the entry unchanged. A new item's providers stay
+on EF's ordinary path: inserting them before the item would violate their foreign
+key, and concurrent creation of the same item already conflicts on `BaseItems`.
+Other explicit provider inserts also keep ordinary duplicate rejection. If the
+concurrent rewrites carry different provider *names*, the resolved row set is
+their union for the names the later writer omitted, not the later writer's exact set as
+under SQLite. The later writer's value always wins for every name it writes.
+`IX_BaseItemProviders_ItemId_ProviderIdInternId` remains the identity authority.
+
 The initial PostgreSQL migration must install `NpgsqlTextInterning.InstallSql` in
 the same transaction which creates the owning tables, and must omit/drop the
 three unsafe full-text database primary-key constraints. The EF logical keys are
@@ -234,12 +254,21 @@ A test-only trigger widens the insert window; both `OnPlaybackStart` calls must
 succeed, one physical row must remain, and `UserItems/{id}/UserData` must return the
 same play count as a direct no-tracking database read, proving cache consistency.
 
-No Jellyfin host patch or schema migration is required: both resolvers are provider
+Provider coverage reproduces the production interleaving deterministically. The
+first rewrite deletes the item's seeded providers and pauses. The second rewrite's
+delete starts, and the test waits until `pg_stat_activity` reports that backend
+blocked on a lock before it releases the first. Both saves must commit, and exactly the
+second writer's providers must remain. A duplicate explicit insert outside the
+rewrite path must still fail. With the interceptor unregistered, the same test fails
+with the production 23505 on `IX_BaseItemProviders_ItemId_ProviderIdInternId`.
+
+No Jellyfin host patch or schema migration is required: the resolvers are provider
 runtime behavior and remain pinned to the existing Jellyfin database ABI
 12.2.0.0. The already-published 0.1.1.0 binary does not contain it and remains
 affected. The fix ships as plugin 0.1.3.0; select its new versioned installation
 directory rather than overwriting an installed 0.1.1.0 directory in place. The
-normal package/host compatibility and rollback rules still apply.
+normal package/host compatibility and rollback rules still apply. The provider
+resolver is not in 0.1.3.0 and ships in the release after it.
 
 The checked-in migration reproduces this finalized model exactly. It installs
 both LIKE forms and the bounded-prefix function, the miss-serialized interning

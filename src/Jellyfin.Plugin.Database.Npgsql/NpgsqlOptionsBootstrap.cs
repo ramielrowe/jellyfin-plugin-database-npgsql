@@ -80,7 +80,8 @@ internal static class NpgsqlOptionsBootstrap
             .AddInterceptors(
                 NpgsqlQueryExpressionInterceptor.Instance,
                 NpgsqlItemValueConcurrencyInterceptor.Instance,
-                NpgsqlUserDataConcurrencyInterceptor.Instance);
+                NpgsqlUserDataConcurrencyInterceptor.Instance,
+                NpgsqlBaseItemProviderConcurrencyInterceptor.Instance);
         return configured;
     }
 

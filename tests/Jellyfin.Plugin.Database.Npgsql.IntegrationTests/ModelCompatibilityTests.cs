@@ -356,6 +356,105 @@ public sealed class ModelCompatibilityTests
     }
 
     [Fact]
+    public async Task CallerOwnedTransactions_ResolveConcurrentProviderRewriteOfOneExistingItem()
+    {
+        var options = PostgreSqlTestOptions.FromEnvironment();
+        Assert.SkipUnless(options.IsConfigured, options.MissingInfrastructureMessage);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var environment = await PostgreSqlTestEnvironment.CreateAsync(options, cancellationToken);
+        await using var database = await environment.CreateDatabaseAsync(cancellationToken);
+        try
+        {
+            await CreateSchemaAsync(database.RuntimeConnectionString, cancellationToken);
+            var itemId = Guid.NewGuid();
+            await using (var seed = CreateContext(database.RuntimeConnectionString))
+            {
+                var item = CreateBaseItem(itemId, "provider-rewrite");
+                item.Provider =
+                [
+                    new BaseItemProvider { Item = item, ProviderId = "Imdb", ProviderValue = "tt-seed" },
+                    new BaseItemProvider { Item = item, ProviderId = "Tmdb", ProviderValue = "seed" }
+                ];
+                seed.BaseItems.Add(item);
+                await seed.SaveChangesAsync(cancellationToken);
+            }
+
+            // Reproduce the production interleaving: the second rewrite's delete waits on
+            // the first rewrite's deleted rows, then resumes after that commit without
+            // seeing the first rewrite's newly inserted providers.
+            var firstDeleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var secondBackend = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+            // The host performs these steps synchronously; keep each blocking writer off the test thread.
+            var firstOperation = Task.Run(
+                () => RewriteItemProvidersAsync(
+                    database.RuntimeConnectionString,
+                    itemId,
+                    new Dictionary<string, string> { ["Imdb"] = "tt-first", ["Tmdb"] = "first" },
+                    _ => { },
+                    async () =>
+                    {
+                        firstDeleted.TrySetResult();
+                        await releaseFirst.Task.WaitAsync(cancellationToken);
+                    },
+                    cancellationToken),
+                cancellationToken);
+            await firstDeleted.Task.WaitAsync(cancellationToken);
+            var secondOperation = Task.Run(
+                () => RewriteItemProvidersAsync(
+                    database.RuntimeConnectionString,
+                    itemId,
+                    new Dictionary<string, string> { ["Imdb"] = "tt-second", ["Tmdb"] = "second" },
+                    pid => secondBackend.TrySetResult(pid),
+                    () => Task.CompletedTask,
+                    cancellationToken),
+                cancellationToken);
+
+            var secondPid = await secondBackend.Task.WaitAsync(cancellationToken);
+            await using (var observer = CreateContext(database.RuntimeConnectionString))
+            {
+                var deadline = DateTime.UtcNow.AddSeconds(30);
+                while (!await ScalarAsync<bool>(
+                    observer,
+                    "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE pid = "
+                        + secondPid.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                        + " AND wait_event_type = 'Lock')",
+                    cancellationToken))
+                {
+                    Assert.True(DateTime.UtcNow < deadline, "The second provider rewrite never waited on the first.");
+                    await Task.Delay(20, cancellationToken);
+                }
+            }
+
+            releaseFirst.TrySetResult();
+            await Task.WhenAll(firstOperation, secondOperation);
+
+            await using var verification = CreateContext(database.RuntimeConnectionString);
+            var stored = await verification.BaseItemProviders
+                .Where(provider => provider.ItemId == itemId)
+                .OrderBy(provider => provider.ProviderId)
+                .Select(provider => provider.ProviderId + "=" + provider.ProviderValue)
+                .ToArrayAsync(cancellationToken);
+            Assert.Equal(["Imdb=tt-second", "Tmdb=second"], stored);
+
+            await using var duplicate = CreateContext(database.RuntimeConnectionString);
+            await using var duplicateTransaction = await duplicate.Database.BeginTransactionAsync(cancellationToken);
+            duplicate.BaseItemProviders.Add(new BaseItemProvider
+            {
+                ItemId = itemId,
+                Item = null!,
+                ProviderId = "Tmdb",
+                ProviderValue = "duplicate"
+            });
+            await Assert.ThrowsAsync<DbUpdateException>(() => duplicate.SaveChangesAsync(cancellationToken));
+        }
+        finally
+        {
+            global::Npgsql.NpgsqlConnection.ClearAllPools();
+        }
+    }
+
+    [Fact]
     public async Task CallerOwnedTransactions_PredecessorDeadlocksButSuccessorSerializesInverseRoleInterning()
     {
         var options = PostgreSqlTestOptions.FromEnvironment();
@@ -1706,6 +1805,39 @@ public sealed class ModelCompatibilityTests
         await otherRead.Task.WaitAsync(cancellationToken);
 
         context.UserData.Add(snapshot);
+        context.SaveChanges();
+        transaction.Commit();
+    }
+
+    private static async Task RewriteItemProvidersAsync(
+        string connectionString,
+        Guid itemId,
+        IReadOnlyDictionary<string, string> providerIds,
+        Action<int> onBackend,
+        Func<Task> afterDelete,
+        CancellationToken cancellationToken)
+    {
+        await using var context = CreateContext(connectionString);
+        await using var transaction = await context.Database.BeginTransactionAsync(cancellationToken);
+        onBackend(await ScalarAsync<int>(context, "SELECT pg_backend_pid()", cancellationToken));
+
+        // Mirror ItemPersistenceService.UpdateOrInsertItems for an existing item: attach the
+        // remapped entity as Modified, delete its owned provider rows, then save the new set.
+        var existingItems = context.BaseItems.Where(item => item.Id == itemId).Select(item => item.Id).ToHashSet();
+        Assert.Contains(itemId, existingItems);
+        var entity = CreateBaseItem(itemId, "provider-rewrite");
+        entity.Provider = providerIds
+            .Select(provider => new BaseItemProvider
+            {
+                Item = entity,
+                ProviderId = provider.Key,
+                ProviderValue = provider.Value
+            })
+            .ToList();
+        context.BaseItems.Attach(entity).State = EntityState.Modified;
+        context.BaseItemProviders.Where(provider => existingItems.Contains(provider.ItemId)).ExecuteDelete();
+
+        await afterDelete();
         context.SaveChanges();
         transaction.Commit();
     }
