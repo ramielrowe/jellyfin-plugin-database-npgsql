@@ -4,7 +4,7 @@ set -euo pipefail
 export LC_ALL=C
 
 image=${1:-jellyfin-npgsql-linuxserver:test}
-postgres_image='postgres:16.6@sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36'
+postgres_image='public.ecr.aws/docker/library/postgres:16.6@sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36'
 installation_directory='Npgsql Database_0.1.4.0'
 password='jellyfin-smoke-password'
 suffix="${GITHUB_RUN_ID:-local}-$$"

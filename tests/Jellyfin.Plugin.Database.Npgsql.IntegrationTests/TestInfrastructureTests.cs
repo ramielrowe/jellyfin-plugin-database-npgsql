@@ -158,7 +158,7 @@ public sealed class TestInfrastructureTests
     public void ContainerImageValidation_AcceptsDefaultPinnedReference()
     {
         Assert.Equal(
-            "postgres:16.6@sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36",
+            "public.ecr.aws/docker/library/postgres:16.6@sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36",
             PostgreSqlTestOptions.DefaultContainerImage);
         Assert.True(PostgreSqlTestOptions.IsDigestPinnedImage(PostgreSqlTestOptions.DefaultContainerImage));
     }

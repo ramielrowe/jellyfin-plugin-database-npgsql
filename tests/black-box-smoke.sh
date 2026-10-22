@@ -355,7 +355,7 @@ reserve_port HTTPS_PORT HTTPS_PORT_LEASE_FD "${HTTPS_PORT:-}"
 [ "$HTTP_PORT" != "$HTTPS_PORT" ] || { echo "FAIL: HTTP_PORT and HTTPS_PORT must be distinct" >&2; exit 1; }
 JELLYFIN_HOST_COMMIT="${JELLYFIN_HOST_COMMIT:-ca0f16eb7c195f720a1493ed469a27c4657db0c6}"
 UNSUPPORTED_HOST_COMMIT="${UNSUPPORTED_HOST_COMMIT:-284997ebe28678ebca971f9f64fcfe02976ed937}"
-POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16.6@sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36}"
+POSTGRES_IMAGE="${POSTGRES_IMAGE:-public.ecr.aws/docker/library/postgres:16.6@sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36}"
 if [[ ! "$POSTGRES_IMAGE" =~ ^[^[:space:]]+@sha256:[0-9a-fA-F]{64}$ ]]; then
     echo "FAIL: POSTGRES_IMAGE must be pinned by a complete SHA-256 digest" >&2
     exit 1
@@ -1048,7 +1048,7 @@ cp "$PLUGIN_FOLDER/Jellyfin.Plugin.Database.Npgsql.deps.json" "$AMBIGUOUS_PLUGIN
 cp "$PLUGIN_FOLDER/Npgsql.EntityFrameworkCore.PostgreSQL.dll" "$AMBIGUOUS_PLUGIN_FOLDER/Npgsql.EntityFrameworkCore.PostgreSQL.dll"
 cp "$PLUGIN_FOLDER/Npgsql.dll" "$AMBIGUOUS_PLUGIN_FOLDER/Npgsql.dll"
 
-mapfile -t package_dlls < <(find "$PLUGIN_FOLDER" -maxdepth 1 -type f -name '*.dll' -printf '%f\n' | sort)
+mapfile -t package_dlls < <(find "$PLUGIN_FOLDER" -maxdepth 1 -type f -name '*.dll' -printf '%f\n' | LC_ALL=C sort)
 expected_dlls=(Jellyfin.Plugin.Database.Npgsql.dll Npgsql.EntityFrameworkCore.PostgreSQL.dll Npgsql.dll)
 if [ "${package_dlls[*]}" != "${expected_dlls[*]}" ]; then
     fail "package DLL set contains a host assembly: ${package_dlls[*]}"

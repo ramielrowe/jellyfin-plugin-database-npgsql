@@ -4,6 +4,11 @@
   "sourceSha256": "359ffeb044af5337c992d1de98bf7fe469d86548a3345d67d7a15b9118d24efc",
   "assemblySha256": "5d8f95fc84305c385264bf4ba552774b9f2fb751bf72ab67991a1cfd73d470f1",
   "packageSha256": "699c62340f84d8cb7613a17b19d2107adbec313a33c6fe813423d9baf2dd4844",
+  "toolchain": {
+    "sdkVersion": "10.0.401",
+    "compilerVersion": "5.9.0-1.26423.113+e34a38d2ae1fc26406a317517196e55c68ff83ab",
+    "runtimeVersion": "10.0.12-servicing.26422.108+95017c711e6afc1085133d440e42b4bd78155701"
+  },
   "lastMigration": "20261009061446_AddActivityLogTypeDateIndex",
   "expectedHistoryRows": 51,
   "forbiddenPostReleaseSymbols": [

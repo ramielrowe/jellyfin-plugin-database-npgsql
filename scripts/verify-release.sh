@@ -26,6 +26,36 @@ export XDG_DATA_HOME="$PLUGIN_ROOT/.artifacts/xdg-data"
 command -v grep >/dev/null 2>&1 \
     || { echo "FAIL: release verification requires grep" >&2; exit 1; }
 
+# The predecessor fixture's pinned assembly hash covers its portable PDB, which
+# records the compiler and the runtime it ran on. The compiler rolls forward to
+# the newest installed patch runtime, so require the pinned SDK with nothing
+# newer beside its bundled runtime before spending a full build to find out.
+assert_pinned_toolchain() {
+    python3 - "$PLUGIN_ROOT/tests/fixtures/predecessor/fixture-manifest.json" \
+        "$(cd "$PLUGIN_ROOT" && dotnet --version)" "$(dotnet --list-runtimes)" <<'EOF'
+import json
+import sys
+
+toolchain = json.load(open(sys.argv[1], encoding="utf-8"))["toolchain"]
+sdk = sys.argv[2]
+expected_runtime = toolchain["runtimeVersion"].split("-", 1)[0]
+band = expected_runtime.rsplit(".", 1)[0] + "."
+installed = [
+    line.split()[1]
+    for line in sys.argv[3].splitlines()
+    if line.startswith("Microsoft.NETCore.App " + band)
+]
+selected = max(installed, key=lambda version: int(version[len(band):].split("-", 1)[0]), default="none")
+if sdk != toolchain["sdkVersion"] or selected != expected_runtime:
+    raise SystemExit(
+        f"FAIL: SDK {sdk} would compile on .NET {selected}; the predecessor fixture's pinned hash requires "
+        f"SDK {toolchain['sdkVersion']} on its bundled runtime {expected_runtime} with no newer {band}x "
+        "runtime installed (see .github/actions/setup-dotnet-sdk)")
+EOF
+}
+
+assert_pinned_toolchain
+
 restore_without_build_servers() {
     dotnet restore "$@" --disable-build-servers
 }

@@ -147,7 +147,7 @@ if grep -F '../../../src/' "$PREDECESSOR_PROJECT" >/dev/null; then
 fi
 mapfile -t provider_assembly_projects < <(
     grep -R -l --include='*.csproj' '<AssemblyName>Jellyfin.Plugin.Database.Npgsql</AssemblyName>' \
-        "$PLUGIN_ROOT/src" "$PLUGIN_ROOT/tests" "$PLUGIN_ROOT/tools" | sort
+        "$PLUGIN_ROOT/src" "$PLUGIN_ROOT/tests" "$PLUGIN_ROOT/tools" | LC_ALL=C sort
 )
 expected_provider_assembly_projects=(
     "$PLUGIN_ROOT/src/Jellyfin.Plugin.Database.Npgsql/Jellyfin.Plugin.Database.Npgsql.csproj"
@@ -167,7 +167,7 @@ actual_source_hash=$(dotnet "$PLUGIN_ROOT/tests/Jellyfin.Plugin.Database.Npgsql.
 [ "$actual_source_hash" = "$expected_source_hash" ] \
     || fail "predecessor source snapshot differs from its pinned manifest"
 
-mapfile -t actual_files < <(find "$PACKAGE_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)
+mapfile -t actual_files < <(find "$PACKAGE_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
 expected_files=(
     Jellyfin.Plugin.Database.Npgsql.deps.json
     Jellyfin.Plugin.Database.Npgsql.dll
@@ -191,7 +191,7 @@ mapfile -t manifest_files < <(
         /^artifacts:/ { in_artifacts = 1; next }
         in_artifacts && /^  - "/ { value = $0; sub(/^  - "/, "", value); sub(/"$/, "", value); print value; next }
         in_artifacts { exit }
-    ' "$PLUGIN_ROOT/build.yaml" | sort
+    ' "$PLUGIN_ROOT/build.yaml" | LC_ALL=C sort
 )
 [ "${manifest_files[*]}" = "${expected_files[*]}" ] \
     || fail "build.yaml artifacts differ from the release allowlist: ${manifest_files[*]}"
@@ -221,7 +221,7 @@ mapfile -d '' -t audited_projects < <(
     find "$PLUGIN_ROOT/src" "$PLUGIN_ROOT/tests" "$PLUGIN_ROOT/tools" \
         -path "$PLUGIN_ROOT/tests/feasibility" -prune -o \
         -type f -name '*.csproj' -print0 \
-        | sort -z
+        | LC_ALL=C sort -z
 )
 
 [ "${#audited_projects[@]}" -gt 0 ] || fail "no projects were found to audit"

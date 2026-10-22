@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Net;
+using System.Reflection.Metadata;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -64,6 +65,16 @@ public sealed class StockServerLifecycleTests
         var buildDirectory = Path.Combine(fixtureRoot, "bin", "Release", "net10.0");
         var assemblyPath = Path.Combine(buildDirectory, PluginMetadata.AssemblyFileName);
         Assert.True(File.Exists(assemblyPath), "Build the immutable predecessor fixture in Release before running its audit.");
+
+        // The DLL embeds its portable PDB's ID, and the PDB records the compiler and the
+        // runtime it ran on, so any other SDK or a newer patch runtime installed beside
+        // it changes the pinned hash. Name that cause rather than a bare hash mismatch.
+        var (compilerVersion, runtimeVersion) = ReadCompilerToolchain(Path.ChangeExtension(assemblyPath, ".pdb"));
+        Assert.True(
+            compilerVersion == manifest.Toolchain.CompilerVersion && runtimeVersion == manifest.Toolchain.RuntimeVersion,
+            $"The predecessor fixture was compiled by Roslyn {compilerVersion} on .NET {runtimeVersion}. Its pinned hash "
+                + $"requires SDK {manifest.Toolchain.SdkVersion} (Roslyn {manifest.Toolchain.CompilerVersion}) running on "
+                + $"its bundled runtime {manifest.Toolchain.RuntimeVersion}, with no newer patch runtime installed beside it.");
         Assert.Equal(manifest.AssemblySha256, await HashFileAsync(assemblyPath, cancellationToken));
         var assemblyText = Encoding.UTF8.GetString(await File.ReadAllBytesAsync(assemblyPath, cancellationToken));
         Assert.Contains(Successor, assemblyText, StringComparison.Ordinal);
@@ -1482,13 +1493,47 @@ public sealed class StockServerLifecycleTests
         return Convert.ToHexString(await SHA256.HashDataAsync(stream, cancellationToken)).ToLowerInvariant();
     }
 
+    private static (string? CompilerVersion, string? RuntimeVersion) ReadCompilerToolchain(string pdbPath)
+    {
+        // Roslyn's compilation-options record: null-terminated UTF-8 name/value pairs.
+        var compilationOptionsKind = new Guid("B5FEEC05-8CD0-4A83-96DA-466284BB4BD8");
+        using var stream = File.OpenRead(pdbPath);
+        using var provider = MetadataReaderProvider.FromPortablePdbStream(stream);
+        var reader = provider.GetMetadataReader();
+        foreach (var handle in reader.CustomDebugInformation)
+        {
+            var information = reader.GetCustomDebugInformation(handle);
+            if (reader.GetGuid(information.Kind) != compilationOptionsKind)
+            {
+                continue;
+            }
+
+            var fields = Encoding.UTF8.GetString(reader.GetBlobBytes(information.Value)).Split('\0');
+            var options = new Dictionary<string, string>(StringComparer.Ordinal);
+            for (var index = 0; index + 1 < fields.Length; index += 2)
+            {
+                options[fields[index]] = fields[index + 1];
+            }
+
+            return (options.GetValueOrDefault("compiler-version"), options.GetValueOrDefault("runtime-version"));
+        }
+
+        return (null, null);
+    }
+
     private sealed record PredecessorFixtureManifest(
         string Version,
         string HistoricalSourceCommit,
         string SourceSha256,
         string AssemblySha256,
         string PackageSha256,
+        PredecessorFixtureToolchain Toolchain,
         string LastMigration,
         int ExpectedHistoryRows,
         string[] ForbiddenPostReleaseSymbols);
+
+    private sealed record PredecessorFixtureToolchain(
+        string SdkVersion,
+        string CompilerVersion,
+        string RuntimeVersion);
 }

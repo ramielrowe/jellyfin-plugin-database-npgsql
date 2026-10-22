@@ -11,29 +11,21 @@ permissions:
 
 jobs:
   release-contract:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      # Keep setup-dotnet's cache path aligned with verify-release.sh.
+      # Keep the NuGet cache path aligned with verify-release.sh.
       NUGET_PACKAGES: ${{ github.workspace }}/.packages
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # The predecessor fixture's pinned assembly hash covers its portable PDB ID,
-      # which records the exact compiler and the .NET runtime it ran on. Install
-      # the exact SDK in isolation so newer runner-image SDKs and runtimes are not
-      # selected by roll-forward.
-      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
-        env:
-          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
+      - uses: ./.github/actions/setup-dotnet-sdk
         with:
-          dotnet-version: 10.0.401
-          cache: true
           cache-dependency-path: '**/packages.lock.json'
       - run: ./scripts/verify-release.sh
       - run: dotnet format Jellyfin.Plugin.Database.Npgsql.slnx --verify-no-changes --no-restore
 
   vanilla-jellyfin-black-box:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       # The verifier runs from the plugin checkout and uses this same path.
@@ -47,16 +39,8 @@ jobs:
           repository: jellyfin/jellyfin
           ref: ca0f16eb7c195f720a1493ed469a27c4657db0c6
           path: jellyfin
-      # The predecessor fixture's pinned assembly hash covers its portable PDB ID,
-      # which records the exact compiler and the .NET runtime it ran on. Install
-      # the exact SDK in isolation so newer runner-image SDKs and runtimes are not
-      # selected by roll-forward.
-      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
-        env:
-          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
+      - uses: ./plugin/.github/actions/setup-dotnet-sdk
         with:
-          dotnet-version: 10.0.401
-          cache: true
           cache-dependency-path: |
             plugin/**/packages.lock.json
             jellyfin/**/packages.lock.json

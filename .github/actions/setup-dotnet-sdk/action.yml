@@ -1,0 +1,53 @@
+name: Set up the pinned .NET SDK
+description: >-
+  Install exactly the .NET SDK that reproduces the integrity-pinned predecessor
+  fixture, with only its bundled runtime, and restore the NuGet package cache.
+
+inputs:
+  cache-dependency-path:
+    description: Lock files whose contents key the NuGet package cache.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # The predecessor fixture's pinned assembly hash covers its portable PDB ID,
+    # which records the exact compiler and the .NET runtime it ran on. Neither
+    # the runner image's SDKs nor actions/setup-dotnet can be used: setup-dotnet
+    # always installs the newest LTS runtime next to the requested SDK, and the
+    # compiler then rolls forward onto it. Install the checksum-pinned SDK
+    # archive into an empty directory and refuse any other SDK or runtime.
+    - name: Install .NET SDK 10.0.401
+      shell: bash
+      env:
+        SDK_VERSION: 10.0.401
+        SDK_RUNTIME_VERSION: 10.0.12
+        SDK_SHA512: 51c8b999af9e8dd9998c9edc5944e19a90788862068acd38694e098889054ce8c23d4f0c5cccfa16bf187d044562359e5ee69a9f8ad0bbe913ba90311fbce25b
+      run: |
+        set -euo pipefail
+        install_dir="$RUNNER_TEMP/dotnet"
+        archive="$RUNNER_TEMP/dotnet-sdk-$SDK_VERSION-linux-x64.tar.gz"
+        [ ! -e "$install_dir" ] || { echo "FAIL: $install_dir already exists" >&2; exit 1; }
+        curl --fail --silent --show-error --location --retry 5 --retry-all-errors \
+            --output "$archive" \
+            "https://builds.dotnet.microsoft.com/dotnet/Sdk/$SDK_VERSION/dotnet-sdk-$SDK_VERSION-linux-x64.tar.gz"
+        printf '%s  %s\n' "$SDK_SHA512" "$archive" | sha512sum --check --strict
+        mkdir "$install_dir"
+        tar --extract --gzip --file "$archive" --directory "$install_dir"
+        rm -f -- "$archive"
+
+        expected_sdks="$SDK_VERSION [$install_dir/sdk]"
+        expected_runtimes=$(printf '%s\n' \
+            "Microsoft.AspNetCore.App $SDK_RUNTIME_VERSION [$install_dir/shared/Microsoft.AspNetCore.App]" \
+            "Microsoft.NETCore.App $SDK_RUNTIME_VERSION [$install_dir/shared/Microsoft.NETCore.App]")
+        [ "$(DOTNET_ROOT="$install_dir" "$install_dir/dotnet" --list-sdks)" = "$expected_sdks" ] \
+            || { echo "FAIL: the pinned SDK archive did not install exactly SDK $SDK_VERSION" >&2; exit 1; }
+        [ "$(DOTNET_ROOT="$install_dir" "$install_dir/dotnet" --list-runtimes)" = "$expected_runtimes" ] \
+            || { echo "FAIL: the pinned SDK archive did not install exactly runtime $SDK_RUNTIME_VERSION" >&2; exit 1; }
+
+        echo "DOTNET_ROOT=$install_dir" >> "$GITHUB_ENV"
+        echo "$install_dir" >> "$GITHUB_PATH"
+    - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ env.NUGET_PACKAGES }}
+        key: nuget-${{ runner.os }}-${{ hashFiles(inputs.cache-dependency-path) }}

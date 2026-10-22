@@ -10,10 +10,11 @@ public sealed record PostgreSqlTestOptions
     public const string WorkerEnvironmentVariable = "JELLYFIN_NPGSQL_TEST_WORKER";
     public const string ContainerImageEnvironmentVariable = "JELLYFIN_NPGSQL_TEST_POSTGRES_IMAGE";
     public const string ExternalExclusiveEnvironmentVariable = "JELLYFIN_NPGSQL_TEST_EXTERNAL_EXCLUSIVE";
-    // Docker Official Image postgres:16.6 multi-platform manifest. The fixture
-    // additionally verifies the running server; the digest is not treated as a
-    // version assertion by itself.
-    public const string DefaultContainerImage = "postgres:16.6@sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36";
+    // Docker Official Image postgres:16.6 multi-platform manifest, pulled from
+    // Docker's ECR Public mirror (same digest) to avoid Docker Hub's shared
+    // anonymous pull limit. The fixture additionally verifies the running
+    // server; the digest is not treated as a version assertion by itself.
+    public const string DefaultContainerImage = "public.ecr.aws/docker/library/postgres:16.6@sha256:557fea37a744d5f4c8faab304b0a90858b53ab119735a88c131fd19dab802f36";
 
     public string? AdministratorConnectionString { get; init; }
 

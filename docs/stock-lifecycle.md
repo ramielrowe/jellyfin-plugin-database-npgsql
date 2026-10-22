@@ -12,7 +12,12 @@ checked-in, immutable source snapshot rooted at plugin commit
 `f7575d769132236431388eddbcd13525d4507150`. That assembly contains only the
 baseline and index migrations. A checked-in manifest asserts the complete
 source-tree, DLL, and deterministic ZIP SHA-256 values and rejects post-0.0.9
-symbols. The fixture project can compile only `source-tree/**/*.cs`, so a change
+symbols. The DLL embeds its portable PDB's ID, and the PDB records the compiler
+and the runtime it ran on, so the DLL hash reproduces only with the manifest's
+pinned toolchain: SDK 10.0.401 on its bundled 10.0.12 runtime, with no newer
+patch runtime installed for the compiler to roll forward onto. `verify-release.sh`
+and the test name any other toolchain, and CI installs exactly that SDK from a
+checksum-pinned archive (`.github/actions/setup-dotnet-sdk`). The fixture project can compile only `source-tree/**/*.cs`, so a change
 to the current production tree cannot silently change the predecessor. The test
 also records the SHA-256 of both predecessor and current ZIPs,
 installs the predecessor before first start, and writes vanilla

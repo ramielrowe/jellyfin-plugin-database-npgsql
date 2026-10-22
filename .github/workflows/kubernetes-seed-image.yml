@@ -23,7 +23,7 @@ env:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -40,7 +40,7 @@ jobs:
           grep -Fq "<Version>$version</Version>" Directory.Build.props
           grep -Fq "ARG PLUGIN_VERSION=$version" docker/kubernetes/Dockerfile
           grep -Fq "ARG INSTALLATION_DIRECTORY=\"$install_directory\"" docker/kubernetes/Dockerfile
-          grep -Fq 'debian:bookworm-slim@sha256:a4672c0cb26fbdde88e38fa2dfb6c681942306680e41e4378b28770b6e79ee91' docker/kubernetes/Dockerfile
+          grep -Fq 'public.ecr.aws/docker/library/debian:bookworm-slim@sha256:a4672c0cb26fbdde88e38fa2dfb6c681942306680e41e4378b28770b6e79ee91' docker/kubernetes/Dockerfile
           grep -Fq 'USER 1000:1000' docker/kubernetes/Dockerfile
           grep -Fq 'org.opencontainers.image.licenses="GPL-3.0-only"' docker/kubernetes/Dockerfile
           grep -Fq "plugin \`$version\`" docker/kubernetes/README.md
@@ -83,7 +83,7 @@ jobs:
 
   build-and-smoke:
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 75
     permissions:
       contents: read
@@ -129,23 +129,15 @@ jobs:
   release-qualification:
     if: github.event_name == 'release'
     needs: validate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      # Keep setup-dotnet's cache path aligned with verify-release.sh.
+      # Keep the NuGet cache path aligned with verify-release.sh.
       NUGET_PACKAGES: ${{ github.workspace }}/.packages
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # The predecessor fixture's pinned assembly hash covers its portable PDB ID,
-      # which records the exact compiler and the .NET runtime it ran on. Install
-      # the exact SDK in isolation so newer runner-image SDKs and runtimes are not
-      # selected by roll-forward.
-      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
-        env:
-          DOTNET_INSTALL_DIR: ${{ runner.temp }}/dotnet
+      - uses: ./.github/actions/setup-dotnet-sdk
         with:
-          dotnet-version: 10.0.401
-          cache: true
           cache-dependency-path: '**/packages.lock.json'
       - name: Run canonical release qualification
         run: ./scripts/verify-release.sh
@@ -153,7 +145,7 @@ jobs:
   publish:
     if: github.event_name == 'release'
     needs: [validate, build-and-smoke, release-qualification]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
