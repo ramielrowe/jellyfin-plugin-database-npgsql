@@ -583,8 +583,8 @@ fi
 wait_for_health() {
     local port=$1
     for _ in $(seq 1 120); do
-        if ss -H -ltnp "sport = :$port" 2>/dev/null | grep -q .; then
-            assert_host_owns_listener "$port"
+        if ss -H -ltnp "sport = :$port" 2>/dev/null | grep -q . \
+            && assert_host_owns_listener "$port" allow-absent; then
             if curl --silent --fail "http://127.0.0.1:$port/health" 2>/dev/null | grep -qx 'Healthy'; then
                 assert_host_owns_listener "$port"
                 return 0
@@ -603,11 +603,21 @@ wait_for_health() {
 
 assert_host_owns_listener() {
     local port=$1
+    local absent_policy=${2:-fail}
     assert_host_identity
     local listener_pid listener_pgid
     listener_pid=$(ss -H -ltnp "sport = :$port" 2>/dev/null \
         | sed -n 's/.*127\.0\.0\.1:'"$port"'.*pid=\([0-9][0-9]*\),.*/\1/p' | head -n 1)
-    [ -n "$listener_pid" ] || fail "the expected loopback listener is absent"
+    if [ -z "$listener_pid" ]; then
+        # Jellyfin 12.2 reports startup progress from a temporary setup server on
+        # the same port and stops it before the main host binds, so during startup
+        # the listener can vanish between two probes. Only a listener that is
+        # present but not attributable to the loopback host is an error then.
+        if [ "$absent_policy" = allow-absent ] && ! ss -H -ltn "sport = :$port" 2>/dev/null | grep -q .; then
+            return 1
+        fi
+        fail "the expected loopback listener is absent"
+    fi
     listener_pgid=$(awk '{print $5}' "/proc/$listener_pid/stat" 2>/dev/null || true)
     [ "$listener_pgid" = "$HOST_PGID" ] \
         || fail "refusing to control a listener outside the launched Jellyfin process group"
